@@ -62,3 +62,16 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 - "事件号全局唯一"是**误读**：附录B E3(review→backend,frontend)、E7(assign→backend,frontend)
   是聚合/多目标派发，同一事件号被多个角色各处理一次是合法设计。
 - 处置：派 worker 删除 test_adapters 该误读断言（保留整行唯一断言）。
+
+### M0 独立评审结论（wf_965a4c9e，只读 Explore/opus，41 工具调用/186k tokens）
+**无阻塞问题，M0 可验收。** §16 十三条全通过或不涉及（M0 退化项已注明：视图 M1、
+权限三件套 M2）；附录A schema 一字不差、§4.3 DDL 六表逐字、§4.4 落盘顺序事务(1)(2)(5)
+严格对应、§9.1 恢复 a/b/c+挂起保持正确、测试无假绿（无 skip/xfail/mock-SUT，R1 删除
+合理，附录B 四项断言真实）、契约符合。
+3 条非阻塞建议逐条裁决：
+- ①§3.2 发送者约束降级在调度层未接线（allowed_sender 已实现，run_thread 未调用）
+  → **回环 T5 补齐**（R2，wf_c66aa597）：spec §3.2 明确职责、属 M0 §3+§5.1 范围，须忠实。
+- ②终止后遗留 1 行惰性 pending 派发行（终止总结 system 事件所致）→ 评审确认无害
+  （terminated 拒新派发、recover 不处理 pending、不违反 §5.4/exactly-once）→ **留 M1 清理**。
+- ③_dispatch.py 短生命周期只读 sqlite 旁路 Store 公开面 → 合规（读盘即弃、契约 §7 授权）
+  → **留后续内聚，不改**。
