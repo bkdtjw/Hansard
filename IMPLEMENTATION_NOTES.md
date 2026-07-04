@@ -35,7 +35,18 @@
 - M0：进行中。
   - T0 ✅ 包骨架 + 接口契约（4cc4b84）
   - T1 ✅ 验收测试先行 82 用例全红（143d97e）
-  - T2/T3/T4 派发中；T5/T6 待。
+  - T2-T6 ✅ 实现（workflow 并行）；R1 修 §9.4 误读断言；R2 补 §3.2 降级（评审建议①）。
+  - **M0 完成**：85 tests green，独立评审无阻塞，合入 main + tag m0-done，
+    已推送 origin=bkdtjw/Hansard（commit 88ed2d7）。
+- **M1：启动**（视图 §6 + 看门狗 §5.3 + 终止 §5.4 + moderator/角色提示词 §11.2/11.3）。分支 m1。
+  - 明确不做（playbook §3.2）：真实后端、resume、聚合与并行。moderator 仍绑 mock。
+  - 验收标准：视图渲染快照测试 + 环路/轮数上限触发路径测试。
+  - T1 ✅ 测试先行 39 用例见红（test_render 21 + test_watchdog 10 + test_terminate_m1 8），M0 85 保持绿。
+  - **审计警示**：M1-T1 期间 orchestrator-spec.md 被越权改动 1 空格（§5.3 表格），已 git checkout
+    回滚归位（宪法只读红线）；tests/ 产出经亲验质量合格予以保留；后续 worker 卡须强化
+    "绝对禁止 Edit/Write spec，只读=只 Read/Grep 查看"。
+  - T1 提 3 歧义（均宽松、不阻塞）：终止清单用"分支/会话"关键词（§5.4 原词，T3 采纳）；
+    check_watchdogs 的 suspended 落盘职责不绑内部分工；meta.dropped 元素须可区分层级+顺序，字段实现方自定。
 
 ### T1 反馈裁决（跨卡边界缺口，Lead 自决，已并入 docs/m0-contract.md §8）
 - ① human approve 入口 → 冻结 `scheduler.apply_gate_decision(...)`（owner T5）
