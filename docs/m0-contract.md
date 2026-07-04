@@ -231,3 +231,34 @@ def recover(store: Store, config: dict) -> None:
   具体函数/类在**测试函数体内**引用，使未实现符号表现为运行时红（fail/error），而非 collection 中断。
 - 断言只依赖本契约列出的**公开签名与返回约定**；不依赖任何未冻结的内部实现细节。
 - 附录B fixture（`tests/fixtures/like_feature.*`）由 T1 建立最小可用版；T6 负责最终 E2E 装配跑绿。
+
+---
+
+## 8. T1 反馈裁决（Lead 冻结，补充 §1–§4）
+
+T1（测试先行）诚实上报 5 处跨卡边界缺口（均属工程约定缺口，非 spec 内部矛盾）。Lead 裁决并纳入冻结契约：
+
+1. **human approve 入口**（缺口①②）→ 新增 `orch.scheduler`（owner **T5**）：
+   ```python
+   def apply_gate_decision(store, config, adapters, *, corr: str,
+                           approve: bool, sender: str = "human") -> None:
+       """§10 `orch approve|reject` 的编排器入口。
+       ① 产生 gate_decision 事件（from=sender, corr 回填, to=[原 gate_request.sender]）
+       ② 把对应 gate_wait 派发行标 done → thread status='running'（resume）
+       ③ approve 且该 gate 关联特权操作 → 系统执行器按 config['gate_ops'] 执行，
+          结果作为 system 事件入队；run_ci 类经 jobs 登记（M0 同步退化）后回调
+          system 事件 to=[callback_to]、corr 回填（§5.2/§5.5）。
+       reject：只入 gate_decision 并 resume，不执行特权操作。"""
+   ```
+   T6 装配时用它替换 E2E 中的 store 原语/裸 sqlite 注入。
+
+2. **ledger 父目录自动创建**（缺口③）→ `MockAdapter` 写 ledger 前
+   `Path(ledger_path).parent.mkdir(parents=True, exist_ok=True)`。owner **T4**。
+
+3. **Store 线程目录属性**（缺口④）→ 冻结公开属性 `Store.thread_dir: Path`
+   （构造时绑定的线程目录）。owner **T3**。
+
+4. **通用标 done 原语**（缺口⑤）→ 新增 `Store.mark_done(event_id: int, target: str) -> None`
+   （把任一派发行状态置 done，供 apply_gate_decision 标 gate_wait 行）。owner **T3**。
+
+裁决效果：E2E 不再需要直连 sqlite hack；相关断言在 T6 装配阶段切换到上述冻结接口。

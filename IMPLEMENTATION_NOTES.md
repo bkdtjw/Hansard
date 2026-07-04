@@ -32,4 +32,14 @@
 - CLI 框架 → **typer 0.25**（含 click 8.3）→ 声明式、类型友好，与 spec §12 命令表映射清晰。
 
 ## 里程碑进度台账
-- M0：进行中。任务卡状态见下。
+- M0：进行中。
+  - T0 ✅ 包骨架 + 接口契约（4cc4b84）
+  - T1 ✅ 验收测试先行 82 用例全红（143d97e）
+  - T2/T3/T4 派发中；T5/T6 待。
+
+### T1 反馈裁决（跨卡边界缺口，Lead 自决，已并入 docs/m0-contract.md §8）
+- ① human approve 入口 → 冻结 `scheduler.apply_gate_decision(...)`（owner T5）
+- ② 系统执行器触发点 → 由 apply_gate_decision 驱动，M0 同步退化（owner T5）
+- ③ ledger 父目录自动创建 → MockAdapter mkdir（owner T4）
+- ④ Store 线程目录属性 → 冻结 `Store.thread_dir`（owner T3）
+- ⑤ 通用标 done 原语 → 冻结 `Store.mark_done(event_id,target)`（owner T3）
