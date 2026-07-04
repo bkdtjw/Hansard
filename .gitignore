@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# sqlite 运行产物（线程运行时数据，非源码）
+orchestrator/threads/*/events.db
+orchestrator/threads/*/events.db-wal
+orchestrator/threads/*/events.db-shm
+
+# 施工脚手架 worktree（建在仓库外侧，防误纳入）
+/../wt-*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
