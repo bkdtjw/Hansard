@@ -1,0 +1,185 @@
+# 附录B "点赞功能" mock 脚本（M0 验收 fixture）
+#
+# 结构（契约 §3 / §4.1）：{role: {触发事件号(int): 预置作者字段信封(dict)}}
+#   - MockAdapter(role=…, script=<该 role 的 {事件号: 信封} 子表>) 由装配层从本文件切片。
+#   - invoke 用 view['event_ids'] 的最大值作触发号查表；返回信封**只含作者字段**
+#     （to/type/body/artifacts/corr/blackboard_ops）；系统字段 from/re/id/ts/meta 由编排器赋值。
+#   - 事件号对应附录B E1..E19：Ek 触发号 = 该角色本批所回应事件的号。
+#
+# ── T6 装配对附录B 的两处 spec 对齐（见最终回复"③ 附录B/§ 不一致"）──
+#  (1) §3.3：blackboard_ops 仅当 type ∈ {decision, acceptance, gate_decision} 且 sender
+#      can_decide 时才被应用；否则忽略 ops 并追加 system 审计事件（§3.2 违规处理）。
+#      故附录B 行 E3 的 "[bb: freeze_contract v1]" 挂在 review 型上属 spec 内部不一致
+#      （附录B 行640 vs §3.3 行116）：若照挂会多出一条 system 审计事件、打断类型序列。
+#      本 fixture 遵 §3.3：E3(review) 不携带 bb_ops；契约 v1 仅叙事、不入黑板；黑板终态所需
+#      的 v2 冻结由 E6(decision, pm can_decide) 合法投影 —— 与附录B 四项断言（终态 v2）一致。
+#  (2) §5.1 聚合：E8(backend handoff) 与 E9(frontend "报告完成待联调") 同派发给 tester →
+#      同批一次 invoke（触发号取 max=9），tester 一次回 defect(E10)。附录B 行646 将 E9 记为
+#      frontend→moderator，但 report(retention C) 经 moderator 会强制其再回一条事件、打断
+#      E10..E11 类型序列（moderator 无法"读而不回"，§5.1 每个派发目标必被 invoke）。E2E 只断言
+#      **类型**序列（helpers.EXPECTED_TYPE_SEQUENCE），故本 fixture 把 E9 的 to 定为 [tester]
+#      走聚合，类型仍为 report、位置仍为第 9，序列与终态均不变。
+#
+# 附录B 期望序列（类型层面，顺序与类型必须一致）：
+#   E1  human → ∅            assign         "帖子支持点赞/取消赞"
+#   E2  moderator → pm       assign         兜底路由生效
+#   E3  pm → backend,frontend review        PRD+契约v1（v1 不入黑板，见对齐(1)）
+#   E4  backend → pm         question       "重复点赞语义?"   （与 E5 同批聚合测试点）
+#   E5  frontend → pm        answer         "无异议"
+#   E6  pm → moderator       decision       幂等语义裁决 [bb: freeze v2 + set_decision + set_task done]
+#   E7  moderator → backend,frontend assign  写域不相交 → 并行测试点
+#   E8  backend → tester     handoff        附 artifacts
+#   E9  frontend → tester    report         "mock 完成待联调"（与 E8 同批聚合，见对齐(2)）
+#   E10 tester → backend     defect         已删帖子返回500 → 环路计数 1
+#   E11 backend → tester     handoff        修复
+#   E12 tester → moderator   acceptance     meta.verify.exit_code=0 必须存在
+#   E13 moderator → human    gate_request corr=gate-01  → gate_wait + suspended
+#   E14 human → moderator    gate_decision corr=gate-01 approve   （E2E 经 apply_gate_decision，不入脚本）
+#   E15 system → moderator   system  CI 回调（系统执行器 run_ci → 编排器生成，不入脚本）
+#   E16 moderator → frontend assign          rebase + 切真实接口
+#   E17 frontend → tester    handoff
+#   E18 tester → moderator   acceptance      meta.verify.exit_code=0
+#   E19 moderator → ∅        terminate       → 不生成派发行，触发终止清单 system 总结事件（E20）
+
+moderator:
+  # E1 (human assign, to=∅ → 兜底 moderator) → E2 moderator→pm
+  1:
+    to: [pm]
+    type: assign
+    body: "点赞功能开工，请 pm 出 PRD 与接口契约。"
+    corr: null
+    blackboard_ops: null
+  # E6 (pm decision 交由 moderator) → E7 moderator→backend,frontend（写域不相交，并行测试点）
+  6:
+    to: [backend, frontend]
+    type: assign
+    body: "契约已冻结到 v2，backend 写 server/、frontend 写 web/，并行开工。"
+    corr: null
+    blackboard_ops: null
+  # E9 (frontend report) → 兜底续走不产新事件时由主循环处理；此处 moderator 不对 report 单独回复。
+  # E12 (tester acceptance) → E13 moderator→human 门禁申请
+  12:
+    to: [human]
+    type: gate_request
+    body: "验收通过，申请 merge 到主干并触发 CI。"
+    corr: gate-01
+    blackboard_ops: null
+  # E15 (system CI 回调 to=moderator) → E16 moderator→frontend
+  15:
+    to: [frontend]
+    type: assign
+    body: "CI 通过，frontend 请 rebase 并切换到真实接口。"
+    corr: null
+    blackboard_ops: null
+  # E18 (tester 第二次 acceptance) → E19 moderator→∅ 终止
+  18:
+    to: []
+    type: terminate
+    body: "点赞功能全流程完成，终止线程。"
+    corr: null
+    blackboard_ops: null
+
+pm:
+  # E2 (moderator assign) → E3 pm→backend,frontend 发起评审。
+  # 注：不携带 blackboard_ops —— review 型不满足 §3.3 门槛（decision/acceptance/gate_decision），
+  # 挂 bb_ops 会被忽略并多出 system 审计事件（§3.2/§3.3）。契约 v1 只作叙事，冻结统一在 E6。
+  2:
+    to: [backend, frontend]
+    type: review
+    body: "PRD v1 + 接口契约 v1，请评审。"
+    artifacts: ["docs/like-prd.md", "docs/like-api.md"]
+    corr: null
+    blackboard_ops: null
+  # E4+E5 (backend question + frontend answer 同批聚合) → E6 pm→moderator 裁决。
+  # decision 型 + pm can_decide → 满足 §3.3 门槛，bb_ops 合法投影黑板：
+  #   冻结契约 v2 + 记决策 + 登记三项任务为 done（黑板终态"tasks 全 done"的唯一合法来源）。
+  # M0 mock 于裁决点声明任务终态；跨事件的任务生命周期推进属后续里程碑（附录B 仅断言终态）。
+  5:
+    to: [moderator]
+    type: decision
+    body: "重复点赞按幂等处理：再次点赞即取消。契约升级 v2，各角色任务收敛。"
+    corr: null
+    blackboard_ops:
+      - {op: freeze_contract, name: like-api, path: docs/like-api.md, version: 2}
+      - {op: set_decision, text: "重复点赞 = 取消赞（幂等）"}
+      - {op: set_task, key: "backend.impl", status: "done"}
+      - {op: set_task, key: "frontend.impl", status: "done"}
+      - {op: set_task, key: "test.accept", status: "done"}
+
+backend:
+  # E3 (pm review) → E4 backend→pm 提问
+  3:
+    to: [pm]
+    type: question
+    body: "重复点赞的语义是什么？累加还是取消？"
+    corr: null
+    blackboard_ops: null
+  # E7 (moderator assign) → E8 backend→tester 交接
+  7:
+    to: [tester]
+    type: handoff
+    body: "点赞后端实现完成，移交测试。"
+    artifacts: ["server/like.py"]
+    corr: null
+    blackboard_ops: null
+  # E10 (tester defect) → E11 backend→tester 修复
+  10:
+    to: [tester]
+    type: handoff
+    body: "已修复已删帖子返回 500 的缺陷。"
+    artifacts: ["server/like.py"]
+    corr: null
+    blackboard_ops: null
+
+frontend:
+  # E3 (pm review) → E5 frontend→pm 回复
+  3:
+    to: [pm]
+    type: answer
+    body: "前端无异议。"
+    corr: null
+    blackboard_ops: null
+  # E7 (moderator assign) → E9 frontend→tester 报告（见抬头对齐(2)）。
+  # to=[tester]：与 E8(backend handoff→tester) 同派发目标 → §5.1 同批聚合，tester 一次 invoke
+  # （触发号 max=9）回 defect(E10)。类型仍为 report、序位仍为第 9，序列与终态不受影响。
+  7:
+    to: [tester]
+    type: report
+    body: "前端 mock 完成，待联调。"
+    corr: null
+    blackboard_ops: null
+  # E16 (moderator assign) → E17 frontend→tester 交接
+  16:
+    to: [tester]
+    type: handoff
+    body: "已 rebase 并切换到真实接口。"
+    artifacts: ["web/like.js"]
+    corr: null
+    blackboard_ops: null
+
+tester:
+  # E8(backend handoff) + E9(frontend report) 同批聚合派发给 tester（见抬头对齐(2)）→
+  # 触发号取 max=9 → E10 tester→backend 缺陷（环路计数 1）。故本条键为 9（聚合批最大事件号）。
+  9:
+    to: [backend]
+    type: defect
+    body: "已删帖子点赞返回 500，应为 404。详见 reports/r1.md。"
+    artifacts: ["reports/r1.md"]
+    corr: null
+    blackboard_ops: null
+  # E11 (backend handoff) → E12 tester→moderator 验收（需 meta.verify.exit_code=0）
+  11:
+    to: [moderator]
+    type: acceptance
+    body: "缺陷修复验证通过。"
+    artifacts: ["reports/r2.md"]
+    corr: null
+    blackboard_ops: null
+  # E17 (frontend handoff) → E18 tester→moderator 第二次验收
+  17:
+    to: [moderator]
+    type: acceptance
+    body: "联调验收通过。"
+    artifacts: ["reports/r3.md"]
+    corr: null
+    blackboard_ops: null
