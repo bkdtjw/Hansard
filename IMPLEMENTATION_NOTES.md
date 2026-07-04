@@ -12,6 +12,16 @@
 ## Lead 集成胶水清单
 （每一处 Lead 亲手写的非实现代码——包骨架/__init__/装配——记于此，含文件与理由）
 
+- **T0 包骨架**（commit `m0/T0`）：`src/orch/` 顶层包 + 7 子包
+  （protocol/store/scheduler/adapters/render/verify/cli）的 `__init__.py`；
+  `pyproject.toml`（setuptools 后端；依赖 jsonschema+pyyaml；
+  pytest pythonpath=src、testpaths=tests）；`tests/__init__.py`。
+  render/verify/cli 仅占位 docstring（M1/M2 归属，M0 不实现其内容）。
+  验证：`PYTHONPATH=src python -c "import orch,..."` 通过；`pytest` 收集 0 项。
+- **M0 接口契约**（commit `m0/T0`）：`docs/m0-contract.md`——冻结跨任务卡边界的
+  模块/符号/签名/返回约定（设计规格，非实现代码），供 T1 写测试与 T2–T5 实现共享，
+  确保测试先行与实现对齐。内部逻辑仍由各 worker 依 spec 自主实现。
+
 ## 开放决策点（spec §17）取舍
 （格式：决策项 → 选择 → 一行理由）
 
