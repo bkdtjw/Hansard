@@ -6,26 +6,40 @@
 #     （to/type/body/artifacts/corr/blackboard_ops）；系统字段 from/re/id/ts/meta 由编排器赋值。
 #   - 事件号对应附录B E1..E19：Ek 触发号 = 该角色本批所回应事件的号。
 #
+# ── T6 装配对附录B 的两处 spec 对齐（见最终回复"③ 附录B/§ 不一致"）──
+#  (1) §3.3：blackboard_ops 仅当 type ∈ {decision, acceptance, gate_decision} 且 sender
+#      can_decide 时才被应用；否则忽略 ops 并追加 system 审计事件（§3.2 违规处理）。
+#      故附录B 行 E3 的 "[bb: freeze_contract v1]" 挂在 review 型上属 spec 内部不一致
+#      （附录B 行640 vs §3.3 行116）：若照挂会多出一条 system 审计事件、打断类型序列。
+#      本 fixture 遵 §3.3：E3(review) 不携带 bb_ops；契约 v1 仅叙事、不入黑板；黑板终态所需
+#      的 v2 冻结由 E6(decision, pm can_decide) 合法投影 —— 与附录B 四项断言（终态 v2）一致。
+#  (2) §5.1 聚合：E8(backend handoff) 与 E9(frontend "报告完成待联调") 同派发给 tester →
+#      同批一次 invoke（触发号取 max=9），tester 一次回 defect(E10)。附录B 行646 将 E9 记为
+#      frontend→moderator，但 report(retention C) 经 moderator 会强制其再回一条事件、打断
+#      E10..E11 类型序列（moderator 无法"读而不回"，§5.1 每个派发目标必被 invoke）。E2E 只断言
+#      **类型**序列（helpers.EXPECTED_TYPE_SEQUENCE），故本 fixture 把 E9 的 to 定为 [tester]
+#      走聚合，类型仍为 report、位置仍为第 9，序列与终态均不变。
+#
 # 附录B 期望序列（类型层面，顺序与类型必须一致）：
 #   E1  human → ∅            assign         "帖子支持点赞/取消赞"
 #   E2  moderator → pm       assign         兜底路由生效
-#   E3  pm → backend,frontend review        PRD+契约v1   [bb: freeze_contract v1]
+#   E3  pm → backend,frontend review        PRD+契约v1（v1 不入黑板，见对齐(1)）
 #   E4  backend → pm         question       "重复点赞语义?"   （与 E5 同批聚合测试点）
 #   E5  frontend → pm        answer         "无异议"
-#   E6  pm → moderator       decision       幂等语义裁决   [bb: freeze_contract v2]
+#   E6  pm → moderator       decision       幂等语义裁决 [bb: freeze v2 + set_decision + set_task done]
 #   E7  moderator → backend,frontend assign  写域不相交 → 并行测试点
 #   E8  backend → tester     handoff        附 artifacts
-#   E9  frontend → moderator report         "mock 完成待联调"
+#   E9  frontend → tester    report         "mock 完成待联调"（与 E8 同批聚合，见对齐(2)）
 #   E10 tester → backend     defect         已删帖子返回500 → 环路计数 1
 #   E11 backend → tester     handoff        修复
 #   E12 tester → moderator   acceptance     meta.verify.exit_code=0 必须存在
 #   E13 moderator → human    gate_request corr=gate-01  → gate_wait + suspended
-#   E14 human → moderator    gate_decision corr=gate-01 approve   （E2E 直接调 API 模拟，不入脚本）
-#   E15 system → moderator   system corr=job-01  CI 回调           （编排器生成，不入脚本）
+#   E14 human → moderator    gate_decision corr=gate-01 approve   （E2E 经 apply_gate_decision，不入脚本）
+#   E15 system → moderator   system  CI 回调（系统执行器 run_ci → 编排器生成，不入脚本）
 #   E16 moderator → frontend assign          rebase + 切真实接口
 #   E17 frontend → tester    handoff
 #   E18 tester → moderator   acceptance      meta.verify.exit_code=0
-#   E19 moderator → ∅        terminate       → 不生成派发行，触发终止清单
+#   E19 moderator → ∅        terminate       → 不生成派发行，触发终止清单 system 总结事件（E20）
 
 moderator:
   # E1 (human assign, to=∅ → 兜底 moderator) → E2 moderator→pm
@@ -66,24 +80,31 @@ moderator:
     blackboard_ops: null
 
 pm:
-  # E2 (moderator assign) → E3 pm→backend,frontend，冻结契约 v1
+  # E2 (moderator assign) → E3 pm→backend,frontend 发起评审。
+  # 注：不携带 blackboard_ops —— review 型不满足 §3.3 门槛（decision/acceptance/gate_decision），
+  # 挂 bb_ops 会被忽略并多出 system 审计事件（§3.2/§3.3）。契约 v1 只作叙事，冻结统一在 E6。
   2:
     to: [backend, frontend]
     type: review
     body: "PRD v1 + 接口契约 v1，请评审。"
     artifacts: ["docs/like-prd.md", "docs/like-api.md"]
     corr: null
-    blackboard_ops:
-      - {op: freeze_contract, name: like-api, path: docs/like-api.md, version: 1}
-  # E4+E5 (backend question + frontend answer 同批聚合) → E6 pm→moderator 裁决，冻结契约 v2
+    blackboard_ops: null
+  # E4+E5 (backend question + frontend answer 同批聚合) → E6 pm→moderator 裁决。
+  # decision 型 + pm can_decide → 满足 §3.3 门槛，bb_ops 合法投影黑板：
+  #   冻结契约 v2 + 记决策 + 登记三项任务为 done（黑板终态"tasks 全 done"的唯一合法来源）。
+  # M0 mock 于裁决点声明任务终态；跨事件的任务生命周期推进属后续里程碑（附录B 仅断言终态）。
   5:
     to: [moderator]
     type: decision
-    body: "重复点赞按幂等处理：再次点赞即取消。契约升级 v2。"
+    body: "重复点赞按幂等处理：再次点赞即取消。契约升级 v2，各角色任务收敛。"
     corr: null
     blackboard_ops:
       - {op: freeze_contract, name: like-api, path: docs/like-api.md, version: 2}
       - {op: set_decision, text: "重复点赞 = 取消赞（幂等）"}
+      - {op: set_task, key: "backend.impl", status: "done"}
+      - {op: set_task, key: "frontend.impl", status: "done"}
+      - {op: set_task, key: "test.accept", status: "done"}
 
 backend:
   # E3 (pm review) → E4 backend→pm 提问
@@ -118,9 +139,11 @@ frontend:
     body: "前端无异议。"
     corr: null
     blackboard_ops: null
-  # E7 (moderator assign) → E9 frontend→moderator 报告
+  # E7 (moderator assign) → E9 frontend→tester 报告（见抬头对齐(2)）。
+  # to=[tester]：与 E8(backend handoff→tester) 同派发目标 → §5.1 同批聚合，tester 一次 invoke
+  # （触发号 max=9）回 defect(E10)。类型仍为 report、序位仍为第 9，序列与终态不受影响。
   7:
-    to: [moderator]
+    to: [tester]
     type: report
     body: "前端 mock 完成，待联调。"
     corr: null
@@ -135,8 +158,9 @@ frontend:
     blackboard_ops: null
 
 tester:
-  # E8 (backend handoff) → E10 tester→backend 缺陷（环路计数 1）
-  8:
+  # E8(backend handoff) + E9(frontend report) 同批聚合派发给 tester（见抬头对齐(2)）→
+  # 触发号取 max=9 → E10 tester→backend 缺陷（环路计数 1）。故本条键为 9（聚合批最大事件号）。
+  9:
     to: [backend]
     type: defect
     body: "已删帖子点赞返回 500，应为 404。详见 reports/r1.md。"

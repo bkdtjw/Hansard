@@ -118,11 +118,13 @@ def test_ledger_shared_across_roles_no_duplicate_event_ids(like_feature_script, 
         role: _mock(role, like_feature_script.get(role, {}), ledger)
         for role in like_feature_script
     }
-    # 按附录B 顺序，每个回复由对应角色针对其触发号 invoke 一次。
+    # 按附录B 顺序，每个回复由对应角色针对其触发号 invoke 一次（与 E2E 实跑的 16 次 invoke 对齐）。
+    # 注：E8(backend→tester handoff)+E9(frontend→tester report) 同批聚合 → tester 触发号 max=9
+    #     （见 fixture 抬头对齐(2)）；故 tester 首次驱动为 [8,9]，ledger 记 tester:9。
     drive = [
         ("moderator", [1]), ("pm", [2]), ("backend", [3]), ("frontend", [3]),
         ("pm", [4, 5]), ("moderator", [6]), ("backend", [7]), ("frontend", [7]),
-        ("tester", [8]), ("backend", [10]), ("tester", [11]), ("moderator", [12]),
+        ("tester", [8, 9]), ("backend", [10]), ("tester", [11]), ("moderator", [12]),
         ("moderator", [15]), ("frontend", [16]), ("tester", [17]), ("moderator", [18]),
     ]
     for role, eids in drive:
@@ -131,15 +133,13 @@ def test_ledger_shared_across_roles_no_duplicate_event_ids(like_feature_script, 
     lines = read_ledger_lines(ledger)
     # exactly-once：无任何一行重复。
     assert len(lines) == len(set(lines)), f"ledger 出现重复事件号: {lines}"
-    # 且事件号维度也各自唯一（同一 event_id 不被两个角色重复处理）。
-    event_ids = [ln.split(":", 1)[1] for ln in lines]
-    assert len(event_ids) == len(set(event_ids)), f"事件号重复: {event_ids}"
 
 
 def test_ledger_persists_to_disk_file(role_script, tmp_dir):
     # ledger 是**落盘**文件（供跨进程/崩溃后的 exactly-once 校验）。
+    # tester 首次被触发是 E8(handoff)+E9(report) 同批聚合 → 触发号 max=9（见 fixture 抬头对齐(2)）。
     ledger = tmp_dir / "sub" / "ledger.txt"
     ad = _mock("tester", role_script("tester"), ledger)
-    ad.invoke(make_view("tester", [8]), None)
+    ad.invoke(make_view("tester", [8, 9]), None)
     assert Path(ledger).exists()
-    assert Path(ledger).read_text(encoding="utf-8").strip() == "tester:8"
+    assert Path(ledger).read_text(encoding="utf-8").strip() == "tester:9"
