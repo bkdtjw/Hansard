@@ -126,6 +126,26 @@ def _finalize_envelope(store, config: dict, role: str, env: dict) -> dict:
     return out
 
 
+def _enforce_sender_constraint(config: dict, reply: dict) -> str | None:
+    """§3.2 发送者约束：越权则**就地把回复 type 改为 report**，返回被降级的原 type。
+
+    判定精确复用 protocol.allowed_sender（§3.2：decision→can_decide 角色或 human；
+    gate_decision→仅 human；system→仅编排器；terminate→moderator/tester/human；
+    其余 type→任意）。发送者约束在 schema 校验之后单独执行（spec 行631）。
+
+    sender=reply['from']（已由 _finalize_envelope 权威赋为 role，§16.11）；
+    can_decide 取自 config 中该 role 的申报（§11.1）。允许则返回 None（不改 type）。
+    降级后的 report 落盘 + system 审计事件由调用方按 §3.2 完成（参照 §3.3 bb_ops 越权处理）。
+    """
+    role = reply["from"]
+    orig_type = reply.get("type")
+    can_decide = bool(_role_conf(config, role).get("can_decide", False))
+    if orch.protocol.allowed_sender(orig_type, role, can_decide=can_decide):
+        return None
+    reply["type"] = "report"  # §3.2：降级为 report 落盘。
+    return orig_type
+
+
 def _apply_bb_if_eligible(store, config: dict, reply: dict, reply_id: int) -> None:
     """§3.3 门槛判定后应用 blackboard_ops；不满足则忽略并追加 system 审计事件。
 
@@ -273,6 +293,11 @@ def _dispatch_group(
     # 权威赋值 re = 本批全部 event_ids（§3.1/§16.11）。
     reply["re"] = list(event_ids)
 
+    # §3.2 发送者约束：越权则**就地降级为 report** 后再落盘（spec 行105/行631；schema 校验之后
+    # 单独执行）。降级在 reply_and_done 之前完成 → report 落盘、且 _apply_bb_if_eligible 按定稿
+    # type（report）自然判定 bb_ops 不适用。审计事件在回复落盘后追加（同 §3.3 bb_ops 越权处理）。
+    downgraded_from = _enforce_sender_constraint(config, reply)
+
     # 记录聚合埋点 batch_size（§13）。
     store.record_metric("batch_size", float(len(event_ids)), extra=target)
 
@@ -283,6 +308,15 @@ def _dispatch_group(
     )
     for eid in event_ids[1:]:
         store.mark_done(eid, target)
+
+    # §3.2：越权已降级 report 落盘 → 追加一条 system 审计事件（编排器权威 from=system，§16.11）。
+    if downgraded_from is not None:
+        append_system_event(
+            store,
+            body=(f"发送者约束违规降级为 report：role={target} "
+                  f"越权 type={downgraded_from}（§3.2）"),
+            to=["moderator"],
+        )
 
     # 应用 blackboard_ops（§3.3 门槛，定稿 type 判定）。
     _apply_bb_if_eligible(store, config, reply, reply_id)

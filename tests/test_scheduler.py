@@ -19,6 +19,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import orch.adapters  # 包级导入
 import orch.scheduler  # 包级导入
 import orch.store
 
@@ -236,3 +237,110 @@ def test_recover_leaves_pending_untouched(thread_dir):
     orch.scheduler.recover(st, _config())
     row = _dispatch_row(thread_dir, e1, "backend")
     assert row["status"] == "pending", "pending 行恢复时不处理"
+
+
+# ——————————————————————————————————————————————————————————————
+# §3.2 发送者约束违规 → 调度层降级为 report 落盘 + 追加一条 system 审计事件
+#   （spec §3.2 行105："发送者约束违规的处理：调度器把该信封降级为 report 落盘，
+#    并追加一条 system 审计事件。"；发送者约束在 schema 校验之后单独执行，spec 行631）
+# ——————————————————————————————————————————————————————————————
+
+def _drive_one_dispatch(thread_dir, *, role: str, reply_env: dict,
+                        can_decide: bool, seed_type: str = "assign"):
+    """最小 store+mock+config 直接驱动**恰一次**派发（不跑整条附录B）。
+
+    seed 一条 to=[role] 的事件触发对 role 的单次 invoke；MockAdapter 按触发号返回
+    reply_env（只含作者字段）。reply_env 的 to 一律 [human]，使这条回复落盘后主循环在
+    下一轮遇 target==human 即 gate_wait+suspended 返回（§10），从而只发生一次真实派发、
+    干净停机（避免回复再触发对无适配器目标的二次派发）。config 只声明该 role 的 can_decide。
+    返回 store。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type=seed_type, body="开工", to=[role])
+    adapter = orch.adapters.MockAdapter(
+        role=role, script={e1: reply_env}, ledger_path=thread_dir / "ledger.txt",
+    )
+    cfg = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "roles": {role: {"can_decide": can_decide, "write_scope": [], "tools": []}},
+    }
+    orch.scheduler.run_thread(st, cfg, {role: adapter})
+    return st
+
+
+def _events_by_id(store) -> list[dict]:
+    return sorted(store.events(), key=lambda e: e["id"])
+
+
+def test_sender_constraint_downgrade_backend_decision(thread_dir):
+    """越权路径①：backend（can_decide=False）发 type=decision。
+
+    §3.2 决策仅允许 can_decide 角色或 human；backend 不满足 → 调度器把该回复
+    **降级为 report 落盘**（落盘事件 type==report）**且追加一条 system 审计事件**
+    （from=='system'）。系统字段仍由编排器权威赋值（from=backend，§16.11）。
+    """
+    st = _drive_one_dispatch(
+        thread_dir, role="backend", can_decide=False,
+        reply_env={"to": ["human"], "type": "decision", "body": "我要冻结契约"},
+    )
+    evs = _events_by_id(st)
+
+    # backend 那条回复落盘时已被降级为 report（非 decision）。
+    backend_replies = [e for e in evs if e["from"] == "backend"]
+    assert backend_replies, "backend 应有一条落盘回复"
+    assert len(backend_replies) == 1
+    assert backend_replies[0]["type"] == "report", (
+        f"§3.2：越权 decision 应降级为 report 落盘，实际 {backend_replies[0]['type']}"
+    )
+    assert backend_replies[0]["type"] != "decision", "越权 decision 不得原样落盘"
+
+    # 追加了一条 system 审计事件（编排器权威 sender=system）。
+    system_events = [e for e in evs if e["from"] == "system" and e["type"] == "system"]
+    assert system_events, "§3.2：应追加一条 system 审计事件"
+
+
+def test_sender_constraint_downgrade_nonhuman_gate_decision(thread_dir):
+    """越权路径②：非 human 角色（moderator，即便 can_decide=True）发 type=gate_decision。
+
+    §3.2 gate_decision 仅允许 human；moderator 非 human → 降级为 report 落盘 +
+    追加 system 审计事件。can_decide=True 也不豁免（gate_decision 只认 human）。
+    """
+    st = _drive_one_dispatch(
+        thread_dir, role="moderator", can_decide=True,
+        reply_env={"to": ["human"], "type": "gate_decision", "body": "approve"},
+    )
+    evs = _events_by_id(st)
+
+    mod_replies = [e for e in evs if e["from"] == "moderator"]
+    assert mod_replies, "moderator 应有一条落盘回复"
+    assert mod_replies[0]["type"] == "report", (
+        f"§3.2：非 human 的 gate_decision 应降级为 report，实际 {mod_replies[0]['type']}"
+    )
+    assert mod_replies[0]["type"] != "gate_decision", "非 human 的 gate_decision 不得原样落盘"
+
+    system_events = [e for e in evs if e["from"] == "system" and e["type"] == "system"]
+    assert system_events, "§3.2：应追加一条 system 审计事件"
+
+
+def test_sender_constraint_allows_legit_decision_from_can_decide_role(thread_dir):
+    """反向对照：合法路径不得误降级——can_decide 角色发 decision 应原样落盘。
+
+    证明 §3.2 接线是**精确**判定（复用 protocol.allowed_sender），不会把合法
+    decision 也降级；且不追加 system 审计事件。
+    """
+    st = _drive_one_dispatch(
+        thread_dir, role="pm", can_decide=True,
+        reply_env={"to": ["human"], "type": "decision", "body": "码点计数"},
+    )
+    evs = _events_by_id(st)
+
+    pm_replies = [e for e in evs if e["from"] == "pm"]
+    assert pm_replies, "pm 应有一条落盘回复"
+    assert pm_replies[0]["type"] == "decision", (
+        f"合法 decision（can_decide 角色）必须原样落盘，实际 {pm_replies[0]['type']}"
+    )
+    # 合法路径不追加 §3.2 违规审计事件。
+    assert not [e for e in evs if e["from"] == "system"], \
+        "合法 decision 不应触发 §3.2 违规 system 审计事件"
