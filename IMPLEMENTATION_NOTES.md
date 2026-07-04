@@ -43,3 +43,22 @@
 - ③ ledger 父目录自动创建 → MockAdapter mkdir（owner T4）
 - ④ Store 线程目录属性 → 冻结 `Store.thread_dir`（owner T3）
 - ⑤ 通用标 done 原语 → 冻结 `Store.mark_done(event_id,target)`（owner T3）
+
+### 整晚自主推进授权（2026-07-04 夜）
+用户授权：睡觉期间 Lead 自主、高强度用 Workflow 派发 opus worker，推进
+orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解表 → 测试先行见红
+→ workflow 并行实现 → Lead 收尾三步（写域审计/全量 pytest/逐卡 commit）→
+独立只读评审 → 完成定义五项 → 合入 main 打 tag → 推送 bkdtjw/Hansard。
+诚实边界：人工验收（playbook §4）无法代做，做到 agent 侧完成定义、证据留盘供
+醒来终审；M2 真实 CLI 后端需人陪跑，遇自动化极限在 QUESTIONS.md 升级、禁止伪造。
+
+### M0 实现进度（workflow wf_221aa457-910 产出）
+- T2 protocol(rules.py+schema.py) / T3 store / T4 adapters / T5 scheduler
+  (core+recover+systemexec+_dispatch) / T6 E2E 装配 —— 均已落盘。
+- 全量 pytest：81 passed, 1 failed。写域审计：全部在各卡白名单内，无越权。
+
+### 裁决：§9.4 "无重复事件号" 的正确语义（回环修正 R1，workflow wf_c3a4fd65-97a）
+- exactly-once = mock ledger **整行**(role:event_id)唯一，即 len(lines)==len(set(lines))。
+- "事件号全局唯一"是**误读**：附录B E3(review→backend,frontend)、E7(assign→backend,frontend)
+  是聚合/多目标派发，同一事件号被多个角色各处理一次是合法设计。
+- 处置：派 worker 删除 test_adapters 该误读断言（保留整行唯一断言）。
