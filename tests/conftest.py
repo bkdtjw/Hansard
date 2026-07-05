@@ -7,6 +7,10 @@
 临时目录说明：本机全局 %TEMP%\\pytest-of-* 可能因历史遗留而不可写（WinError 5），
 故不用内置 tmp_path，改用项目本地、git 忽略（tests/.gitignore）的 tests/.pytmp/<uid>/ 作为
 每个用例的独立可写临时根，用后即清。这只影响测试脚手架，不触碰被测代码与其真相落盘语义。
+
+M4-T5 · chaos_50 marker + --chaos-50 flag（spec §15 M4 硬门槛）
+   默认 pytest 不跑 `chaos_50` 标记用例（避免每次 CI 都吃 50 轮混沌）；
+   仅当命令行显式传入 `--chaos-50` 时才收集并运行。
 """
 
 from __future__ import annotations
@@ -18,6 +22,40 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import load_like_feature_script
+
+
+# ---------------------------------------------------------------------
+# M4-T5 · chaos_50 marker（spec §15 M4 硬门槛：50 轮 100% 通过）
+# ---------------------------------------------------------------------
+
+def pytest_addoption(parser):
+    """新增 `--chaos-50` 命令行开关：显式请求跑 50 轮混沌硬门槛。"""
+    parser.addoption(
+        "--chaos-50",
+        action="store_true",
+        default=False,
+        help="Run M4 chaos 50-round hard-gate tests (spec §15 M4).",
+    )
+
+
+def pytest_configure(config):
+    """注册 chaos_50 marker，避免 `PytestUnknownMarkWarning`。"""
+    config.addinivalue_line(
+        "markers",
+        "chaos_50: mark test as M4 chaos 50-round hard gate (skipped without --chaos-50).",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """未指定 `--chaos-50` 时对所有 `chaos_50` 用例贴 skip 标记（不影响其它用例）。"""
+    if config.getoption("--chaos-50"):
+        return
+    skip_chaos = pytest.mark.skip(
+        reason="chaos_50 hard-gate skipped by default; pass --chaos-50 to run.",
+    )
+    for item in items:
+        if "chaos_50" in item.keywords:
+            item.add_marker(skip_chaos)
 
 # 项目本地临时根（tests/.gitignore 已忽略 .pytmp/）。
 _PYTMP_ROOT = Path(__file__).parent / ".pytmp"
