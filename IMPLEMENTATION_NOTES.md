@@ -59,6 +59,17 @@
     §16.7 落地为"第三人称标签统辖、正文保留全文"（符合 §6.2 字面）；箭头 →(spec散文)/->(实现+测试)
     属 §17 渲染格式开放决策，测试锚定 -> 避免脆性；§6.4 worktree 段对 mock 纯跳过（M2 真实 CLI 补）。
 
+### M2 施工与评审记录
+- M2 契约 docs/m2-contract.md（诚实边界：(a)-(f) 夜段自动化 / (g)-(i) 陪跑升级 QUESTIONS.md Q1/Q2）。
+- T1-T5 workflow wf_d959416a：42 测试 → CliAdapter/ApiAdapter/FakeCli/FakeApi(§7.2/§7.3) → 权限三件套 permissions.py + core.py 接入(§8.1/§8.2/§4.5) → CLI §12 子集 typer 骨架 → E2E 装配 停机-重启-approve → 全量 169 绿。
+- **M2 三维独立评审（wf_7dca491e，A/B/C 并行 opus 只读）** 结论：
+  - A/B 判无阻塞可验收；C 找到 3 处夜段范围内真缺口需回环闭合：
+    - **C-1**: CliAdapter 缺 --allowedTools 工具白名单参数注入（§8.1 三件套之二"骨架层空了一件"）→ R-a
+    - **C-2**: orch run 命令缺失（stop 标志被写但无人读；stop 语义链条断）→ R-b
+    - **C-4**: last_ok_commit 生产无更新回路，§8.2 审计生产恒 skip = fail open → R-b
+  - B 建议 T2 补漏：FakeCli/FakeApi 缺 scripted_replies + inject_side_effect（T5 用 tests/adapters_helpers.py 包装补齐属透明权宜，但应回补 src 让 helpers 退役）→ R-c
+- 回环 workflow wf_f3516501 并行 R-a ∥ R-b ∥ R-c 修上述 4 处。
+
 ### T1 反馈裁决（跨卡边界缺口，Lead 自决，已并入 docs/m0-contract.md §8）
 - ① human approve 入口 → 冻结 `scheduler.apply_gate_decision(...)`（owner T5）
 - ② 系统执行器触发点 → 由 apply_gate_decision 驱动，M0 同步退化（owner T5）
