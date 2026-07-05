@@ -189,6 +189,236 @@ def _assemble_view(store, config: dict, role: str, event_ids: list[int]) -> dict
     )
 
 
+# ——————————————————————————————————————————————————————————————
+# R-T3 · §6.5 热续增量接入调度层（docs/m3-contract.md §2 门控条件逐句落实）
+# ——————————————————————————————————————————————————————————————
+#
+# 已实现但从未被调度层调用的 render_delta（§6.5）在此接线到同步/异步两条核心环。
+# core.py 与 async_core.py **复用同一决策函数**（_render_for_dispatch），不写两份逻辑。
+#
+# 门控条件（m3-contract §2；全部满足才走 render_delta，否则冷启动 render_view）：
+#   (1) 该角色 adapter 声明 supports_resume 且 sessions 表中该角色 sid 非空；
+#   (2) sessions.gen 自上次渲染未变（持久化的 resume_gen == 当前 sessions.gen）；
+#   (3) 黑板 version 未大改（<1 step，即自上次渲染以来黑板 version 未推进）。
+#
+# 持久化（§16.9 禁内存态；键名自定但稳定可从盘重建）：每次成功渲染派发后把该角色的
+# last_evt（本批最大事件号）、当时黑板 version、当时 sessions.gen 落到 thread_meta。
+#
+# §6.5 规则2：render_delta 返回 meta.needs_cold_start=True（新事件含契约 version 变更
+# ≥1）→ 主动作废该角色 sid（sessions.sid 置空 + gen 递增，走 store 既有 reply_and_done
+# 的 session upsert 通道）→ 本轮回退冷启动 render_view（不得把 delta 视图发出去）。
+
+# thread_meta 键前缀（§16.9 稳定键名）：
+_RESUME_LAST_EVT_KEY = "resume_last_evt:{role}"      # 上次渲染的本批最大事件号
+_RESUME_BB_VERSION_KEY = "resume_bb_version:{role}"  # 上次渲染时的黑板 version 标量
+_RESUME_GEN_KEY = "resume_gen:{role}"                # 上次渲染时的 sessions.gen
+
+
+def _blackboard_version(store) -> int:
+    """黑板 version 标量（§6.5 门控3 / 规则2 的"版本推进"判据，调度层自定，§17 归档）。
+
+    = Σ(各冻结契约 version) + 决策条数。契约只增版本、决策只追加 → 单调不减；任一
+    材料级黑板变化（新契约/契约升版/新决策）都令其 ≥1 步推进，正好对应 m3-contract §2
+    门控3"黑板 version 未推进（<1 step）"与 §6.5 规则2"契约版本变更"的宏观信号。
+
+    只读 board_state（§4.6 从盘 state.json 重建），不持有任何内存态（§16.9）。
+    """
+    state = orch.store.board_state(store)
+    contracts = state.get("contracts") or {}
+    total = 0
+    for c in contracts.values():
+        v = (c or {}).get("version")
+        try:
+            total += int(v)
+        except (TypeError, ValueError):
+            total += 1  # 非数值 version：计 1（保守，仍单调）。
+    total += len(state.get("decisions") or [])
+    return total
+
+
+def _adapter_name(config: dict, role: str) -> str:
+    """该角色绑定的 adapter 名（config.roles[role].adapter）；缺省 role 名兜底（会话 backend 列）。"""
+    return str(_role_conf(config, role).get("adapter") or role)
+
+
+def _session_row(store, role: str) -> dict | None:
+    """读该角色的 sessions 行（读盘观察落盘真相，§9.1/§16.9）；无则 None。"""
+    for s in session_rows(store):
+        if s.get("role") == role:
+            return s
+    return None
+
+
+def _resume_session_ok(store, config: dict, role: str, adapter) -> dict | None:
+    """m3-contract §2 门控 (1)(2)：会话侧热续前置——adapter 支持 resume + sid 非空 + gen 未变。
+
+    满足则返回该角色 sessions 行（供 render_delta 取 last_evt / 传 sess）；否则 None。
+    门控(3)（黑板 version）**不在此判**：它与 §6.5 规则2（契约 version 变更→作废 sid）有
+    先后语义——规则2 需先跑 render_delta 读 needs_cold_start，故 (3) 的判定挪到
+    _render_for_dispatch 内、在 render_delta 之后（见该函数）。全部只读盘（§16.9）。
+    """
+    caps = getattr(adapter, "caps", None) or {}
+    if not caps.get("supports_resume"):
+        return None  # 门控(1)前半：adapter 不支持 resume。
+    srow = _session_row(store, role)
+    if srow is None or not srow.get("sid"):
+        return None  # 门控(1)后半：sid 非空。
+    # 门控(2)：sessions.gen 自上次渲染未变。
+    persisted_gen = store.get_meta(_RESUME_GEN_KEY.format(role=role))
+    if not persisted_gen or int(persisted_gen) != int(srow.get("gen") or 0):
+        return None
+    # last_evt 必须已持久化（否则无从算增量）。
+    if store.get_meta(_RESUME_LAST_EVT_KEY.format(role=role)) is None:
+        return None
+    return srow
+
+
+def _blackboard_version_advanced(store, role: str) -> bool:
+    """m3-contract §2 门控(3)：黑板 version 是否自上次渲染推进（≥1 step）。
+
+    比较持久化基线 resume_bb_version 与当前黑板 version 标量。基线缺失（从未渲染过）视为
+    「已推进」→ 不满足门控(3)。此判据只覆盖**非契约**的黑板变化（新决策/任务）——契约
+    version 变更由 §6.5 规则2（render_delta.needs_cold_start）单独处理并作废 sid。
+    """
+    persisted_bb = store.get_meta(_RESUME_BB_VERSION_KEY.format(role=role))
+    if persisted_bb is None:
+        return True
+    return int(persisted_bb) != _blackboard_version(store)
+
+
+def _invalidate_sid(store, config: dict, role: str, srow: dict) -> None:
+    """§6.5 规则2：作废该角色 sid（sessions.sid 置空 + gen 递增），走 store 既有公开接口。
+
+    store 的 sessions 写通道只有 reply_and_done(session=...)（DDL 冻结，§4.3，不新增方法）。
+    这里用一条**无副作用的 system 事件**承载 session upsert：把 sid 置空、gen 在原值上 +1，
+    last_evt 保持不变。该 system 事件 to=[moderator] 会生成一条 pending 派发行——但它落盘后
+    立即随本轮冷启动流程被后续 reply 覆盖会话；为不残留待办，落盘后立即把其自身派发行标 done。
+
+    作废后同时清掉该角色 resume_* 持久化键，确保后续轮不再误判可热续。
+    """
+    old_gen = int(srow.get("gen") or 0)
+    backend = _adapter_name(config, role)
+    invalidate_evt = {
+        "from": "system",
+        "type": "system",
+        "to": ["moderator"],
+        "re": [],
+        "body": (
+            f"§6.5 规则2：契约 version 变更 → 作废角色 {role} 会话 sid"
+            f"（gen {old_gen}→{old_gen + 1}），回退冷启动。"
+        ),
+        "artifacts": [],
+        "corr": None,
+        "blackboard_ops": None,
+    }
+    session = {
+        "role": role,
+        "backend": backend,
+        "sid": None,                 # 置空 = 作废（§6.5 规则2）。
+        "last_evt": int(srow.get("last_evt") or 0),
+        "gen": old_gen + 1,          # gen 递增（§6.5 规则2）。
+    }
+    sys_id = store.reply_and_done(
+        done_event_id=None, done_target=None, reply=invalidate_evt, session=session,
+    )
+    # 该 system 事件自身派发行不留待办（建后即 done，与 §5.4 终止总结同规约）。
+    store.mark_done(sys_id, "moderator")
+    # 清掉该角色的热续持久化基线（作废后重新冷启动会写新基线）。
+    role_gen_key = _RESUME_GEN_KEY.format(role=role)
+    store.set_meta(role_gen_key, "")   # 空串 = 无有效基线（_resume_eligible 视为不满足）。
+
+
+def _session_for_upsert(store, config: dict, role: str, event_ids: list[int],
+                        sess: dict | None) -> dict | None:
+    """把 adapter 返回的会话（{sid,gen}）规范化为 reply_and_done 的 session upsert 入参。
+
+    §7.5 sessions 列：role / backend / sid / last_evt / gen。sess 为 None（mock 无会话）→
+    返回 None（不 upsert，与接线前逐字一致）。backend 取角色绑定的 adapter 名（config）。
+    last_evt = 本批最大事件号（§6.5 下轮增量起点）。
+
+    gen 单调不减（spec §7.2"gen += 1"语义：会话代际计数只增）：取 adapter 返回 gen 与盘上
+    既有 gen 的较大者。这保证 §6.5 规则2 作废 sid 时 gen 递增（_invalidate_sid 把 gen 顶到
+    old+1）后，同轮回退冷启动的会话 upsert 不会把 gen 回退——作废痕迹（gen 递增）得以留存。
+    """
+    if sess is None:
+        return None
+    prev = _session_row(store, role) or {}
+    adapter_gen = int(sess.get("gen", 0) or 0)
+    prev_gen = int(prev.get("gen") or 0)
+    return {
+        "role": role,
+        "backend": _adapter_name(config, role),
+        "sid": sess.get("sid"),
+        "last_evt": int(max(event_ids)),
+        "gen": max(adapter_gen, prev_gen),
+    }
+
+
+def _persist_resume_state(store, config: dict, role: str, event_ids: list[int],
+                          sess: dict | None) -> None:
+    """成功渲染派发后持久化热续判据（§16.9 全部落盘，键名稳定可从盘重建）。
+
+    - last_evt = 本批最大事件号（下轮 render_delta 的增量起点）；
+    - bb_version = 当前黑板 version 标量（下轮门控3 比对基线）；
+    - resume_gen = 当前 sessions.gen（下轮门控2 比对基线）——从 sess 或 sessions 行取。
+
+    sess 为 adapter 返回的会话（{sid, gen}）；会话本身的 upsert 已在 reply_and_done 内完成
+    （见 _dispatch_group 调 reply_and_done 时传入 session）。此处只落"渲染判据基线"。
+    """
+    store.set_meta(_RESUME_LAST_EVT_KEY.format(role=role), str(max(event_ids)))
+    store.set_meta(_RESUME_BB_VERSION_KEY.format(role=role), str(_blackboard_version(store)))
+    srow = _session_row(store, role)
+    gen_val = int((srow or {}).get("gen") or 0)
+    store.set_meta(_RESUME_GEN_KEY.format(role=role), str(gen_val))
+
+
+def _render_for_dispatch(store, config: dict, role: str, event_ids: list[int],
+                         adapter) -> tuple[dict, dict | None]:
+    """R-T3 热续决策（同步/异步核心环复用同一函数）：决定本轮走 render_delta 还是 render_view。
+
+    返回 (view, resume_sess)：
+      - view：本轮要送 adapter.invoke 的视图（冷启动全量或热续增量）。
+      - resume_sess：热续时传给 adapter.invoke 的既有会话（{sid,gen}，供真实 CLI resume_cmd）；
+        冷启动为 None（start_cmd 全量）。
+
+    决策顺序（m3-contract §2 + §6.5 规则2 的先后语义）：
+      A) 门控(1)(2) 会话侧前置（supports_resume + sid 非空 + gen 未变）不满足 → 冷启动。
+      B) 满足 (1)(2) → 先 render_delta，**据其 meta.needs_cold_start 判 §6.5 规则2**：
+         needs_cold_start=True（新事件含契约 version 变更 ≥1，"需求被推翻级别的大改"）→
+         主动作废 sid（_invalidate_sid）+ 回退冷启动 render_view（不得发 delta 视图）。
+      C) needs_cold_start=False，再判门控(3)：黑板 version 若因**非契约**变化（新决策/任务）
+         推进（≥1 step）→ 回退冷启动（但**不作废 sid**，因非"大改"级别）；未推进 → 采用
+         delta 视图热续。
+
+    为何 (3) 挪到 render_delta 之后：契约 version 变更同时会推进黑板 version 标量，若把 (3)
+    放在 render_delta 之前，契约变更会被 (3) 先行拦成"普通冷启动"、永不作废 sid，规则2 落空。
+    先跑 render_delta 读 needs_cold_start，能把"契约大改（作废 sid）"与"非契约小改（保 sid
+    仅本轮冷启动）"精确分流——这正是 §6.5"小改增量、大改弃会话"的分野。
+
+    不满足门控 → 直接 render_view（冷启动）。mock/Fake 不支持 resume 时只走 (A) 冷启动分支，
+    与接线前行为逐字一致（既有 219+ 测试与混沌 MockAdapter 路径零扰动）。
+    """
+    srow = _resume_session_ok(store, config, role, adapter)
+    if srow is None:
+        return _assemble_view(store, config, role, event_ids), None
+
+    last_evt = int(store.get_meta(_RESUME_LAST_EVT_KEY.format(role=role)) or 0)
+    delta = orch.render.render_delta(
+        store, config, role=role, event_ids=list(event_ids),
+        last_evt=last_evt,
+    )
+    if delta.get("meta", {}).get("needs_cold_start"):
+        # §6.5 规则2：契约 version 变更（大改）→ 作废 sid，本轮回退冷启动全量。
+        _invalidate_sid(store, config, role, srow)
+        return _assemble_view(store, config, role, event_ids), None
+    # 门控(3)：黑板 version 因非契约变化推进 → 回退冷启动（保 sid，不作废）。
+    if _blackboard_version_advanced(store, role):
+        return _assemble_view(store, config, role, event_ids), None
+    # 热续：把既有会话传给 invoke（真实 CLI 据此 resume_cmd(sid)）。
+    resume_sess = {"sid": srow.get("sid"), "gen": int(srow.get("gen") or 0)}
+    return delta, resume_sess
+
+
 def _run_verify(config: dict, role: str) -> dict | None:
     """§8.3 验证钩子：回复为 acceptance 时编排器亲自执行 role.verify.cmd。
 
@@ -523,7 +753,12 @@ def _dispatch_group(
     # 提交当成对齐点自 diff 自身（永远合规）。捕获后审计分支恒有对齐点、恒执行。
     _ensure_audit_baseline(store, config, target)
 
-    view = _assemble_view(store, config, target, event_ids)
+    # R-T3（§6.5 热续增量接入）：由 _render_for_dispatch 统一决策本轮走 render_delta 还是
+    # render_view——门控(1)(2)(3) 全满足且 needs_cold_start=False 才发增量视图，否则冷启动
+    # 全量；契约 version 变更时先作废 sid 再回退冷启动（不发 delta 视图）。resume_sess 为热续
+    # 时传给 invoke 的既有会话（真实 CLI 据此 resume_cmd(sid)）；冷启动为 None。mock/Fake
+    # 不支持 resume 时只走冷启动分支，与接线前逐字一致（既有测试与混沌零扰动）。
+    view, resume_sess = _render_for_dispatch(store, config, target, event_ids, adapter)
     # 落 invoke log 用完整渲染视图文本（§14 / 契约 §4）；mock 仍按 view['event_ids'] 查表。
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
@@ -532,7 +767,7 @@ def _dispatch_group(
     # 重调说明段（含首次校验错误文本），token 估算同步更新；event_ids 不变（仍只重调一次）。
     attempt = 0
     env: dict | None = None
-    sess = None
+    sess = resume_sess       # 首次 invoke 携带既有会话（热续）或 None（冷启动）。
     last_errors: list[str] = []
     cur_view = view          # 首次用原视图；失败后切换为携带错误说明的重调视图。
     cur_view_text = view_text
@@ -632,13 +867,26 @@ def _dispatch_group(
     # 记录聚合埋点 batch_size（§13）。
     store.record_metric("batch_size", float(len(event_ids)), extra=target)
 
+    # R-T3（§6.5 热续接线）：把 adapter 返回的会话（{sid,gen}）在**回复落盘同一事务**内
+    # upsert 到 sessions 表（§7.5，走 store 既有 reply_and_done 的 session 通道，不新增 store
+    # 方法、不改 sessions DDL）。sess 为 None（mock 无会话）或 {sid,gen}（CLI/Fake）——None
+    # 时不 upsert，与接线前逐字一致（mock 恒冷启动、混沌零扰动）。
+    session_upsert = _session_for_upsert(store, config, target, event_ids, sess)
+
     # [事务(5)] 回复落盘 + 标 done（对本组每一行都标 done）。
     # reply_and_done 只标一行 done；组内其余行单独标 done（同批聚合，一次回复覆盖全组）。
     reply_id = store.reply_and_done(
-        done_event_id=event_ids[0], done_target=target, reply=reply, session=None
+        done_event_id=event_ids[0], done_target=target, reply=reply,
+        session=session_upsert,
     )
     for eid in event_ids[1:]:
         store.mark_done(eid, target)
+
+    # R-T3（§16.9）：会话 upsert 后持久化本轮热续判据基线（last_evt / bb_version / gen）到
+    # thread_meta，供下轮 _resume_eligible 从盘重建判断。仅当本轮确实产出会话（sess 非空）时
+    # 持久化——mock 无会话 → 不落基线 → 下轮仍冷启动（零扰动）。
+    if session_upsert is not None:
+        _persist_resume_state(store, config, target, event_ids, sess)
 
     # §3.2：越权已降级 report 落盘 → 追加一条 system 审计事件（编排器权威 from=system，§16.11）。
     if downgraded_from is not None:

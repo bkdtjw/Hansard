@@ -52,8 +52,11 @@ from orch.scheduler.core import (
     _handle_terminate,
     _is_cold_start,
     _last_ok_commit,
+    _persist_resume_state,
+    _render_for_dispatch,
     _role_conf,
     _role_worktree,
+    _session_for_upsert,
     _timeout_for,
     _view_with_retry_note,
     _write_scope,
@@ -223,7 +226,11 @@ async def _dispatch_group_async(
         # R-T2 · E（§8.2 首轮审计兜底，与 core._dispatch_group 同源同修）：worktree 存在但
         # 无 last_ok_commit 时，本轮 invoke 前取 HEAD 落盘为对齐点，使审计恒执行、拦首轮越权。
         _ensure_audit_baseline(store, config, target)
-        view = _assemble_view(store, config, target, event_ids)
+        # R-T3（§6.5 热续接入，与 core._dispatch_group 同源同修）：复用同一决策函数
+        # _render_for_dispatch——门控(1)(2)(3) + §6.5 规则2（契约 version 变更作废 sid）决定
+        # 走 render_delta 还是冷启动 render_view。决策读/写盘（sessions/thread_meta/黑板）均在
+        # 锁内（sqlite 单连接串行化）。resume_sess = 热续时传给 invoke 的既有会话（None=冷启动）。
+        view, resume_sess = _render_for_dispatch(store, config, target, event_ids, adapter)
 
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
@@ -232,7 +239,7 @@ async def _dispatch_group_async(
     # 在指令尾追加系统重调说明段，含首次校验错误文本，token 估算同步更新），event_ids 不变。
     attempt = 0
     env: dict | None = None
-    sess = None
+    sess = resume_sess       # 首次 invoke 携带既有会话（热续）或 None（冷启动）。
     last_errors: list[str] = []
     cur_view = view          # 首次原视图；失败后切换为携带错误说明的重调视图。
     cur_view_text = view_text
@@ -330,12 +337,21 @@ async def _dispatch_group_async(
         # §13 batch_size 埋点（M3 契约 §3）
         store.record_metric("batch_size", float(len(event_ids)), extra=target)
 
+        # R-T3（§6.5 热续接线，与 core._dispatch_group 同源同修）：把 adapter 返回的会话
+        # （{sid,gen}）在回复落盘同一事务内 upsert 到 sessions 表；sess=None（mock）→ 不 upsert。
+        session_upsert = _session_for_upsert(store, config, target, event_ids, sess)
+
         # 回复落盘 + 标 done
         reply_id = store.reply_and_done(
-            done_event_id=event_ids[0], done_target=target, reply=reply, session=None
+            done_event_id=event_ids[0], done_target=target, reply=reply,
+            session=session_upsert,
         )
         for eid in event_ids[1:]:
             store.mark_done(eid, target)
+
+        # R-T3（§16.9）：会话 upsert 后持久化本轮热续判据基线（last_evt/bb_version/gen）。
+        if session_upsert is not None:
+            _persist_resume_state(store, config, target, event_ids, sess)
 
         if downgraded_from is not None:
             append_system_event(

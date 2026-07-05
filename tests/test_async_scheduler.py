@@ -440,3 +440,66 @@ def test_async_schema_retry_view_carries_error_note_and_retries_once(thread_dir)
     )
     replies = [e for e in st.events() if e["from"] == role]
     assert replies and replies[-1]["type"] == "report", "second legal reply should persist"
+
+# ==================================================================
+# R-T3 · §6.5 热续增量接入**异步**核心环（async_core.run_thread_async）
+#   证明 async 与 sync 同源同修：复用同一 _render_for_dispatch 决策——第二轮走 render_delta。
+#   FakeCliAdapter(supports_resume=True) 只有同步 invoke，async 路径经 to_thread 包裹。
+# ==================================================================
+
+def _async_resume_cfg() -> dict:
+    return {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "adapters": {
+            "cli": {"kind": "cli", "context_window": 100_000, "timeout_s": 600},
+        },
+        "roles": {
+            "backend": {"adapter": "cli", "can_decide": False,
+                        "write_scope": ["server/"], "tools": ["Edit", "Write"]},
+        },
+    }
+
+
+def test_async_resume_second_round_uses_render_delta(thread_dir, tmp_dir):
+    """async 路径两轮派发：round1 冷启动、round2 走 render_delta（与 sync 同源）。
+
+    §6.5 / m3-contract §2；断言 adapter 收到的 round2 视图无冷启动系统层「可写:」全文
+    且明显更短——证明异步核心环也消费了 render_delta 与门控/持久化链路。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend",
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 600},
+        worktree=wt,
+        scripted_replies={
+            1: {"to": ["human"], "type": "report", "body": "r1", "session": "sid-A"},
+        },
+    )
+    cfg = _async_resume_cfg()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="go", to=["backend"])
+
+    async def _run():
+        await orch.scheduler.run_thread_async(st, cfg, {"backend": ad})
+
+    asyncio.run(_run())
+    assert ad.call_no == 1
+    round1_text = ad.last_view_text
+    assert "可写:" in round1_text, "round1 冷启动（系统层含权限申报）"
+
+    # round2：唤醒，投新事件，续跑。
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="lian", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
+                              "session": "sid-A"}
+    asyncio.run(_run())
+
+    assert ad.call_no == 2
+    round2_text = ad.last_view_text
+    assert "可写:" not in round2_text, "round2 应走 render_delta（异步同源同修）"
+    assert "你是 backend" in round2_text, "热续指令尾必发"
+    assert len(round2_text) < len(round1_text), "render_delta 应明显短于冷启动"

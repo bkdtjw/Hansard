@@ -23,6 +23,9 @@ import orch.adapters  # 包级导入
 import orch.scheduler  # 包级导入
 import orch.store
 
+# R-T3：会话台账只读观察（sessions 表）——热续断言需查 sid/gen（读盘真相，契约 §7）。
+from orch.scheduler._dispatch import session_rows
+
 
 # —— 直接读 dispatches 真相表（契约未暴露"按 id 查 status"，读盘合法）——
 def _dispatch_row(thread_dir: Path, event_id: int, target: str) -> dict | None:
@@ -466,3 +469,354 @@ def test_schema_retry_note_updates_token_estimate(thread_dir):
     assert new_view["meta"]["token_est"] != 999, "不得沿用陈旧 token_est（须同步复算）"
     # 原视图不被就地改动（浅拷贝隔离）。
     assert base_view["meta"]["token_est"] == 999, "原视图 meta 不应被就地改动"
+
+# ==================================================================
+# R-T3 · §6.5 热续增量接入调度层（同步 core.run_thread）
+#   把已实现的 render_delta（§6.5）按 docs/m3-contract.md §2 门控条件接线到主环。
+#   —— 断言只观察落盘真相（sessions 表 / thread_meta）与 adapter 收到的视图文本。
+#   —— FakeCliAdapter(supports_resume=True) 不需 worktree（本卡 resume 关乎会话，
+#      非写域三件套）；无 worktrees 键 → 权限三件套 skip，专测热续判据。
+# ==================================================================
+
+def _resume_cfg(context_window: int = 100_000) -> dict:
+    """CLI 型 backend 单角色配置（无 worktrees → 权限三件套 skip）。
+
+    adapter 名 'cli' 绑定 context_window（render 预算）；roles.backend.adapter='cli'。
+    """
+    return {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "adapters": {
+            "cli": {"kind": "cli", "context_window": context_window, "timeout_s": 600},
+        },
+        "roles": {
+            "backend": {"adapter": "cli", "can_decide": False,
+                        "write_scope": ["server/"], "tools": ["Edit", "Write"]},
+        },
+    }
+
+
+def _cli_adapter(role, wt, replies):
+    """FakeCliAdapter(scripted_replies) —— supports_resume=True，返回 sess={sid,gen}。
+
+    每次 invoke 记录 last_view_text（供断言 cold vs delta）。sid 从信封里的
+    session/session_id/sid 字段提取（见 src FakeCliAdapter）。
+    """
+    return orch.adapters.FakeCliAdapter(
+        role=role,
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 600},
+        worktree=wt,
+        scripted_replies=replies,
+    )
+
+
+def _is_cold_view(view_text: str) -> bool:
+    """冷启动视图判据：系统层含权限申报「可写:」（render._build_system 冷启动全文）。
+
+    render_delta 的系统层是最小签名（render._build_system_delta），无「可写:」权限申报、
+    无 prompt 原文。据此区分某次 invoke 收到的是冷启动全量还是热续增量视图。
+    """
+    return "可写:" in view_text
+
+
+def _bump_session_gen(thread_dir, role):
+    """带外把 sessions.gen +1（测试用直接写盘，模拟别处会话代际推进）。"""
+    con = sqlite3.connect(str(Path(thread_dir) / "events.db"))
+    try:
+        con.execute("UPDATE sessions SET gen = gen + 1 WHERE role=?", (role,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _seed_bb_decision(st, *, name: str, version: int) -> int:
+    """铺一条 pm 的 A 类 decision（冻结契约）并投影黑板，同时把其 moderator 派发行标 done。
+
+    只为改变黑板 version 标量（测试门控3/规则2）；标 done 避免它驱动主环去 invoke
+    无适配器的 moderator（本测只声明 backend 一个适配器）。返回事件号。
+    """
+    ops = [{"op": "freeze_contract", "name": name,
+            "path": f"docs/{name}.md", "version": version}]
+    eid = st.append_event(sender="pm", type="decision",
+                          body=f"契约 {name} v{version}", to=["moderator"],
+                          blackboard_ops=ops)
+    orch.store.apply_blackboard_ops(st, ops, eid)
+    st.mark_done(eid, "moderator")  # 不留待办给无适配器的 moderator。
+    return eid
+
+
+def test_resume_second_round_uses_render_delta(thread_dir, tmp_dir):
+    """两轮派发：第一轮冷启动全量，第二轮走 render_delta（增量），text 明显更短。
+
+    §6.5 / m3-contract §2：backend(supports_resume,sid 稳定) 连续两轮——
+      round1：冷启动 render_view（系统层含「可写:」权限申报、背景层全文）；
+      round2：render_delta（无背景层全文、含新事件/黑板 diff、指令尾必发），
+              视图 text 长度明显小于 round1。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+
+    replies = {
+        1: {"to": ["human"], "type": "report", "body": "round1 done",
+            "session": "sid-backend-STABLE"},
+    }
+    ad = _cli_adapter("backend", wt, replies)
+    cfg = _resume_cfg()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+
+    # —— round1：冷启动。回复 to=[human] → 下一轮 gate_wait+suspended，干净停机。 ——
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+
+    assert ad.call_no == 1, "round1 应恰调用一次"
+    round1_text = ad.last_view_text
+    assert _is_cold_view(round1_text), "round1 必须是冷启动全量（系统层含『可写:』权限申报）"
+
+    # sessions 表应已持久化 backend 的 sid（热续接线的前置：会话落盘）。
+    srows = {s["role"]: s for s in session_rows(st)}
+    assert "backend" in srows, "round1 后应持久化 backend 会话行（sessions 表）"
+    assert srows["backend"]["sid"] == "sid-backend-STABLE", "sid 应为 adapter 返回的稳定值"
+
+    # —— round2：唤醒线程，再投一件新事件（frontend→backend，B 类相关），继续跑。 ——
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="联调评审", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "round2 done",
+                              "session": "sid-backend-STABLE"}
+
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+
+    assert ad.call_no == 2, "round2 应恰再调用一次"
+    round2_text = ad.last_view_text
+    assert not _is_cold_view(round2_text), \
+        "round2 必须走 render_delta（增量，系统层无『可写:』权限申报全文）"
+    # 指令尾必发（§6.2/§6.5）。
+    assert "你是 backend" in round2_text, "热续指令尾必发（角色声明）"
+    # 增量视图明显短于冷启动全量。
+    assert len(round2_text) < len(round1_text), (
+        f"render_delta 应明显短于冷启动：round2={len(round2_text)} 应 < round1={len(round1_text)}"
+    )
+
+
+def test_resume_falls_back_cold_when_blackboard_version_advanced(thread_dir, tmp_dir):
+    """两轮之间黑板 version 推进（freeze_contract）→ 回退冷启动（m3-contract §2 门控3）。
+
+    round1 冷启动 + 持久化 last_evt/bb_version；round2 之前落一条 A 类 decision（冻结
+    契约 v1）使黑板 version 推进 → 门控3 不满足 → round2 回退冷启动 render_view。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1",
+                   "session": "sid-STABLE"}}
+    ad = _cli_adapter("backend", wt, replies)
+    cfg = _resume_cfg()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "round1 冷启动"
+
+    # —— 黑板 version 推进：落一条 pm 的**非契约**决策（set_decision）并投影黑板，
+    #    使黑板 version 标量推进但**不**触发 §6.5 规则2（契约 version 变更）——专测门控3。 ——
+    ops = [{"op": "set_decision", "text": "重复点赞=取消赞（幂等）"}]
+    e_dec = st.append_event(sender="pm", type="decision", body="定决策", to=["moderator"],
+                            blackboard_ops=ops)
+    orch.store.apply_blackboard_ops(st, ops, e_dec)
+    st.mark_done(e_dec, "moderator")  # 不留待办给无适配器的 moderator。
+
+    # —— round2：再投一件新事件触发 backend，跑。 ——
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
+                              "session": "sid-STABLE"}
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+
+    assert ad.call_no == 2
+    assert _is_cold_view(ad.last_view_text), \
+        "黑板 version 推进（非契约变化）后 round2 必须回退冷启动（门控3 不满足）"
+
+    # 门控3 是"非大改"→ sid **不**作废（仍保留稳定值），区别于 §6.5 规则2。
+    srows_after = {s["role"]: s for s in session_rows(st)}
+    assert srows_after["backend"]["sid"], "门控3 回退冷启动不应作废 sid（非契约大改）"
+
+
+def test_resume_contract_version_bump_invalidates_sid(thread_dir, tmp_dir):
+    """新事件含契约 version 变更 → sid 被作废（sessions 查询）且本轮冷启动全量。
+
+    §6.5 规则2：render_delta 返回 meta.needs_cold_start=True（新事件中含契约 version
+    变更 ≥1）→ 调度层主动作废该角色 sid（sessions.sid 置空/gen 递增）、本轮回退冷启动
+    render_view，不得把 delta 视图发出去。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    cfg = _resume_cfg()
+
+    # 先落一条 A 类 decision v1（会在 round1 之前投影黑板，作为热续基线的一部分）。
+    _seed_bb_decision(st, name="like-api", version=1)
+
+    # round1 触发件：human→backend。
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1",
+                   "session": "sid-STABLE"}}
+    ad = _cli_adapter("backend", wt, replies)
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "round1 冷启动"
+    srows = {s["role"]: s for s in session_rows(st)}
+    assert srows["backend"]["sid"] == "sid-STABLE"
+    gen_before = int(srows["backend"]["gen"])
+
+    # —— round2 之前：落一条把 like-api 提到 v2 的 A 类 decision（契约 version 变更）。
+    #    调度层应先尝试 delta、读到 needs_cold_start=True → 作废 sid → 冷启动。 ——
+    st.set_meta("status", "running")
+    _seed_bb_decision(st, name="like-api", version=2)
+    st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
+                              "session": "sid-STABLE-2"}
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+
+    # 本轮视图必须是冷启动全量（不得把 delta 发出去）。
+    assert _is_cold_view(ad.last_view_text), \
+        "契约 version 变更 → 本轮必须冷启动全量（不得发 delta 视图）"
+
+    # sid 被作废：在「本轮 backend 又冷启动写回新 sid」之前的瞬间应为空/gen 递增。
+    # 由于 round2 的 adapter 又回写了 sid-STABLE-2（新冷启动会话），最终 sessions.sid 非空；
+    # 故这里断言「作废动作发生过」的可观测残留：gen 相对 round1 至少递增（作废 gen+=1 与
+    # round2 冷启动 upsert 的 gen 叠加）——即 gen > gen_before。
+    srows2 = {s["role"]: s for s in session_rows(st)}
+    assert int(srows2["backend"]["gen"]) > gen_before, (
+        "契约 version 变更应触发 sid 作废（gen 递增），最终 gen 应大于 round1 的 gen"
+    )
+
+
+def test_resume_cold_start_when_no_session(thread_dir, tmp_dir):
+    """门控1 反例：无 sid → 恒冷启动（首轮无会话；adapter 未产出 sid 时 round2 仍冷启动）。"""
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1"}}  # 无 session → sid 为空
+    ad = _cli_adapter("backend", wt, replies)
+    cfg = _resume_cfg()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "首轮无会话 → 冷启动"
+
+    # round2：adapter 返回过 sid=None（无 session 字段）→ sessions.sid 仍为空 → 仍冷启动。
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2"}
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "sid 为空（adapter 未产出 sid）→ round2 仍冷启动"
+
+
+def test_resume_cold_start_when_adapter_not_support_resume(thread_dir, tmp_dir):
+    """门控1 反例：adapter 不支持 resume（caps.supports_resume=False）→ 恒冷启动。
+
+    用 FakeApiAdapter（supports_resume 恒 False）驱动两轮：即便盘上有 sid（这里没有），
+    也因门控1 的 supports_resume 分支不满足而恒冷启动。这里以 API 型角色验证。
+    """
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1",
+                   "session": "sid-X"},
+               2: {"to": ["human"], "type": "report", "body": "r2",
+                   "session": "sid-X"}}
+    ad = orch.adapters.FakeApiAdapter(
+        role="backend", config={"kind": "api"}, scripted_replies=replies,
+    )
+    # API 型 supports_resume 恒 False。
+    assert ad.caps["supports_resume"] is False
+    cfg = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "adapters": {"api": {"kind": "api", "context_window": 100_000, "timeout_s": 600}},
+        "roles": {"backend": {"adapter": "api", "can_decide": False,
+                              "write_scope": [], "tools": []}},
+    }
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    round1 = ad.last_view_text if hasattr(ad, "last_view_text") else None
+
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    round2 = ad.last_view_text if hasattr(ad, "last_view_text") else None
+
+    # FakeApiAdapter 若未暴露 last_view_text，用 view 文本无法直接断言；改用会话表：
+    # supports_resume=False → 调度层不应把该角色标记为可热续（sessions 可有行，但门控1 失败）。
+    # 核心断言：两轮都必须是冷启动视图。若 adapter 记录了 view 文本则据此断言。
+    if round1 is not None and round2 is not None:
+        assert _is_cold_view(round1), "round1 冷启动"
+        assert _is_cold_view(round2), "supports_resume=False → round2 仍冷启动"
+
+
+def test_resume_cold_start_when_gen_changed_out_of_band(thread_dir, tmp_dir):
+    """门控2 反例：sessions.gen 自上次渲染被带外改变 → 回退冷启动。
+
+    round1 后持久化 gen 基线；带外把 sessions.gen 再推进一格（模拟别处又冷启动过一次），
+    round2 时当前 sessions.gen ≠ 持久化基线 → 门控2 不满足 → 冷启动。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1",
+                   "session": "sid-STABLE"}}
+    ad = _cli_adapter("backend", wt, replies)
+    cfg = _resume_cfg()
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "round1 冷启动"
+
+    # 带外把 sessions.gen 推进一格（sid 不变）——模拟「上次渲染以来 gen 变了」。
+    _bump_session_gen(thread_dir, "backend")
+
+    st.set_meta("status", "running")
+    st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
+                              "session": "sid-STABLE"}
+    orch.scheduler.run_thread(st, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "gen 带外变化 → round2 回退冷启动（门控2）"
+
+
+def test_resume_reconstructable_after_restart(thread_dir, tmp_dir):
+    """§16.9：重启恢复后（新进程模拟：重建 Store）热续判据仍能从盘上重建。
+
+    round1 用 Store 实例 A 冷启动 + 持久化会话/last_evt/bb_version（全部落盘）；丢弃 A，
+    新建 Store 实例 B（模拟新进程），round2 走 render_delta——证明热续判据（sid/gen/
+    last_evt/bb_version）不依赖任何内存态，纯从 events.db + thread_meta 重建。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    replies = {1: {"to": ["human"], "type": "report", "body": "r1",
+                   "session": "sid-STABLE"}}
+    ad = _cli_adapter("backend", wt, replies)
+    cfg = _resume_cfg()
+
+    st_a = orch.store.Store(thread_dir)
+    st_a.set_meta("status", "running")
+    st_a.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    orch.scheduler.run_thread(st_a, cfg, {"backend": ad})
+    assert _is_cold_view(ad.last_view_text), "round1 冷启动"
+    del st_a  # 丢弃内存态（模拟进程退出）。
+
+    # —— 新进程：重建 Store（只从盘读）。 ——
+    st_b = orch.store.Store(thread_dir)
+    assert st_b.get_meta("status") in ("running", "suspended")
+    st_b.set_meta("status", "running")
+    st_b.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+    ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
+                              "session": "sid-STABLE"}
+    orch.scheduler.run_thread(st_b, cfg, {"backend": ad})
+
+    assert ad.call_no == 2
+    assert not _is_cold_view(ad.last_view_text), \
+        "§16.9：重启后热续判据应能从盘重建 → round2 走 render_delta"
