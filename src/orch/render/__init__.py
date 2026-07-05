@@ -512,6 +512,11 @@ def render_view(
         + estimate_tokens(instruction_text)
     )
 
+    # §13 背景层压缩比采集（R-T4）：原文 = 压缩前背景层全文 token；摘要 = 压缩后最终
+    # 背景层 token。二值随 render 一起产出（meta.bg_orig_tokens / bg_summarized_tokens），
+    # 由**调度层**在派发后 record_metric（render 模块不持有 store，保持现分层，§2）。
+    bg_orig_tokens = estimate_tokens(_join_background(background_items))
+
     # —— 预算压缩（§6.3）：配比裁剪（地板）+ 超上限总量压缩 ——
     focus_rendered, background_text, dropped = _compress(
         focus_events=focus_events,
@@ -521,6 +526,7 @@ def render_view(
         budget=budget,
         bg_quota=bg_quota,
     )
+    bg_summarized_tokens = estimate_tokens(background_text)
     # dropped 顺序：背景（配比+总量，最旧先丢）→ 黑板尾截 → 焦点截断，保持
     # "背景整体先于焦点"的既有断言，黑板裁剪夹在二者之间（既非 background 亦非 focus）。
     if blackboard_dropped:
@@ -556,6 +562,9 @@ def render_view(
         },
         "dropped": dropped,
         "cold_start": bool(cold_start),
+        # §13 背景层压缩比采集点（调度层派发后据此 record_metric，R-T4）。
+        "bg_orig_tokens": bg_orig_tokens,
+        "bg_summarized_tokens": bg_summarized_tokens,
     }
 
     return {

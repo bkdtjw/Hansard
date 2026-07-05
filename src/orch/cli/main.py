@@ -865,8 +865,8 @@ def cmd_metrics(
     round_counts: list[int] = []
     cost_values: list[float] = []
     batch_sizes: list[float] = []
+    token_row_count = 0            # `tokens` 行数 = invoke 计数（§13 首次合法率分母/"总调用数"）
     schema_retry_vals: list[float] = []
-    schema_total_vals: list[float] = []
     bg_orig_vals: list[float] = []
     bg_summarized_vals: list[float] = []
 
@@ -876,12 +876,15 @@ def cmd_metrics(
         round_counts.append(len(events))
         cost_values.extend(_collect_metric_values(store, "cost"))
         batch_sizes.extend(_collect_metric_values(store, "batch_size"))
+        # §13：每次 invoke 一条 tokens 行；行数即 invoke 计数（首次合法率的"总调用数"）。
+        token_row_count += len(_collect_metric_values(store, "tokens"))
         schema_retry_vals.extend(_collect_metric_values(store, "schema_retry"))
-        schema_total_vals.extend(_collect_metric_values(store, "schema_total"))
         bg_orig_vals.extend(_collect_metric_values(store, "bg_orig_tokens"))
         bg_summarized_vals.extend(_collect_metric_values(store, "bg_summarized_tokens"))
 
     avg_rounds = statistics.mean(round_counts) if round_counts else None
+    # §13 成本：仅当有真实 cost 行（adapter 暴露 last_usage）才求和；否则 None → N/A
+    # （诚实边界，禁止编造 cost=0；Mock/Fake 无用量 → 恒 N/A，真实后端 Q1/Q2 陪跑充值）。
     total_cost = sum(cost_values) if cost_values else None
 
     # —— 2) 聚合节省 %：Σ(batch_size-1)/总调用数 ——
@@ -891,11 +894,13 @@ def cmd_metrics(
     else:
         agg_save_pct = None
 
-    # —— 3) 首次合法率 %：1 - retry/total ——
-    total_calls = sum(schema_total_vals) if schema_total_vals else sum(batch_sizes) if batch_sizes else None
-    retry_calls = sum(schema_retry_vals) if schema_retry_vals else None
-    if total_calls and total_calls > 0 and retry_calls is not None:
-        first_legal_pct = (1.0 - retry_calls / total_calls) * 100.0
+    # —— 3) 首次合法率 %：1 - schema_retry 行数 ÷ invoke(tokens) 行数（§13，R-T4 复算口径）——
+    # 分母 = tokens 行数（每次 invoke 一条），分子 = schema_retry 行数（每次校验失败一条）。
+    # 有 invoke 记录（tokens 行≥1）时即可复算：无 retry 行 → retry=0 → 首次合法率 100%（真实
+    # 反映"全部一次合法"，非 N/A）；无任何 invoke 记录 → N/A（不臆造）。
+    retry_calls = sum(schema_retry_vals)  # 无行时为 0.0
+    if token_row_count > 0:
+        first_legal_pct = (1.0 - retry_calls / token_row_count) * 100.0
     else:
         first_legal_pct = None
 

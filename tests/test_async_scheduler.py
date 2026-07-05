@@ -281,6 +281,47 @@ def test_run_thread_async_records_batch_size_metric(thread_dir):
 
 
 # ==================================================================
+# (b-4) R-T4 · §13 tokens 采集点：异步路径每次 invoke 也记一条 tokens 行（同源同修）
+# ==================================================================
+
+def test_run_thread_async_records_tokens_metric(thread_dir):
+    """§13 采集点1（R-T4）：run_thread_async 每次 invoke 记一条 tokens 行——与 core 同源同修。
+
+    构造：pm 聚合一次 invoke（batch_size=2）+ moderator 一次 terminate → 共 2 次 invoke →
+    metrics 表应有 2 条 tokens 行；且无 schema_retry 行（全合法）、无 cost 行（Fake 无用量）。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="backend", type="question", body="q1", to=["pm"])
+    st.append_event(sender="frontend", type="answer", body="a1", to=["pm"])
+
+    cfg = _config()
+    cfg["roles"]["pm"] = {"can_decide": True, "write_scope": ["docs/"]}
+    ad_pm = orch.adapters.FakeApiAdapter(
+        role="pm", config={"kind": "api"},
+        scripted_reply={"to": ["moderator"], "type": "handoff", "body": "aggregated"},
+    )
+    ad_mod = orch.adapters.FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_reply={"to": [], "type": "terminate", "body": "done"},
+    )
+    adapters = {"pm": ad_pm, "moderator": ad_mod}
+
+    async def _run():
+        await orch.scheduler.run_thread_async(st, cfg, adapters)
+
+    asyncio.run(_run())
+
+    tokens = _read_metrics(thread_dir, "tokens")
+    assert len(tokens) == 2, (
+        f"§13：2 次 invoke（pm 聚合 + moderator terminate）应记 2 条 tokens 行，实测 {len(tokens)}"
+    )
+    assert all(float(r["value"]) > 0 for r in tokens), "tokens_in 应为正 token 估算（可复算）"
+    assert _read_metrics(thread_dir, "schema_retry") == [], "全合法不应有 schema_retry 行"
+    assert _read_metrics(thread_dir, "cost") == [], "Fake 无 last_usage → 不记 cost 行"
+
+
+# ==================================================================
 # (c-1) §5.2 register_async_job：非阻塞启动 + 状态流转 pending/running→done + 系统事件回调
 # ==================================================================
 

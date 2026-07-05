@@ -820,3 +820,83 @@ def test_resume_reconstructable_after_restart(thread_dir, tmp_dir):
     assert ad.call_no == 2
     assert not _is_cold_view(ad.last_view_text), \
         "§16.9：重启后热续判据应能从盘重建 → round2 走 render_delta"
+
+
+# ——————————————————————————————————————————————————————————————
+# R-T4 · §13 采集点随代码交付：调度层单次派发即落 tokens / batch_size / schema_retry
+# ——————————————————————————————————————————————————————————————
+
+def _metric_rows(store, key: str) -> list[float]:
+    rows = store._con.execute(
+        "SELECT value FROM metrics WHERE key=?", (key,)
+    ).fetchall()
+    return [float(r["value"]) for r in rows]
+
+
+def test_dispatch_records_tokens_and_batch_no_retry_on_legal_reply(thread_dir):
+    """§13 采集点（R-T4）：一次合法派发落 1 条 tokens 行 + 1 条 batch_size 行，
+    0 条 schema_retry 行（首次即合法）。tokens_in 可复算 = 派发视图 token_est。"""
+    st = _drive_one_dispatch(
+        thread_dir, role="backend", can_decide=False,
+        reply_env={"to": ["human"], "type": "report", "body": "已完成"},
+    )
+    tokens = _metric_rows(st, "tokens")
+    batch = _metric_rows(st, "batch_size")
+    retries = _metric_rows(st, "schema_retry")
+
+    assert len(tokens) == 1, f"一次合法派发应恰 1 条 tokens 行，实测 {len(tokens)}"
+    assert len(batch) == 1, f"一次派发应恰 1 条 batch_size 行，实测 {len(batch)}"
+    assert retries == [], f"首次即合法不应有 schema_retry 行，实测 {retries}"
+    # tokens_in 可复算：> 0（视图非空）。
+    assert tokens[0] > 0, "tokens_in 应为派发视图的正 token 估算（可复算）"
+
+
+def test_dispatch_records_one_schema_retry_on_one_illegal_reply(thread_dir):
+    """§13 采集点2（R-T4）：首次非法 → 记恰 1 条 schema_retry 行；invoke 记 2 条
+    tokens 行（首次非法 + 重调合法各一次），首次合法率分母/分子由此复算。"""
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    role = "backend"
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=[role])
+    adapter = _RecordingScriptedAdapter(role, {
+        1: {"type": "report", "body": "缺 to 非法"},          # 缺必填 to → 校验失败
+        2: {"to": ["human"], "type": "report", "body": "已修正重发"},
+    })
+    orch.scheduler.run_thread(st, _d_config(role), {role: adapter})
+
+    retries = _metric_rows(st, "schema_retry")
+    tokens = _metric_rows(st, "tokens")
+    assert len(retries) == 1, f"一次非法回复应恰记 1 条 schema_retry，实测 {len(retries)}"
+    assert len(tokens) == 2, (
+        f"非法+重调合法共 2 次 invoke → 2 条 tokens 行，实测 {len(tokens)}"
+    )
+    # 首次合法率复算 = 1 - retry/invoke = 1 - 1/2 = 50%（本单次派发切片）。
+    first_legal = (1.0 - len(retries) / len(tokens)) * 100.0
+    assert abs(first_legal - 50.0) < 0.01, f"本切片首次合法率应 50%，实测 {first_legal}"
+
+
+def test_dispatch_records_background_compression_metric(thread_dir):
+    """§13 采集点3（R-T4）：有背景层内容的派发落 bg_orig_tokens / bg_summarized_tokens 行。
+
+    构造：先播若干 report（C 类 → 背景层），再触发对 backend 的一次派发，
+    该派发视图背景层非空 → 调度层据 view.meta 落两条 bg_* 行（可复算压缩比）。"""
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    # 背景 report（C 类 → 背景层）：立即标 done，仅作背景上下文，不实际派发
+    # （无 moderator adapter；避免派发到无适配器目标）。
+    for i in range(3):
+        rid = st.append_event(sender="frontend", type="report", to=["moderator"],
+                              body=f"背景报告 {i}")
+        st.mark_done(rid, "moderator")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    adapter = orch.adapters.MockAdapter(
+        role="backend", script={e1: {"to": ["human"], "type": "report", "body": "ok"}},
+        ledger_path=thread_dir / "ledger.txt",
+    )
+    orch.scheduler.run_thread(st, _d_config("backend"), {"backend": adapter})
+
+    orig = _metric_rows(st, "bg_orig_tokens")
+    summ = _metric_rows(st, "bg_summarized_tokens")
+    assert orig, "背景层非空的派发应落 bg_orig_tokens 行（§13 采集点3）"
+    assert summ, "背景层非空的派发应落 bg_summarized_tokens 行（§13 采集点3）"
+    assert orig[0] > 0, "背景原文 token 应 > 0（可复算）"

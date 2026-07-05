@@ -745,3 +745,66 @@ def test_budget_blackboard_ratio_tail_truncated_keeps_head(thread_dir):
         (isinstance(d, dict) and d.get("layer") == "blackboard")
         for d in dropped
     ), "meta.dropped 须记录 blackboard 裁剪（§6.3）"
+
+
+# ==================================================================
+# R-T4 · §13 背景层压缩比采集点：render_view.meta 携带 orig/summarized token
+# ==================================================================
+
+def test_render_view_meta_carries_background_compression_tokens(thread_dir):
+    """§13 采集点3（R-T4）：render_view.meta 必须携带 bg_orig_tokens /
+    bg_summarized_tokens——供调度层派发后 record_metric（render 不持 store，§2）。
+
+    背景不超配额场景：两值应相等（未触发压缩），且 = 背景段 token 估算，可复算。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    # 少量背景件（不超 20% 配额，不触发压缩）：一条 report（C 类 → 背景层）。
+    st.append_event(sender="frontend", type="report", to=["moderator"],
+                    body="一条进背景层的进度报告")
+    fid = st.append_event(sender="tester", type="defect", to=["backend"],
+                          body="焦点触发件")
+    cfg = m1_config(context_window=100000)
+
+    view = orch.render.render_view(
+        st, cfg, role="backend", event_ids=[fid],
+        cold_start=True, instruction="x",
+    )
+    meta = view["meta"]
+    assert "bg_orig_tokens" in meta and "bg_summarized_tokens" in meta, (
+        "meta 必须携带 §13 背景压缩比采集点 bg_orig_tokens / bg_summarized_tokens"
+    )
+    orig = meta["bg_orig_tokens"]
+    summ = meta["bg_summarized_tokens"]
+    assert isinstance(orig, int) and isinstance(summ, int)
+    # 未触发压缩 → 摘要 token == 原文 token；且 = 最终背景段 estimate_tokens（可复算）。
+    assert summ == orig, f"未压缩时 orig==summarized，实测 orig={orig} summ={summ}"
+    assert summ == orch.render.estimate_tokens(view["sections"]["background"]), (
+        "bg_summarized_tokens 必须 = 最终背景段 estimate_tokens（可复算对照）"
+    )
+
+
+def test_render_view_meta_compression_ratio_shrinks_when_over_quota(thread_dir):
+    """§13 采集点3：背景超配额被压缩时，bg_summarized_tokens < bg_orig_tokens
+    （压缩比 = summarized/orig < 1，反映真实压缩，非恒等）。"""
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    # 大量背景件撑过 20% 小窗配额，强制压缩。
+    for i in range(40):
+        st.append_event(sender="frontend", type="report", to=["moderator"],
+                        body=f"BGRATIO{i:02d} background summary padding content line here")
+    fid = st.append_event(sender="tester", type="defect", to=["backend"],
+                          body="focus anchor")
+    cfg = m1_config(context_window=4000)
+
+    view = orch.render.render_view(
+        st, cfg, role="backend", event_ids=[fid],
+        cold_start=True, instruction="x",
+    )
+    meta = view["meta"]
+    orig = meta["bg_orig_tokens"]
+    summ = meta["bg_summarized_tokens"]
+    assert orig > 0, "本场景背景层非空"
+    assert summ < orig, (
+        f"背景超配额被压缩 → summarized({summ}) < orig({orig})（压缩比 < 1）"
+    )

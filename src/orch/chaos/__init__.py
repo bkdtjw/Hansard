@@ -178,7 +178,17 @@ class ChaosHarness:
     # ------------------------------------------------------------------
     # 对外主入口
     # ------------------------------------------------------------------
-    def run(self, rounds: int = 50) -> ChaosReport:
+    def run(self, rounds: int = 50, metrics_store=None) -> ChaosReport:
+        """跑 rounds 轮混沌；可选 metrics_store 落 §13 混沌指标（R-T4）。
+
+        metrics_store（缺省 None）：**行为不变**——不传时不落任何指标，与 R-T1 既有
+        50 轮硬门槛调用路径逐字一致（test_chaos_50rounds 直接调 _run_one_round，也不受
+        本参数影响）。传入 Store 时，全部轮跑完后落两条 §13 混沌指标行（可复算）：
+          - `chaos_rounds`           = rounds（轮数）；
+          - `chaos_mock_pass_pct`    = passed / rounds * 100（mock 层通过率，硬门槛应 100）。
+        真实层完成率仍不落（chaos_real_pass_pct）→ orch metrics 显示 N/A（Q1/Q2 陪跑边界，
+        不伪造）。落盘走 store.record_metric 公开原语（不改 metrics DDL §4.3）。
+        """
         report = ChaosReport(rounds=rounds, passed=0)
 
         # 先跑不中断基准（附录B 第四断言的逐字节比较基线，R-T1）。
@@ -223,6 +233,15 @@ class ChaosHarness:
                 if ("terminal" in reason or "types" in reason
                         or "board" in reason or "baseline" in reason):
                     report.terminal_ok = False
+
+        # §13 采集点4（R-T4）：可选把混沌轮数与 mock 层通过率落 metrics 表（可复算）。
+        # 缺省 metrics_store=None → 完全跳过（行为不变，向后兼容 50 轮硬门槛）。
+        if metrics_store is not None:
+            mock_pass_pct = (report.passed / rounds * 100.0) if rounds else 0.0
+            metrics_store.record_metric("chaos_rounds", float(rounds), extra="mock")
+            metrics_store.record_metric(
+                "chaos_mock_pass_pct", float(mock_pass_pct), extra="mock",
+            )
 
         return report
 

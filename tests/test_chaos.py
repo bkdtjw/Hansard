@@ -215,3 +215,46 @@ def test_chaos_harness_each_round_reaches_terminate(tmp_dir, like_feature_script
         assert status == "terminated", (
             f"{tdir.name}: 混沌恢复后线程必须到达 terminated；实测 status={status!r}"
         )
+
+
+# ==================================================================
+# (b-6) R-T4 · ChaosHarness.run(metrics_store=...) 落 §13 混沌指标（缺省不变）
+# ==================================================================
+
+def test_chaos_run_metrics_store_records_rounds_and_pass_pct(tmp_dir, like_feature_script):
+    """R-T4：ChaosHarness.run(metrics_store=store) 跑完后向该 store 落两条 §13 混沌指标：
+    chaos_rounds（=rounds）与 chaos_mock_pass_pct（=passed/rounds*100）。3 轮全过 → 100%。"""
+    import orch.chaos
+    import orch.store
+
+    ws = tmp_dir / "chaos-ws"
+    ws.mkdir()
+    mstore = orch.store.Store(ws / "t-metrics")
+
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws / "rounds", script=like_feature_script, seed=3,
+    )
+    (ws / "rounds").mkdir(parents=True, exist_ok=True)
+    report = harness.run(rounds=3, metrics_store=mstore)
+    assert report.passed == 3
+
+    def _vals(key):
+        return [float(r["value"]) for r in mstore._con.execute(
+            "SELECT value FROM metrics WHERE key=?", (key,)).fetchall()]
+
+    assert _vals("chaos_rounds") == [3.0], "chaos_rounds 应落一条 = rounds(3)"
+    pp = _vals("chaos_mock_pass_pct")
+    assert pp and abs(pp[-1] - 100.0) < 0.01, f"3 轮全过 → mock 通过率 100%，实测 {pp}"
+
+
+def test_chaos_run_default_metrics_store_none_no_side_effect(tmp_dir, like_feature_script):
+    """R-T4 向后兼容：缺省 metrics_store（None）时 run 不落任何 chaos 指标、行为不变。"""
+    import orch.chaos
+
+    ws = tmp_dir / "chaos-ws2"
+    ws.mkdir()
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws, script=like_feature_script, seed=4,
+    )
+    report = harness.run(rounds=2)  # 不传 metrics_store
+    assert report.rounds == 2 and report.passed == 2

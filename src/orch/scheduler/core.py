@@ -73,6 +73,76 @@ def _view_with_retry_note(view: dict, errors: list[str]) -> dict:
     return new_view
 
 
+# ——————————————————————————————————————————————————————————————
+# R-T4 · §13 指标采集点（采集点随代码一起交付，禁止事后补测不可复算的数字）
+#
+# 三个采集点埋在 core / async_core 的**同一决策函数**里（Lead §17 裁决落实）：
+#   1) 每次 invoke 记一条 `tokens` 行（tokens_in=派发视图 meta.token_est；
+#      tokens_out=对回复 body 跑 estimate_tokens）。invoke 计数 = `tokens` 行数，
+#      是 §13 首次合法率的分母（"总调用数"）。
+#   2) 每次 schema 校验失败记一条 `schema_retry` 行（§13 首次合法率分子="退回次数"）。
+#   3) 费用：**仅当** adapter 显式暴露真实用量/计费（属性 last_usage）时记 `cost` 行；
+#      Mock/Fake 无 last_usage → 不记（orch metrics 成本字段显示 N/A，禁止编造 cost=0）。
+# 这些 record_metric 都走 store 既有公开原语（不改 metrics DDL §4.3）。
+# ——————————————————————————————————————————————————————————————
+
+def _record_invoke_tokens(store, target: str, view_text_in: str, raw_env) -> None:
+    """§13 采集点1：每次 invoke 记一条 tokens 行（可复算，随代码交付）。
+
+    tokens_in = 本次实际送出的视图文本 estimate_tokens（= view.meta.token_est 同口径，
+    §6.3 全系统一致）；tokens_out = 对回复 body 文本跑 estimate_tokens（非法回复无合法
+    body → 0）。value 存 tokens_in；extra 记 'role:in=..:out=..' 供审计与复算对照。
+    """
+    tokens_in = orch.render.estimate_tokens(view_text_in or "")
+    body = ""
+    if isinstance(raw_env, dict):
+        b = raw_env.get("body")
+        if isinstance(b, str):
+            body = b
+    tokens_out = orch.render.estimate_tokens(body)
+    store.record_metric(
+        "tokens", float(tokens_in),
+        extra=f"{target}:in={tokens_in}:out={tokens_out}",
+    )
+
+
+def _record_render_compression(store, target: str, view: dict) -> None:
+    """§13 采集点3：渲染时记 背景层 原文/摘要 token（背景压缩比）。
+
+    从 render_view 产出的 view.meta 读 bg_orig_tokens / bg_summarized_tokens（render 模块
+    不持 store，故落盘在调度层，保持现分层 §2）。仅当**原文非 0**（确有背景层内容）时记录
+    —— 无背景层内容压缩比无意义（分母为 0），不落 bg_* 行；orch metrics 无行显示 N/A。
+    热续 render_delta 无背景层（不含该 meta 键）→ 自然跳过（get 兜 0）。压缩比由 orch
+    metrics 对全部 bg_* 行求均值（Σ summarized ÷ Σ orig）。
+    """
+    if not isinstance(view, dict):
+        return
+    meta = view.get("meta") or {}
+    orig = meta.get("bg_orig_tokens")
+    summ = meta.get("bg_summarized_tokens")
+    if not isinstance(orig, (int, float)) or orig <= 0:
+        return
+    summ_val = float(summ) if isinstance(summ, (int, float)) else 0.0
+    store.record_metric("bg_orig_tokens", float(orig), extra=target)
+    store.record_metric("bg_summarized_tokens", summ_val, extra=target)
+
+
+def _record_invoke_cost(store, target: str, adapter) -> None:
+    """§13 采集点1（费用侧）：仅当 adapter 暴露真实用量 last_usage 时记 cost 行。
+
+    协议（Lead §17 裁决）：adapter 有 `last_usage` 属性且其含数值 'cost'（或可换算的
+    真实计费字段）→ 记一条 cost 行；否则**不记**（Mock/Fake 无 → orch metrics 成本 N/A）。
+    禁止编造 cost=0：无真实计费信息就不落任何 cost 行。真实后端 Q1/Q2 陪跑接入后自然充值。
+    """
+    usage = getattr(adapter, "last_usage", None)
+    if not isinstance(usage, dict):
+        return
+    cost = usage.get("cost")
+    if not isinstance(cost, (int, float)):
+        return
+    store.record_metric("cost", float(cost), extra=str(target))
+
+
 def _role_conf(config: dict, role: str) -> dict:
     return (config.get("roles") or {}).get(role, {}) or {}
 
@@ -759,6 +829,8 @@ def _dispatch_group(
     # 时传给 invoke 的既有会话（真实 CLI 据此 resume_cmd(sid)）；冷启动为 None。mock/Fake
     # 不支持 resume 时只走冷启动分支，与接线前逐字一致（既有测试与混沌零扰动）。
     view, resume_sess = _render_for_dispatch(store, config, target, event_ids, adapter)
+    # §13 采集点3：渲染背景层压缩比（原文/摘要 token）随派发落盘（render 不持 store，§2）。
+    _record_render_compression(store, target, view)
     # 落 invoke log 用完整渲染视图文本（§14 / 契约 §4）；mock 仍按 view['event_ids'] 查表。
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
@@ -778,10 +850,15 @@ def _dispatch_group(
             event_ids=event_ids, role=target,
             view_text=cur_view_text, output_text=str(raw_env),
         )
+        # §13 采集点1：每次 invoke 记 tokens（可复算）+ 可选 cost（有真实用量才记）。
+        _record_invoke_tokens(store, target, cur_view_text, raw_env)
+        _record_invoke_cost(store, target, adapter)
         errors = orch.protocol.validate_author_fields(raw_env)
         if not errors:
             env = raw_env
             break
+        # §13 采集点2：本次 schema 校验失败 → 记一条 schema_retry（首次合法率分子）。
+        store.record_metric("schema_retry", 1.0, extra=target)
         last_errors = errors
         attempt += 1
         # §5.1：下一次（原地重调）视图携带本次校验错误说明。

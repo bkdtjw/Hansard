@@ -53,6 +53,9 @@ from orch.scheduler.core import (
     _is_cold_start,
     _last_ok_commit,
     _persist_resume_state,
+    _record_invoke_cost,
+    _record_invoke_tokens,
+    _record_render_compression,
     _render_for_dispatch,
     _role_conf,
     _role_worktree,
@@ -231,6 +234,8 @@ async def _dispatch_group_async(
         # 走 render_delta 还是冷启动 render_view。决策读/写盘（sessions/thread_meta/黑板）均在
         # 锁内（sqlite 单连接串行化）。resume_sess = 热续时传给 invoke 的既有会话（None=冷启动）。
         view, resume_sess = _render_for_dispatch(store, config, target, event_ids, adapter)
+        # §13 采集点3：背景层压缩比随派发落盘（与 core 同源同修；仍在锁内写 store）。
+        _record_render_compression(store, target, view)
 
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
@@ -257,16 +262,21 @@ async def _dispatch_group_async(
                     to=["moderator"],
                 )
             return
-        # 审计原文（本次实际送出的视图文本）
+        # 审计原文（本次实际送出的视图文本）+ §13 采集点1 tokens/cost（与 core 同源同修）。
         async with lock:
             store.write_invoke_log(
                 event_ids=event_ids, role=target,
                 view_text=cur_view_text, output_text=str(raw_env),
             )
+            _record_invoke_tokens(store, target, cur_view_text, raw_env)
+            _record_invoke_cost(store, target, adapter)
         errors = orch.protocol.validate_author_fields(raw_env)
         if not errors:
             env = raw_env
             break
+        # §13 采集点2：本次 schema 校验失败 → 记一条 schema_retry（与 core 同源同修）。
+        async with lock:
+            store.record_metric("schema_retry", 1.0, extra=target)
         last_errors = errors
         attempt += 1
         # §5.1：下一次（原地重调）视图携带本次校验错误说明。
