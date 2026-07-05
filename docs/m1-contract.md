@@ -71,8 +71,10 @@ M1 mock 角色**无 worktree → 跳过**（真实 CLI 属 M2）；实现保留�
 ```python
 def check_watchdogs(store, config, *, now: float | None = None) -> list[dict]:
     """核心环每轮调用。now 可注入假时钟（测试用，默认 time.time()）。返回触发动作列表。
-    级别1 单次调用超时：now > deadline_ts → kill+attempt+1+重试1次+再败 failed 转 moderator
-      （M0 恢复路径已实现此对账；M1 在核心环主动触发）。
+    级别1 单次调用超时：now > deadline_ts → attempt+1（M1 仅计量）。
+      完整语义"kill 子进程 / 重试1次 / 再败 failed 转 moderator"属 **M2 真实后端**（mock 无子进程对象）；
+      M1 mock 同步返回不残留 dispatching，故级别1 在活循环中实际为 no-op，仅崩溃恢复注入假时钟的
+      测试路径会计 attempt。**不得据此误认为 M1 已具备超时 kill/重试**。
     级别2 互@环路：同一有序对 (A→B) 的 defect 事件数 ≥ loop_limit(默认3) → 自动 gate_request 升级 human。
     级别3 全局轮数：线程事件总数 ≥ max_rounds(默认100) → 自动 gate_request。
     """
