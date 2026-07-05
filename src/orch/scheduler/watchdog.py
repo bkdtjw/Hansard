@@ -1,15 +1,30 @@
 """§5.3 看门狗三级（核心环每轮主动调用）。
 
-三级判定与动作逐行对齐 spec §5.3 表格：
+spec §5.3 表格原文（宪法定义，逐字抄录，不做任何简化）：
 
-| 级别     | 判定                                    | 动作                                     |
-|----------|-----------------------------------------|------------------------------------------|
-| 单次调用 | now > deadline_ts                       | attempts+1（M0 恢复对账已实现同一 bump， |
-|          |                                         | 本层在核心环主动触发计一次 attempt）     |
-| 互@环路  | 同一有序对 (A→B) 的 defect 数 ≥ loop_limit | 自动 gate_request 升级人类               |
-| 全局轮数 | 线程事件总数 ≥ max_rounds                | 自动 gate_request                        |
+| 级别     | 判定                                        | 动作                                        |
+|----------|---------------------------------------------|---------------------------------------------|
+| 单次调用 | now > deadline_ts                           | kill 子进程；attempts+1；重试 1 次；再败 →   |
+|          |                                              | failed + 转 moderator                        |
+| 互@环路  | 同一有序对 (A→B) 的 defect 数 ≥ loop_limit  | 自动 gate_request 升级人类                   |
+| 全局轮数 | 线程事件总数 ≥ max_rounds                    | 自动 gate_request                            |
 
-铁律（spec §5.3 / §16.2 / §16.11）：
+**M1 本层实现范围的诚实说明（不得掩盖的缺口）**：
+  1. 单次调用（级别1）本层【仅】实现 attempts+1（bump_attempt 一次），不实现
+     "kill 子进程 / 重试 1 次 / 再败→failed+转 moderator" 的完整动作序列。
+  2. 完整动作序列需要一个真实子进程句柄去 kill、以及重试执行的真实后端；M1
+     worker 派发目前是 mock（无真实子进程对象可 kill），故该完整对账被**推迟
+     到 M2 真实后端实现**，此处只是提前占位计一次 attempt，不是"已对账"。
+  3. 此外，在当前核心环活循环里，mock 派发同步返回结果、不会残留
+     status='dispatching' 的行，因此 check_watchdogs 每轮主动触发时，级别1的
+     for 循环通常枚举不到任何行——即级别1在 M1 的“核心环主动触发”路径下
+     实际是 no-op；唯一能观察到 bump_attempt 生效的路径是测试里注入假时钟 /
+     手工构造 dispatching 行（例如 §9.1 崩溃恢复相关测试路径），而非真实活
+     循环中的主动触发。
+  以上三点均为 M1 阶段性事实，不代表功能"已完整"或"已对账"，仅为诚实记录，
+  避免"做一半当做完"。
+
+铁律（spec §5.3 / §16.2 / §16.11，本层遵守，与上面的范围声明不冲突）：
   - 定时依据一律**落盘绝对时间戳** dispatches.deadline_ts；判定只用注入/取样的 now
     与该时间戳比较，**禁止**内存倒计时 / sleep。
   - 环路与轮数每次**从日志现数、不落盘**（§9.1 可推导，无任何计数器持久化字段）。
@@ -93,13 +108,19 @@ def _raise_gate(store, *, body: str) -> int:
 def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[dict]:
     """核心环每轮调用。now 可注入假时钟（测试用，默认 time.time()）。返回触发动作列表。
 
-    §5.3 三级（判定与动作严格对齐 spec 表格 + docs/m1-contract.md §2）：
+    §5.3 三级判定与动作（本函数的**实现范围**，非 spec 表格全文——完整表格见本模块
+    顶部 docstring）：
       级别1 单次调用超时：对每个 status='dispatching' 的 (E_n,T)，若 now > deadline_ts →
-        bump_attempt（计一次 attempt；kill/重试/failed 转 moderator 的完整对账由 §9.1 恢复
-        路径承载，本层在核心环主动计 attempt）。时间只来自 now 参数（§16.2）。
+        仅 bump_attempt（计一次 attempt）。spec §5.3 表格要求的"kill 子进程 / 重试 1 次 /
+        再败 → failed + 转 moderator"完整动作序列【本层未实现】，留待 M2 真实后端（M1
+        worker 派发为 mock，无真实子进程可 kill）。此外 mock 派发同步返回、活循环中不会
+        残留 dispatching 行，故此级别在真实活循环主动触发路径下通常是 no-op；能触发
+        bump_attempt 的只有测试注入假时钟 / 手工构造 dispatching 行的场景。时间只来自
+        now 参数（§16.2）。
       级别2 互@环路：同一有序对 (A→B) 的 defect 数 ≥ loop_limit → gate_request(to=[human])
-        + 线程 suspended。
+        + 线程 suspended。（完整实现，非部分。）
       级别3 全局轮数：线程事件总数 ≥ max_rounds → gate_request(to=[human]) + suspended。
+        （完整实现，非部分。）
 
     返回的 list[dict] 每项形如 {'level':1|2|3, ...}，供调用方/测试观察；测试不绑定其内部
     结构，只观察落盘真相（attempts / gate_request 事件 / status）。级别2/3 一旦触发即挂起，
@@ -108,7 +129,11 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
     ts_now = time.time() if now is None else float(now)
     actions: list[dict] = []
 
-    # —— 级别1：单次调用超时 → attempts+1（落盘绝对时间戳判定，§16.2）——
+    # —— 级别1：单次调用超时 → 仅 bump_attempt 计一次 attempt（落盘绝对时间戳判定，§16.2）。
+    # 【范围声明】spec §5.3 要求的 kill 子进程/重试1次/再败转 moderator 完整动作序列
+    # 本层未实现，留待 M2 真实后端；M1 worker 派发为 mock 且同步返回，活循环中通常
+    # 枚举不到 dispatching 行，此级别在真实活循环里实际是 no-op（详见模块与函数
+    # docstring 的完整说明）——本行只做计数，不代表已完成对账。 ——
     for row in dispatching_rows(store):
         deadline = row.get("deadline_ts")
         if deadline is None:
