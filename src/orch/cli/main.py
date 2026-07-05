@@ -184,6 +184,35 @@ def _build_default_adapters(roles: list[str]) -> dict:
     return adapters
 
 
+def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path) -> dict:
+    """据 config（§11.1）为每角色装配**真实** CLI 适配器（Q1/Q2 陪跑接入）。
+
+    role → config.roles[role].adapter → config.adapters[name].kind：
+      - cli → CliAdapter（cwd=thread_dir；write_scope 空的角色无需 git worktree）。
+    role 层字段（can_decide/write_scope/tools/supports_resume）覆盖 adapter 层。
+    暂只支持 kind=cli（真实联跑）；其它 kind 显式报错，不臆造后端（诚实边界）。
+    """
+    from orch.adapters import CliAdapter
+
+    adapters_conf = config.get("adapters", {}) or {}
+    roles_conf = config.get("roles", {}) or {}
+    out: dict = {}
+    for role in roles:
+        rc = dict(roles_conf.get(role, {}) or {})
+        aname = rc.get("adapter")
+        ac = dict(adapters_conf.get(aname, {}) or {})
+        merged = {**ac, **rc}
+        kind = str(merged.get("kind", ac.get("kind", "")))
+        if kind == "cli":
+            out[role] = CliAdapter(role=role, config=merged, worktree=thread_dir)
+        else:
+            raise ValueError(
+                f"真实装配暂只支持 kind=cli（角色 {role!r} 解析到 kind={kind!r}）；"
+                "混合/API 后端属后续陪跑项。"
+            )
+    return out
+
+
 def _stop_marker_path(workspace: Path) -> Path:
     return workspace / "orch.stop"
 
@@ -247,9 +276,13 @@ def cmd_run(
             if not roles:
                 # 无角色配置 → 无从装配 adapters；跳过（run 骨架不臆造角色）。
                 continue
-            adapters = _build_default_adapters(roles)
+            cfg = _load_config(ws)
+            if cfg.get("adapters") and cfg.get("roles"):
+                adapters = _build_adapters_from_config(roles, cfg, tdir)
+            else:
+                adapters = _build_default_adapters(roles)
             try:
-                orch.scheduler.run_thread(store, _load_config(ws), adapters)
+                orch.scheduler.run_thread(store, cfg, adapters)
             except Exception as exc:  # noqa: BLE001 骨架层兜底：不因单个线程崩溃拖垮 run
                 _echo(f"[run] thread {tdir.name} error: {exc!r}")
 

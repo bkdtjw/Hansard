@@ -191,3 +191,15 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   · 前端零 console 错误、后端零异常。Chrome 扩展未连，改用 Claude Preview 起服务截图（玻璃感主界面清晰）；
     配置/指标视图截图因 preview 渲染器对 backdrop-filter 重绘超时（工具兼容问题，非产品缺陷，已用 DOM/HTTP 证据替代）。
 - 全量回归：pytest -q → 275 passed, 1 skipped（249 基线 + 26 web）；未改 chaos/scheduler，硬门槛不受影响。
+
+### 真实 CLI 后端接入（Q1/Q2 陪跑，2026-07-05，Lead 亲做）
+- 触发：用户在场，要求用真实 kimi/claude CLI 作 orchestrator 后端联跑。属诚实边界内"需人陪跑"，Lead 亲做（真实凭据/计费/输出即时把关）。
+- 实测（Lead 亲跑，非采信）：
+  · kimi 0.19.2：`kimi -p "<prompt>" --output-format stream-json` 非交互可用；回复在 `{"role":"assistant","content":...}`，session_id 在 `{"type":"session.resume_hint","session_id":...}` 行，resume `kimi -r <sid>`。Windows 可执行 `C:\Users\nirvana\.kimi-code\bin\kimi.exe`，subprocess 需完整路径 + UTF-8 解码（默认 gbk 乱码）。
+  · claude 2.1.201：`claude -p --output-format json`（result=回复文本、session_id 顶层字段）、`--session-id <uuid>` 可编排器自控、`-r/--resume`。但工具子进程 401（环境注入 ANTHROPIC_AUTH_TOKEN/BASE_URL 是本运行时的智谱代理凭据，unset 后回退 OAuth 亦过期）——claude TUI（OAuth 活在交互终端）能用、子进程读不到。凭据隔离，需用户终端修通，登记 QUESTIONS Q1。
+- 接入改动（均向后兼容，278 全绿）：
+  · adapters：新增 `_unwrap_agent_output(stdout, config)` 按 config.wire_format 解包（"text" 默认=M2 既有；"stream-json"=kimi 逐行 JSON 拼 assistant content + resume_hint sid；"json"=claude result/session_id）；CliAdapter.invoke 用它 + sid_hint 优先兜底 `_extract_sid`；Popen 加 encoding=utf-8/errors=replace；caps.supports_resume 读 config（kimi 设 false 走全冷启动，避免增量视图喂无记忆新 session）。
+  · cli/main.py：新增 `_build_adapters_from_config`（据 §11.1 装真实 CliAdapter，暂只 kind=cli，未知 kind 显式报错不臆造）；orch run 在 config 有 adapters+roles 时用真实装配，否则 Fake。
+  · tests/test_cli_adapter.py：+3 解包单测（kimi/claude/text），样例取自实测、json.dumps 构造，零测试计费。
+- 真实联跑（Lead 亲跑，线程 t-91bb9e71）：config 三角色全 kimi_cli → orch new 小任务 → 真实三方协作 E1..E7 全真实 kimi（backend 给方案→moderator 派 tester→tester 确认→moderator 汇报 human→human 指令→moderator terminate）→ terminated；E8 终止台账记录三角色真实 session_id。全链路：render 视图→kimi.exe subprocess→stream-json 解包→信封入队→调度→session 提取→终止清单。
+- 真实发现（记录，未即时修）：真实 agent 会自主 handoff 给未配置角色（moderator→tester，初次 roles 无 tester 时 run 抛 `KeyError('tester')`）。即时以"加 tester 角色"绕过；健壮性缺口=装配/调度对未知 target 应优雅拒收+审计而非崩环，属 spec 边界外增强，留后续（真实场景配全角色规避）。

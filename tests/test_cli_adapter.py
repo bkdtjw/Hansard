@@ -465,3 +465,53 @@ def test_cli_adapter_real_class_no_tools_no_flag(tmp_dir, monkeypatch):
     argv = captured.get("argv")
     assert argv is not None
     assert "--allowedTools" not in argv
+
+
+# ——————————————————————————————————————————————————————————————
+# Q1 陪跑接入：真实 CLI 输出解包（stream-json / json / text）
+# 样例形状取自 kimi.exe / claude 的实测输出（不真调 CLI，避免测试计费）。
+# ——————————————————————————————————————————————————————————————
+
+def test_unwrap_stream_json_kimi_shape():
+    """kimi -p --output-format stream-json：逐行 JSON，assistant.content 含信封块，
+    session_id 在 session.resume_hint 行（Q1 实测形状）。"""
+    import json as _json
+    from orch.adapters import _unwrap_agent_output, _extract_last_json_block
+    line1 = _json.dumps({
+        "role": "assistant",
+        "content": '```json\n{"to":["moderator"],"type":"report","body":"ok"}\n```',
+    })
+    line2 = _json.dumps({
+        "role": "meta", "type": "session.resume_hint",
+        "session_id": "session_abc123",
+    })
+    stdout = line1 + "\n" + line2
+    text, sid = _unwrap_agent_output(stdout, {"wire_format": "stream-json"})
+    assert sid == "session_abc123"
+    env = _json.loads(_extract_last_json_block(text))
+    assert env["to"] == ["moderator"]
+    assert env["type"] == "report"
+
+
+def test_unwrap_json_result_claude_shape():
+    """claude -p --output-format json：单 JSON，result 是回复文本，session_id 顶层字段。"""
+    import json as _json
+    from orch.adapters import _unwrap_agent_output, _extract_last_json_block
+    stdout = _json.dumps({
+        "type": "result",
+        "result": '方案如下\n```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```',
+        "session_id": "11111111-2222-4333-8444-555566667777",
+    })
+    text, sid = _unwrap_agent_output(stdout, {"wire_format": "json"})
+    assert sid == "11111111-2222-4333-8444-555566667777"
+    env = _json.loads(_extract_last_json_block(text))
+    assert env["type"] == "chat"
+
+
+def test_unwrap_text_mode_backward_compatible():
+    """text（默认）：整段即回复，sid_hint=None（交 _extract_sid 兜底，M2 既有语义不变）。"""
+    from orch.adapters import _unwrap_agent_output
+    raw = '```json\n{"to":["x"],"type":"chat","body":"y"}\n```'
+    text, sid = _unwrap_agent_output(raw, {})
+    assert text == raw
+    assert sid is None

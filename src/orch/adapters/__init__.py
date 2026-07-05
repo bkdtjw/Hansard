@@ -144,6 +144,54 @@ def _extract_sid(parsed_env: dict, stdout: str, config: dict) -> str | None:
     return None
 
 
+def _unwrap_agent_output(stdout: str, config: dict) -> tuple[str, str | None]:
+    """按 config.wire_format 从子进程 stdout 解出 (agent 回复文本, session_id)。
+
+    §7.2 真实 CLI 输出包装各异（陪跑实测，QUESTIONS.md Q1）：
+      - "text"（默认；claude 裸文本 / M2 既有行为）：整段 stdout 即回复；sid 交 _extract_sid。
+      - "stream-json"（kimi -p --output-format stream-json，实测）：逐行 JSON；
+        role=="assistant" 的 content 依序拼接为回复；带 session_id 的行（session.resume_hint）取会话号。
+      - "json"（claude -p --output-format json 单结果，实测）：整段是一个 JSON；
+        result 字段为回复文本；session_id 字段为会话号。
+    回复文本再交 _extract_last_json_block 取信封。纯格式转换，无角色逻辑（§7.6）。
+    """
+    wire = str(config.get("wire_format", "text"))
+    if wire == "stream-json":
+        parts: list[str] = []
+        sid: str | None = None
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("role") == "assistant" and isinstance(obj.get("content"), str):
+                parts.append(obj["content"])
+            if sid is None:
+                cand = obj.get("session_id")
+                if isinstance(cand, str) and cand:
+                    sid = cand
+        return "\n".join(parts), sid
+    if wire == "json":
+        try:
+            obj = json.loads(stdout)
+        except json.JSONDecodeError:
+            return stdout, None
+        if isinstance(obj, dict):
+            text = obj.get("result")
+            sid = obj.get("session_id")
+            return (
+                text if isinstance(text, str) else stdout,
+                sid if isinstance(sid, str) and sid else None,
+            )
+        return stdout, None
+    return stdout, None
+
+
 def _strip_to_author_fields(raw: dict) -> dict:
     """§3.1/§7.6：只保留作者字段。系统字段由编排器权威赋值，禁止后端自报（§16.11）。"""
     return {k: raw[k] for k in _AUTHOR_FIELDS if k in raw}
@@ -221,7 +269,7 @@ class CliAdapter:
         self.config = dict(config)
         self.worktree = Path(worktree)
         self.caps = caps if caps is not None else _caps_from_config(
-            config, supports_resume=True
+            config, supports_resume=bool(config.get("supports_resume", True))
         )
 
     def invoke(
@@ -246,6 +294,8 @@ class CliAdapter:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",  # 真实 CLI（kimi/claude）输出恒 UTF-8；Windows 默认 gbk 会乱码（Q1 实测）
+            errors="replace",
         )
         try:
             stdout, _stderr = proc.communicate(timeout=timeout_s or None)
@@ -256,7 +306,8 @@ class CliAdapter:
                 f"CliAdapter[{self.role}] timed out after {timeout_s}s"
             )
 
-        block = _extract_last_json_block(stdout or "")
+        agent_text, sid_hint = _unwrap_agent_output(stdout or "", self.config)
+        block = _extract_last_json_block(agent_text or "")
         if block is None:
             raise ValueError(
                 f"CliAdapter[{self.role}] no ```json block in stdout"
@@ -269,7 +320,9 @@ class CliAdapter:
             ) from e
 
         env = _strip_to_author_fields(parsed)
-        sid = _extract_sid(parsed, stdout or "", self.config)
+        # stream-json/json 解包已给出 sid_hint（kimi resume_hint / claude session_id）；
+        # 兜底走 _extract_sid（text 模式的信封字段 / 正则），保持 M2 既有语义。
+        sid = sid_hint or _extract_sid(parsed, stdout or "", self.config)
         prev_gen = int((sess or {}).get("gen", 0))
         new_sess: dict | None = {"sid": sid, "gen": prev_gen + 1}
         return env, new_sess
