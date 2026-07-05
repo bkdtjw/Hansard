@@ -19,6 +19,11 @@ M2 契约 §3 追加权限三件套 ensure_worktrees / audit_write_scope / autoc
 
 from __future__ import annotations
 
+from orch.scheduler.async_core import (
+    register_async_job,
+    run_thread_async,
+    run_workspace,
+)
 from orch.scheduler.core import run_thread
 from orch.scheduler.permissions import (
     audit_write_scope,
@@ -31,6 +36,9 @@ from orch.scheduler.watchdog import check_watchdogs
 
 __all__ = [
     "run_thread",
+    "run_thread_async",
+    "register_async_job",
+    "run_workspace",
     "recover",
     "apply_gate_decision",
     "check_watchdogs",
