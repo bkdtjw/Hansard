@@ -21,6 +21,11 @@ import orch.render
 import orch.store
 
 from orch.scheduler._dispatch import session_rows
+from orch.scheduler.permissions import (
+    audit_write_scope,
+    autocommit,
+    reset_hard,
+)
 from orch.scheduler.systemexec import (
     append_system_event,
     run_privileged_and_callbacks,
@@ -37,6 +42,33 @@ _MAX_SCHEMA_RETRY = 1
 
 def _role_conf(config: dict, role: str) -> dict:
     return (config.get("roles") or {}).get(role, {}) or {}
+
+
+def _role_worktree(config: dict, role: str):
+    """M2：从 config['worktrees'][role] 读该角色的 worktree 路径（M2 契约 §3）。
+
+    M0/M1 mock 语境不设 worktrees → 返回 None → 三件套整体 skip（保 127 绿）。
+    """
+    from pathlib import Path
+    wts = (config or {}).get("worktrees") or {}
+    p = wts.get(role)
+    if not p:
+        return None
+    return Path(p)
+
+
+def _write_scope(config: dict, role: str) -> list[str]:
+    """§8.2 审计所需的写域申报（M2 契约 §5，roles[role].write_scope）。"""
+    return list(_role_conf(config, role).get("write_scope") or [])
+
+
+def _last_ok_commit(config: dict) -> str | None:
+    """§8.2 审计所需的对齐点：上个合法 commit。M2 契约 §3 从 config['last_ok_commit'] 读。
+
+    未提供则返回 None → 审计跳过（无对齐点无法执行 diff）；autocommit 仍会执行。
+    """
+    v = (config or {}).get("last_ok_commit")
+    return str(v) if v else None
 
 
 def _timeout_for(config: dict, role: str) -> float:
@@ -355,6 +387,38 @@ def _dispatch_group(
             to=["moderator"],
         )
         return False
+
+    # ————————————————————————————————————————————————————————
+    # §4.5 + §8.2 权限三件套接入：仅当该角色有 worktree 时启用（M0/M1 mock skip）。
+    # 顺序（spec §5.1 伪代码 (4)）：autocommit → audit_write_scope → 违规拒收+reset+审计。
+    # ————————————————————————————————————————————————————————
+    worktree_path = _role_worktree(config, target)
+    if worktree_path is not None:
+        last_ok_commit = _last_ok_commit(config)
+        # 用本批最大 event_id 命名 commit（同批一次 invoke，一次 wip 提交，§4.5）。
+        commit_evt = max(event_ids)
+        autocommit(worktree_path, role=target, event_id=commit_evt)
+
+        if last_ok_commit:
+            ok, violations = audit_write_scope(
+                worktree_path, _write_scope(config, target), last_ok_commit,
+            )
+            if not ok:
+                # §8.2 违规处理：整体拒收该信封 + git reset --hard {last_ok_commit} +
+                # 追加 system 审计事件转 moderator（简化决策，不做部分裁剪）。
+                reset_hard(worktree_path, last_ok_commit)
+                for eid in event_ids:
+                    store.mark_failed(eid, target)
+                append_system_event(
+                    store,
+                    body=(
+                        f"§8.2 write_scope 越权：role={target} "
+                        f"E{event_ids} audit rejected，越权路径={violations}；"
+                        f"已 git reset --hard 到 {last_ok_commit}。"
+                    ),
+                    to=["moderator"],
+                )
+                return False
 
     # 定稿信封：系统字段 from + §8.3 verify 钩子（含 acceptance 降级）。
     reply = _finalize_envelope(store, config, target, env)
