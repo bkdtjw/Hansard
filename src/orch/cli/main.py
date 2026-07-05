@@ -1,4 +1,4 @@
-"""用户界面 CLI（spec §12 子集，M2-T4）。
+"""用户界面 CLI（spec §12 子集，M2-T4 + M3-T4）。
 
 typer 单文件实现，命令与 spec §12 表一致：
   orch run [--once]                     启动调度进程（常驻；--once 一次循环退出）
@@ -11,6 +11,7 @@ typer 单文件实现，命令与 spec §12 表一致：
   orch reopen t-xxx                     线程 status → running
   orch attach t-xxx role                打印该角色原生会话接入命令（sid=None 兜底）
   orch threads                          列 workspace 下所有 t-xxx 线程
+  orch bench resume --fixture X --runs N   开/关 resume 的 tokens_in 对比实验（§12/§13，M3-T4）
 
 【M2 骨架边界】
   - worktrees / 权限 三件套由 T3 落地；本层新建 workspace/t-xxx/{events.db, blackboard, logs}。
@@ -19,11 +20,25 @@ typer 单文件实现，命令与 spec §12 表一致：
     只做常驻循环骨架 + orch.stop 消费。真实 CLI/API 由 config 覆盖（M3 完善）。
   - 各命令的具体 flag 措辞取自 spec §12 表 + M2 契约 §5；与真实 CLI 的 flag 联跑差异属 §17
     开放决策（升级 QUESTIONS.md）。
+
+【M3-T4 边界（本卡新增）】
+  - `orch bench resume`：不启真子进程，只跑内部 render_view + estimate_tokens 估算
+    （M3 契约 §5：bench resume 用 pytest fixture 生成简化任务而非附录B）。
+  - "关 resume"（冷启动）路径：每轮都对完整事件流跑一次 orch.render.render_view
+    （cold_start=True），tokens_in = 该轮视图的 token_est。
+  - "开 resume"（热续）路径：本卡只写 CLI 层，不改 orch.render（其 render_delta 由
+    T2 另卡实现，不在本卡可写路径内）。本层用 render_view 已冻结的公开产物
+    自行近似热续增量：首轮仍是全量冷启动，之后各轮只对"上一轮之后新增的事件"
+    重新走 render_view 并只统计新增焦点段 + 指令尾（黑板层固定段沿用首轮估算，
+    不重复计入），从而得到一个不依赖未落地 render_delta 符号、且与其真实契约方向一致
+    （新事件全文 + 黑板 diff + 指令尾必发）的 tokens_in 近似值，供 bench 相对对比使用。
+    真实精确的 render_delta 落地后，bench 可直接切换调用（记 IMPLEMENTATION_NOTES.md）。
 """
 
 from __future__ import annotations
 
 import json
+import statistics
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +47,7 @@ import typer
 
 import orch.store
 import orch.scheduler
+import orch.render
 
 
 app = typer.Typer(
@@ -39,6 +55,13 @@ app = typer.Typer(
     no_args_is_help=True,
     help="orch —— 异构多智能体编排系统 CLI（spec §12 子集）。",
 )
+
+bench_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="orch bench —— 基准对比实验（spec §12/§13）。",
+)
+app.add_typer(bench_app, name="bench")
 
 
 # ——————————————————————————————————————————————————————————————
@@ -537,6 +560,213 @@ def cmd_attach(
         cmd = f"{backend} --resume {sid}"
     _echo(f"[attach] thread={thread} role={role} backend={backend} sid={sid}")
     _echo(f"  {cmd}")
+
+
+# ——————————————————————————————————————————————————————————————
+# orch bench resume（spec §12/§13，M3-T4）
+# ——————————————————————————————————————————————————————————————
+
+def _bench_config(context_window: int = 100_000) -> dict:
+    """bench 用的最小 config（结构同 docs/m1-contract.md §5；prompt 缺省为占位文本）。
+
+    只声明一个 backend 角色（bench 只关心"某角色多轮 invoke 的 tokens_in"，
+    不需要多角色编排）；adapter=mock，context_window 足够大以避免触发 §6.3 压缩
+    干扰 bench 对比（压缩会让 cold/resume 差异失真）。
+    """
+    return {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "adapters": {"mock": {"kind": "mock", "context_window": context_window}},
+        "roles": {
+            "backend": {
+                "adapter": "mock",
+                "can_decide": False,
+                "write_scope": ["server/"],
+                "tools": ["Edit", "Write"],
+                "prompt": None,
+            },
+        },
+    }
+
+
+def _bench_fixture_events(fixture: str) -> list[dict]:
+    """bench 用简化任务事件序列（M3 契约 §5：用 pytest fixture 而非附录B）。
+
+    fixture 名目前只需一个稳定别名 "like"（对齐 tests/test_bench_cli.py）；
+    未识别的 fixture 名也退化到同一套简化序列（bench 不因陌生 fixture 名报错，
+    只是对比实验，容错优先）。序列刻意含多轮 pm/tester → backend 的 B 类事件 +
+    一条 A 类 decision，用以体现"新事件全文 + 黑板 diff"的热续增量方向。
+    """
+    return [
+        {"sender": "pm", "type": "review", "to": ["backend"],
+         "body": f"[{fixture}] PRD v1 发起评审，请 backend 确认字段。"},
+        {"sender": "pm", "type": "decision", "to": ["moderator"],
+         "body": f"[{fixture}] 契约 like-api v1 冻结",
+         "blackboard_ops": [
+             {"op": "freeze_contract", "name": "like-api",
+              "path": "docs/like-api.md", "version": 1},
+         ]},
+        {"sender": "backend", "type": "answer", "to": ["pm"],
+         "body": f"[{fixture}] 已确认字段，开始实现。"},
+        {"sender": "tester", "type": "defect", "to": ["backend"],
+         "body": f"[{fixture}] 已删资源二次操作返回 500，请修复。"},
+        {"sender": "pm", "type": "decision", "to": ["moderator"],
+         "body": f"[{fixture}] 契约 like-api v2 冻结（幂等语义）",
+         "blackboard_ops": [
+             {"op": "freeze_contract", "name": "like-api",
+              "path": "docs/like-api.md", "version": 2},
+             {"op": "set_decision", "text": "二次操作按幂等处理，不报错"},
+         ]},
+        {"sender": "frontend", "type": "review", "to": ["backend"],
+         "body": f"[{fixture}] 前端联调发现返回体缺 updated_at 字段。"},
+    ]
+
+
+def _bench_seed(store: "orch.store.Store", fixture: str) -> list[int]:
+    ids: list[int] = []
+    for spec in _bench_fixture_events(fixture):
+        ids.append(store.append_event(**spec))
+    return ids
+
+
+def _bench_cold_tokens(store: "orch.store.Store", config: dict, event_ids: list[int]) -> int:
+    """关 resume（冷启动）：每轮对完整事件流重跑 render_view，tokens_in = token_est。"""
+    view = orch.render.render_view(
+        store, config,
+        role="backend", event_ids=event_ids, cold_start=True,
+        instruction="请处理以上事件。",
+    )
+    return int(view["meta"]["token_est"])
+
+
+def _bench_resume_tokens(
+    store: "orch.store.Store", config: dict,
+    event_ids: list[int], last_evt: int | None,
+) -> int:
+    """开 resume（热续近似）：首轮无差别走冷启动；此后只对"新增事件切片"
+    重新 render_view 并只计入其焦点段 + 指令尾（不重复计入系统层/黑板层——
+    热续时二者已在会话上下文中，§6.5 语义为"黑板 diff + 新事件 + 指令尾"，
+    本近似省略黑板 diff 的额外 token（首轮已含黑板全文），故为保守下界估算）。
+
+    本函数只使用 orch.render 已冻结导出的 render_view/estimate_tokens，
+    不依赖尚未落地的 render_delta（T2 另卡 owner，不在本卡可写路径）。
+    """
+    if last_evt is None:
+        return _bench_cold_tokens(store, config, event_ids)
+
+    new_ids = [eid for eid in event_ids if eid > last_evt]
+    if not new_ids:
+        # 无新事件：热续只需重发指令尾（近似为极小常量 token）。
+        instruction_text = f"你是 backend。现在只针对 回应：请处理以上事件。"
+        return orch.render.estimate_tokens(instruction_text)
+
+    # 只对新增切片跑 render_view（cold_start=False 语义上是热续视图），
+    # 其 token_est 近似 "新事件全文 + 指令尾"（该切片自身黑板层为空或极小，
+    # 因为 render_view 的黑板层取自当前 board.md 全文——为避免重复计入黑板全文，
+    # 这里改用 sections 拆分只累加 background+focus+instruction 三段）。
+    view = orch.render.render_view(
+        store, config,
+        role="backend", event_ids=new_ids, cold_start=False,
+        instruction="请处理以上事件。",
+    )
+    sections = view["sections"]
+    partial_text = "\n\n".join(
+        sections[name] for name in ("background", "focus", "instruction")
+        if sections.get(name, "").strip()
+    )
+    return orch.render.estimate_tokens(partial_text)
+
+
+def _run_bench_series(
+    ws: Path, fixture: str, runs: int, *, use_resume: bool,
+) -> list[int]:
+    """跑 runs 轮，每轮新建独立线程目录（互不干扰），返回每轮 tokens_in 列表。"""
+    config = _bench_config()
+    samples: list[int] = []
+    for i in range(runs):
+        tdir = ws / f"bench-{'resume' if use_resume else 'cold'}-{i}-{uuid.uuid4().hex[:6]}"
+        store = orch.store.Store(tdir)
+        ids = _bench_seed(store, fixture)
+        if not use_resume:
+            samples.append(_bench_cold_tokens(store, config, ids))
+        else:
+            # 首轮（前半段事件）冷启动建会话，后半段作为"新事件"走热续近似。
+            mid = max(1, len(ids) // 2)
+            first_ids, rest_ids = ids[:mid], ids
+            _ = _bench_cold_tokens(store, config, first_ids)  # 建立会话上下文（不计入 tokens_in 对比本身）
+            last_evt = first_ids[-1]
+            samples.append(_bench_resume_tokens(store, config, rest_ids, last_evt))
+    return samples
+
+
+@bench_app.command("resume")
+def cmd_bench_resume(
+    fixture: str = typer.Option(
+        "like", "--fixture", help="简化任务 fixture 别名（M3 契约 §5：非附录B）。",
+    ),
+    runs: int = typer.Option(
+        3, "--runs", help="开/关 resume 各跑的轮数（≥3 才有相对意义，§13）。",
+    ),
+    with_resume: bool = typer.Option(
+        False, "--with-resume", help="只跑「开 resume」一条路径。",
+    ),
+    no_resume: bool = typer.Option(
+        False, "--no-resume", help="只跑「关 resume」一条路径。",
+    ),
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    ),
+) -> None:
+    """§12/§13 `orch bench resume`：同 fixture 开/关 resume 各跑 N 次的 token 对比。
+
+    不启真子进程（M3 契约 §5）：只在内部对 orch.render 反复 invoke 并用
+    estimate_tokens 累计 tokens_in，比较冷启动全量 vs 热续增量近似的均值差与百分比。
+
+    --with-resume / --no-resume 均缺省时（默认）→ 两条路径都跑并给出对比报告；
+    只给其一 → 只跑该路径（用于单独抽查某侧, e-3 测试覆盖）。
+    """
+    ws = _resolve_workspace(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    # 默认（既不给 --with-resume 也不给 --no-resume）→ 两条路径都跑，产出完整对比报告。
+    # 只给其一 → 只跑该路径（e-3 测试覆盖：两开关各自独立可用）。
+    only_warm = with_resume and not no_resume
+    only_cold = no_resume and not with_resume
+    run_cold = not only_warm
+    run_warm = not only_cold
+
+    _echo(f"[bench resume] fixture={fixture} runs={runs} workspace={ws}")
+
+    cold_samples: list[int] = []
+    warm_samples: list[int] = []
+
+    if run_cold:
+        cold_samples = _run_bench_series(ws, fixture, runs, use_resume=False)
+        _echo(f"  no-resume tokens_in per run: {cold_samples}")
+
+    if run_warm:
+        warm_samples = _run_bench_series(ws, fixture, runs, use_resume=True)
+        _echo(f"  with-resume tokens_in per run: {warm_samples}")
+
+    if cold_samples:
+        cold_mean = statistics.mean(cold_samples)
+        _echo(f"  no-resume tokens_in mean: {cold_mean:.1f}")
+    if warm_samples:
+        warm_mean = statistics.mean(warm_samples)
+        _echo(f"  with-resume tokens_in mean: {warm_mean:.1f}")
+
+    if cold_samples and warm_samples:
+        cold_mean = statistics.mean(cold_samples)
+        warm_mean = statistics.mean(warm_samples)
+        diff = cold_mean - warm_mean
+        pct = (diff / cold_mean * 100.0) if cold_mean > 0 else 0.0
+        _echo(f"  tokens_in mean diff (no-resume - with-resume): {diff:.1f}")
+        _echo(f"  tokens saved %: {pct:.1f}%")
+    elif cold_samples or warm_samples:
+        _echo(
+            "  (single path run; pass without --with-resume/--no-resume, or run"
+            " the other side too, for a tokens saved % comparison)"
+        )
 
 
 # ——————————————————————————————————————————————————————————————
