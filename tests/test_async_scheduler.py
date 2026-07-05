@@ -544,3 +544,110 @@ def test_async_resume_second_round_uses_render_delta(thread_dir, tmp_dir):
     assert "可写:" not in round2_text, "round2 应走 render_delta（异步同源同修）"
     assert "你是 backend" in round2_text, "热续指令尾必发"
     assert len(round2_text) < len(round1_text), "render_delta 应明显短于冷启动"
+
+
+# ==================================================================
+# R-T5 发现1 · §9.3 异步生产路径同源崩溃恢复：run_thread_async 入口须补完
+#   被 kill 打断的终止清算（复用 core._finish_interrupted_terminate）。
+#   否则残留的终止总结事件 pending 会被主环当普通派发去 invoke → KeyError。
+# ==================================================================
+
+def _dispatch_rows(thread_dir: Path) -> list[dict]:
+    con = sqlite3.connect(str(Path(thread_dir) / "events.db"))
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT event_id, target, status FROM dispatches"
+            " ORDER BY event_id ASC, target ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def test_run_thread_async_recovers_interrupted_terminate(thread_dir):
+    """§9.3 异步生产路径：终止清算中途被 kill → run_thread_async 恢复续跑不抛 KeyError。
+
+    构造「终止清算中途被打断」的盘上真相（同 §5.4/§9.1 定义、参照 test_fault_inject 手法）：
+    先落 status=running + 一条 terminate 事件（E2，re=[E1]），再在 append_event_post 注入
+    FaultInjector 直接调 _handle_terminate——它 append 完总结事件（提交后）即被 SystemExit(137)
+    打断，恰留下：总结事件已落盘 + 其 (summary_id, moderator) 派发行仍 pending + status 仍
+    running（mark_done / set_meta 未执行）。这正是"被 kill 打断的终止清算"。
+
+    然后走 run_thread_async 恢复续跑，断言：
+      (1) run_thread_async 正常返回、不抛 KeyError（旧洞：残留总结 pending 被当普通派发送进
+          invoke；生产 mock 按事件号编排脚本时命中不到该号 → KeyError）；
+      (2) 终态 status == terminated；
+      (3) 总结事件不重复（幂等复用既有总结，type=system 且 re=[E2] 的事件恰 1 条）；
+      (4) moderator adapter 从未因这条残留 pending 被 invoke（call_no 保持 0）——最强判据：
+          证明恢复经 _finish_interrupted_terminate 消费该 pending，而非当普通派发送进 invoke。
+          缺此补完时该 pending 会被派发（call_no≥1），本断言即翻红。
+    """
+    from orch.scheduler.core import _handle_terminate
+
+    cfg = _config()
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+
+    # E1：触发件；E2：moderator 的 terminate（re=[E1]）。terminate 型不生成派发行（§5.4）。
+    e1 = st.append_event(sender="human", type="assign", body="go", to=["moderator"])
+    e2 = st.append_event(sender="moderator", type="terminate", body="done", re=[e1])
+
+    # —— 注入：append_event_post 第 1 次命中即崩。直接调 _handle_terminate：其内首个
+    #    append_event（总结事件）提交后触发注入 → SystemExit(137)，留下未闭合终止态。 ——
+    orch.store.set_fault_injector(orch.store.FaultInjector({"append_event_post": 1}))
+    killed = False
+    try:
+        term_ev = next(e for e in st.events() if e["id"] == e2)
+        _handle_terminate(st, cfg, term_ev)
+    except SystemExit as exc:
+        assert exc.code == 137
+        killed = True
+    finally:
+        orch.store.set_fault_injector(None)
+    assert killed, "注入应在总结事件 append 后触发 SystemExit(137)"
+
+    # —— 盘上真相：终止清算被打断的确切状态 —— #
+    assert st.get_meta("status") == "running", "被 kill：status 尚未置 terminated"
+    summaries = [e for e in st.events()
+                 if e["type"] == "system" and e2 in (e.get("re") or [])]
+    assert len(summaries) == 1, "总结事件已落盘一条"
+    summary_id = summaries[0]["id"]
+    resid = [d for d in _dispatch_rows(thread_dir)
+             if d["event_id"] == summary_id and d["status"] == "pending"]
+    assert resid, "总结事件的 (summary_id, moderator) 派发行仍 pending（残留待办）"
+
+    # moderator adapter：脚本仅含 call_no=1。若恢复把残留总结 pending 当普通派发送进 invoke，
+    # moderator 就会被调用（call_no≥1）——这正是本发现的崩溃面（残留总结 pending 被误当普通
+    # 派发；生产 mock 脚本按事件号编排时表现为 KeyError）。恢复补完正确时该 pending 由
+    # _finish_interrupted_terminate 幂等消费、绝不进 invoke → call_no 恒为 0。
+    ad_mod = orch.adapters.FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_replies={1: {"to": [], "type": "terminate", "body": "again"}},
+    )
+
+    # —— 恢复续跑：run_thread_async 入口应先补完终止清算（_finish_interrupted_terminate）。 ——
+    del st
+    st2 = orch.store.Store(thread_dir)
+
+    async def _run():
+        await orch.scheduler.run_thread_async(st2, cfg, {"moderator": ad_mod})
+
+    # (1) 不抛 KeyError（旧洞在此崩）。
+    asyncio.run(_run())
+
+    # (2) 终态 terminated。
+    assert st2.get_meta("status") == "terminated", (
+        f"恢复后应续跑至 terminated；实测 {st2.get_meta('status')!r}"
+    )
+    # (3) 总结事件不重复（幂等复用既有总结）。
+    summaries2 = [e for e in st2.events()
+                  if e["type"] == "system" and e2 in (e.get("re") or [])]
+    assert len(summaries2) == 1, (
+        f"恢复应幂等复用既有总结事件，不得重复 append；实测 {len(summaries2)} 条"
+    )
+    # (4) moderator 从未因残留 pending 被 invoke。
+    assert ad_mod.call_no == 0, (
+        "残留终止总结 pending 不该被当普通派发送进 invoke（应由恢复补完消费）；"
+        f"moderator 却被 invoke {ad_mod.call_no} 次"
+    )

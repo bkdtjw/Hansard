@@ -346,20 +346,7 @@ class Store:
 
             # ③ 会话 upsert（§7.5，更新时机在本事务内）。
             if session is not None:
-                self._con.execute(
-                    "INSERT INTO sessions(role, backend, sid, last_evt, gen)"
-                    " VALUES (:role, :backend, :sid, :last_evt, :gen)"
-                    " ON CONFLICT(role) DO UPDATE SET"
-                    "   backend=excluded.backend, sid=excluded.sid,"
-                    "   last_evt=excluded.last_evt, gen=excluded.gen",
-                    {
-                        "role": session["role"],
-                        "backend": session["backend"],
-                        "sid": session.get("sid"),
-                        "last_evt": int(session.get("last_evt", 0)),
-                        "gen": int(session.get("gen", 0)),
-                    },
-                )
+                self._upsert_session_row(session)
             self._con.commit()
         except BaseException:
             self._con.rollback()
@@ -367,6 +354,61 @@ class Store:
         # §4.4 事务(5) 提交后：故障注入点。
         _fault_check("reply_and_done_post")
         return reply_id
+
+    def _upsert_session_row(self, session: dict) -> None:
+        """§7.5 sessions upsert 的唯一内部实现（在调用方已开启的事务内执行，不自 commit）。
+
+        reply_and_done 的会话 upsert 与公开 upsert_session 复用此段——同一条 SQL、同一语义，
+        禁止两处各写一份（§4.3 DDL 冻结，列固定 role/backend/sid/last_evt/gen）。
+        """
+        self._con.execute(
+            "INSERT INTO sessions(role, backend, sid, last_evt, gen)"
+            " VALUES (:role, :backend, :sid, :last_evt, :gen)"
+            " ON CONFLICT(role) DO UPDATE SET"
+            "   backend=excluded.backend, sid=excluded.sid,"
+            "   last_evt=excluded.last_evt, gen=excluded.gen",
+            {
+                "role": session["role"],
+                "backend": session["backend"],
+                "sid": session.get("sid"),
+                "last_evt": int(session.get("last_evt", 0)),
+                "gen": int(session.get("gen", 0)),
+            },
+        )
+
+    def upsert_session(self, role: str, sid, gen: int, *,
+                       backend: str | None = None,
+                       last_evt: int | None = None) -> None:
+        """会话簿记：单事务直写 sessions 表（§7.5），不经事件日志（§4.2）。
+
+        sessions 表是**工作状态**而非事件真相：sid 作废、代际递增属会话簿记，不该借合成
+        事件污染事件日志（§4.2 事件日志=发生过什么）。语义与 reply_and_done 内的会话 upsert
+        完全一致、复用同一内部实现（_upsert_session_row），仅事务边界不同（此处自开自 commit）。
+
+        缺省保留既有行的 backend/last_evt（作废 sid 只改 sid+gen，不该动其余列）；无既有行时
+        backend 兜底空串、last_evt 兜底 0。sid 传 None = 作废。
+        """
+        row = self._con.execute(
+            "SELECT role, backend, sid, last_evt, gen FROM sessions WHERE role=?",
+            (role,),
+        ).fetchone()
+        prev = dict(row) if row is not None else {}
+        eff_backend = backend if backend is not None else (prev.get("backend") or "")
+        eff_last_evt = (last_evt if last_evt is not None
+                        else int(prev.get("last_evt") or 0))
+        self._begin()
+        try:
+            self._upsert_session_row({
+                "role": role,
+                "backend": eff_backend,
+                "sid": sid,
+                "last_evt": int(eff_last_evt),
+                "gen": int(gen),
+            })
+            self._con.commit()
+        except BaseException:
+            self._con.rollback()
+            raise
 
     # ——————————————————————————————————————————————————————
     # 派发行状态迁移辅助

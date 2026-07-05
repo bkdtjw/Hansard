@@ -675,6 +675,13 @@ def test_resume_contract_version_bump_invalidates_sid(thread_dir, tmp_dir):
     st.set_meta("status", "running")
     _seed_bb_decision(st, name="like-api", version=2)
     st.append_event(sender="frontend", type="review", body="联调", to=["backend"])
+
+    # R-T5 发现2：作废 sid 属会话簿记，不该经事件日志（§4.2）。快照 round2 触发件落盘后、
+    # backend 被派发前的事件集合——其中每一条都是"真实发生过的事"（human/frontend/pm 事件）；
+    # 作废动作**不得**在此之后凭空塞入任何合成 from=system/type=system 的"作废"事件。
+    events_before = st.events()
+    ids_before = {e["id"] for e in events_before}
+
     ad.scripted_replies[2] = {"to": ["human"], "type": "report", "body": "r2",
                               "session": "sid-STABLE-2"}
     orch.scheduler.run_thread(st, cfg, {"backend": ad})
@@ -690,6 +697,22 @@ def test_resume_contract_version_bump_invalidates_sid(thread_dir, tmp_dir):
     srows2 = {s["role"]: s for s in session_rows(st)}
     assert int(srows2["backend"]["gen"]) > gen_before, (
         "契约 version 变更应触发 sid 作废（gen 递增），最终 gen 应大于 round1 的 gen"
+    )
+
+    # R-T5 发现2 核心断言：round2 期间**唯一**新增的事件是 backend 的正常回复（r2 report），
+    # 绝无任何 from=system/type=system 的合成"作废"事件混入事件日志。
+    events_after = st.events()
+    new_events = [e for e in events_after if e["id"] not in ids_before]
+    synth = [e for e in new_events
+             if e["from"] == "system" and e["type"] == "system"]
+    assert synth == [], (
+        "作废 sid 属会话簿记（sessions 表），不得向事件日志注入合成 system 事件；"
+        f"却发现 {len(synth)} 条：{[e['body'] for e in synth]}"
+    )
+    # 更强：round2 新增事件恰为 backend 的那一条 report 回复（无任何"作废"痕迹落日志）。
+    assert [e["type"] for e in new_events] == ["report"], (
+        "round2 事件日志应只多出 backend 的 report 回复一条，"
+        f"实际新增：{[(e['from'], e['type']) for e in new_events]}"
     )
 
 

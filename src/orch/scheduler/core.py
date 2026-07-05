@@ -357,42 +357,19 @@ def _blackboard_version_advanced(store, role: str) -> bool:
 
 
 def _invalidate_sid(store, config: dict, role: str, srow: dict) -> None:
-    """§6.5 规则2：作废该角色 sid（sessions.sid 置空 + gen 递增），走 store 既有公开接口。
+    """§6.5 规则2：作废该角色 sid（sessions.sid 置空 + gen 递增）——纯会话簿记，不经事件日志。
 
-    store 的 sessions 写通道只有 reply_and_done(session=...)（DDL 冻结，§4.3，不新增方法）。
-    这里用一条**无副作用的 system 事件**承载 session upsert：把 sid 置空、gen 在原值上 +1，
-    last_evt 保持不变。该 system 事件 to=[moderator] 会生成一条 pending 派发行——但它落盘后
-    立即随本轮冷启动流程被后续 reply 覆盖会话；为不残留待办，落盘后立即把其自身派发行标 done。
+    sessions 表是**工作状态**而非事件真相（§4.2 事件日志=发生过什么）：sid 作废、代际递增
+    属会话簿记，不该借合成 type=system 事件承载（§3.2 对 type=system 的语义枚举是看门狗/
+    回调/审计，不含"会话作废"，且合成事件会永久污染事件日志）。故走 store 的 upsert_session
+    直写 sessions 表（单事务，语义与 reply_and_done 内会话 upsert 完全一致、复用同一内部实现）。
 
     作废后同时清掉该角色 resume_* 持久化键，确保后续轮不再误判可热续。
     """
     old_gen = int(srow.get("gen") or 0)
-    backend = _adapter_name(config, role)
-    invalidate_evt = {
-        "from": "system",
-        "type": "system",
-        "to": ["moderator"],
-        "re": [],
-        "body": (
-            f"§6.5 规则2：契约 version 变更 → 作废角色 {role} 会话 sid"
-            f"（gen {old_gen}→{old_gen + 1}），回退冷启动。"
-        ),
-        "artifacts": [],
-        "corr": None,
-        "blackboard_ops": None,
-    }
-    session = {
-        "role": role,
-        "backend": backend,
-        "sid": None,                 # 置空 = 作废（§6.5 规则2）。
-        "last_evt": int(srow.get("last_evt") or 0),
-        "gen": old_gen + 1,          # gen 递增（§6.5 规则2）。
-    }
-    sys_id = store.reply_and_done(
-        done_event_id=None, done_target=None, reply=invalidate_evt, session=session,
-    )
-    # 该 system 事件自身派发行不留待办（建后即 done，与 §5.4 终止总结同规约）。
-    store.mark_done(sys_id, "moderator")
+    # sid 置空 = 作废；gen 在原值上 +1（§6.5 规则2）。backend/last_evt 由 upsert_session
+    # 保留既有行，无需在此重传（§4.3 DDL 列冻结）。
+    store.upsert_session(role=role, sid=None, gen=old_gen + 1)
     # 清掉该角色的热续持久化基线（作废后重新冷启动会写新基线）。
     role_gen_key = _RESUME_GEN_KEY.format(role=role)
     store.set_meta(role_gen_key, "")   # 空串 = 无有效基线（_resume_eligible 视为不满足）。

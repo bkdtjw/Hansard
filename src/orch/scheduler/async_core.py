@@ -48,6 +48,7 @@ from orch.scheduler.core import (
     _enforce_sender_constraint,
     _ensure_audit_baseline,
     _finalize_envelope,
+    _finish_interrupted_terminate,
     _group_pending,
     _handle_terminate,
     _is_cold_start,
@@ -401,6 +402,14 @@ async def run_thread_async(
     组间/批间的线程 status 变化每次都检查（terminate/suspend 立即回到外层）。
     """
     lock = _store_lock(store)
+
+    # §9.3 多线程生产路径同源崩溃恢复：进入主循环前先补完可能被 kill 打断的终止清算。
+    # 与 sync 版 run_thread 顶部逐字同源——复用 core._finish_interrupted_terminate（不复制逻辑）。
+    # 若盘上已有 terminate 事件但 status != terminated（在 _handle_terminate 三步中途被 kill），
+    # 主循环若直接跑会把终止总结事件的残留 pending 当普通派发去 invoke → 脚本无该事件号 →
+    # KeyError（§9.1）。只查表幂等重入（§16.10），须在 store 锁内（多协程串行化写）。
+    async with lock:
+        _finish_interrupted_terminate(store, config)
 
     while True:
         async with lock:

@@ -117,3 +117,57 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   两条未真正达标，M4 完成宣告部分收回，待回环 R-A…R-J 修复后重新验收。
 - 驳回 15 条误报/已豁免项（含 §5.5 凭据误读、render_delta 接线属 §17 已记录决策等），
   逐条裁决记录在审计报告 §三。
+
+### M3/M4 施工台账补录（Lead 2026-07-05 补，原会话漏记，依 git log + 契约重建）
+- M3：契约 5bfa4ff → T1 测试先行 17 用例（a40a384）→ T2 render_delta §6.5（484ec94）
+  → T3 async 核心环+异步作业+多线程 §5.1/§5.2/§9.3（5628e94）→ T4 bench resume CLI（a968ec2）
+  → 验收合入 8b26cfe，197 tests，tag m3-done。
+- M4：契约 69a4a58 → T1+T5 测试先行+50轮门槛 opt-in（d1d11a1）→ T2 FaultInjector 3 site（730a53a）
+  → T3 ChaosHarness（018618e）→ T4 metrics/replay CLI（c48a6a5）→ T5 R-a 恢复合并+门禁幂等（610b412）
+  → 验收合入 3a6235e，tag m4-done。
+- 教训：两个里程碑的台账未随卡落盘（违反完成定义第5项），2026-07-05 审计时发现并补录。
+
+### 2026-07-05 审计回环 R-T1…R-T4 + R-J（用户指令"修复"）
+串行派卡（写域在 core.py/chaos 交叠，依 CLAUDE.md 并行判据禁并行）；每卡 Lead 收尾三步齐备。
+- **R-T1**（799eab0，闭 A1/A2/G）：invoke_post/autocommit_post 注入点补进两条核心环（store 暴露公共
+  fault_check）；_resolve_site 删 None 降级、5 site 全真实注入；附录B 第四断言=mock ledger 字节
+  + 黑板 state.json（sort_keys 确定化）与不中断基准逐字节比较；test_fault_inject 重写为生产路径
+  真触发（5 site 各一）；EXPECTED_TYPE_SEQUENCE 移入 src/orch/chaos/expected.py，tests 反向导入。
+  §17 裁决：①注入钩子按控制流位置触发（mock 无 worktree 时 autocommit 为 no-op 但位置仍在）；
+  ②invoke↔reply 窗口天然至少一次，去重属 §9.2 层2/3 agent 幂等——harness 用 _IdempotentMockAdapter
+  忠实模拟幂等 agent（查 ledger 已含 {role}:{event_id} 则补发信封不重做副作用），通用规则非特判；
+  ③_handle_terminate 幂等可重入（总结事件带 re 血缘 + _finish_interrupted_terminate 恢复补完）。
+- **R-T2**（7d182a9，闭 C/D/E/H）：①看门狗 level2/3 升级水位落 thread_meta
+  （wd_l2:{s}:{t} / wd_l3_total），门限=水位+limit 窗口前移（§17 裁决），approve 后不复触发、
+  新窗口仍升级；附带修 _raise_gate 把 corr 写入事件 corr 列（此前 meta-only，orch approve 够不到
+  看门狗门禁）。②_view_with_retry_note 重调携带校验错误说明（§5.1 伪代码原文），同步/异步同源。
+  ③_ensure_audit_baseline 首轮 invoke 前落 HEAD 为 last_ok_commit:{role}（§8.2 fail-open 闭合；
+  permissions 增 head_sha）。④终止不再清扫既有 pending（§5.4 字面"拒绝新派发"）。
+  worker 曾越权碰 systemexec.py，自行 git checkout 回滚改走 in-scope 方案（Lead 复核确认零改动）。
+- **R-T3**（8855009，闭 F/I）：render_delta 按 m3-contract §2 接入两条核心环。三门控
+  （sid 非空+supports_resume / gen 未变 / 黑板 version 未推进）→ render_delta → needs_cold_start
+  （契约 version 变更）→ 作废 sid 回退冷启动。§17 归档：thread_meta 键 resume_last_evt/{bb_version}/
+  {gen}:{role}；黑板 version 标量=Σ契约version+决策条数；决策顺序=门控(1)(2)→delta→规则2→门控(3)
+  （契约大改必须走 sid 作废而非被门控3 拦成普通冷启动）；sid 作废用 system 事件承载 session upsert
+  （DDL 冻结不加方法）；gen 取 max() 单调不减。人类显式作废 sid 无既有挂点，未新增命令（记此备查）。
+- **R-T4**（b4a10e6，闭 B）：§13 采集点随代码交付——每次 invoke 落 tokens 行（in=视图 token_est，
+  out=回复 estimate_tokens），cost 仅 adapter 暴露真实用量才落（Mock/Fake 无→N/A，不编造 0）；
+  schema 校验失败每次落 schema_retry；render meta 出背景层压缩前后 token、调度层落盘；
+  ChaosHarness.run(metrics_store=) 落 chaos_rounds/chaos_mock_pass_pct。metrics CLI 复算口径：
+  首次合法率=1−retry行数÷tokens行数。test_metrics_cli 重写为"CLI 输出 vs 手工查表复算"对照断言。
+- **R-J**（33ea349，Lead 胶水）：pyproject 增 [project.scripts] orch=orch.cli.main:main、
+  typer 转核心依赖；pip install -e . 后 orch 命令全局可用（亲测项目外目录）。
+- 每卡后 Lead 亲跑全量 pytest + --chaos-50：221→229→237→246 passed（+chaos50 各卡均复跑通过）。
+
+### 终局独立评审与 R-T5(2026-07-05)
+- 终局评审(3 维只读,closure/antipattern-regression/test-honesty):11 簇全部真闭合,
+  幂等 mock(§9.2 层2/3 语义)与看门狗水位(§16.9 要求可从盘重建)均裁定合规非放水。
+- R-T5 闭合评审新发现:①async_core.run_thread_async 入口同源调用
+  _finish_interrupted_terminate(major,崩溃洞 sync/async 对等);②Store 新增公开
+  upsert_session(role,sid,gen)单事务直写 sessions(冻结入接口面,DDL 未动),
+  _invalidate_sid 弃用合成 system 事件——§17 裁决:会话簿记属工作状态,不经事件日志,
+  维持 §3.2 type=system 枚举语义纯度。
+- 评审 2 条 info 留档:A2 字节比较范围=ledger+state.json(事件因附录B 允许事件号偏移
+  只能类型级比较,board.md 是 state.json 确定性投影);orch/chaos/expected.py 携带
+  E9→tester(fixture 自决)与 E20 终止总结(§5.4 忠实产物)两处对附录B 字面的偏移,
+  文件抬头已自陈。

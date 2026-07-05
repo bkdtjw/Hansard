@@ -210,6 +210,79 @@ def test_reply_and_done_without_session(thread_dir):
 
 
 # ——————————————————————————————————————————————————————————————
+# R-T5 发现2：upsert_session 会话簿记直写（§7.5，不经事件日志 §4.2）
+# ——————————————————————————————————————————————————————————————
+
+def _read_session(thread_dir: Path, role: str) -> dict | None:
+    con = sqlite3.connect(str(Path(thread_dir) / "events.db"))
+    try:
+        con.row_factory = sqlite3.Row
+        r = con.execute(
+            "SELECT role, backend, sid, last_evt, gen FROM sessions WHERE role=?",
+            (role,),
+        ).fetchone()
+        return dict(r) if r else None
+    finally:
+        con.close()
+
+
+def _count_events(thread_dir: Path) -> int:
+    con = sqlite3.connect(str(Path(thread_dir) / "events.db"))
+    try:
+        return int(con.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+    finally:
+        con.close()
+
+
+def test_upsert_session_direct_write_no_events(thread_dir):
+    """upsert_session 单事务直写 sessions 表：既有行 sid 作废 + gen 递增，事件日志零新增。
+
+    语义须与 reply_and_done 内的会话 upsert 一致（复用同一内部实现）；作废 sid 属会话簿记
+    （§7.5 工作状态），不该向事件日志（§4.2 发生过什么）注入任何事件——events 行数不变。
+    """
+    st = _new_store(thread_dir)
+    # 先经 reply_and_done 建一条 backend 会话行（sid 非空、gen=1、last_evt=e1、backend=cli）。
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["backend"])
+    st.mark_dispatching(e1, "backend", deadline_ts=1.0)
+    st.reply_and_done(
+        done_event_id=e1, done_target="backend",
+        reply={"from": "backend", "re": [e1], "to": ["human"],
+               "type": "report", "body": "r1"},
+        session={"role": "backend", "backend": "cli", "sid": "sid-A",
+                 "last_evt": e1, "gen": 1},
+    )
+    before = _read_session(thread_dir, "backend")
+    assert before["sid"] == "sid-A" and int(before["gen"]) == 1
+    events_n0 = _count_events(thread_dir)
+
+    # —— 作废 sid：sid=None、gen 递增；backend/last_evt 缺省保留既有行 ——
+    st.upsert_session(role="backend", sid=None, gen=int(before["gen"]) + 1)
+
+    after = _read_session(thread_dir, "backend")
+    assert after["sid"] is None, "sid 应被置空（作废）"
+    assert int(after["gen"]) == int(before["gen"]) + 1, "gen 应递增"
+    # 未传的列保留既有值（作废只改 sid+gen，不动 backend/last_evt）。
+    assert after["backend"] == before["backend"], "backend 缺省保留既有行"
+    assert int(after["last_evt"]) == int(before["last_evt"]), "last_evt 缺省保留既有行"
+    # 会话簿记不经事件日志：events 行数不变。
+    assert _count_events(thread_dir) == events_n0, "upsert_session 不得新增任何事件"
+
+
+def test_upsert_session_inserts_new_role_row(thread_dir):
+    """无既有行时 upsert_session 插入新 sessions 行（backend 兜底空串、last_evt 兜底 0）。"""
+    st = _new_store(thread_dir)
+    n0 = _count_events(thread_dir)
+    st.upsert_session(role="tester", sid="sid-T", gen=0, backend="cli", last_evt=5)
+    row = _read_session(thread_dir, "tester")
+    assert row is not None
+    assert row["sid"] == "sid-T"
+    assert row["backend"] == "cli"
+    assert int(row["last_evt"]) == 5
+    assert int(row["gen"]) == 0
+    assert _count_events(thread_dir) == n0, "插入会话行同样不经事件日志"
+
+
+# ——————————————————————————————————————————————————————————————
 # §4.4 派发行状态迁移辅助
 # ——————————————————————————————————————————————————————————————
 
