@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import orch.render  # 包级导入（符号在函数体内引用）
 import orch.store
 
@@ -604,3 +606,142 @@ def test_budget_focus_truncation_keeps_head_and_tail(thread_dir):
     focus = view["sections"]["focus"]
     # 触发件（尾）必须保留其事件号（§6.3 保首尾）。
     assert f"#{fids[-1]}" in focus, "焦点截断须保尾：最新触发焦点事件不得被整段丢弃（§6.3）"
+
+
+# ==================================================================
+# (d') §6.3 分层配比约束（配额为地板，即便总量未超窗口也强制）
+#      焦点窗 ≥ 50% window / 黑板 ≤ 20% window / 背景 ≤ 20% window（Lead 裁决口径）
+# ==================================================================
+
+def test_budget_background_ratio_enforced_even_when_total_fits(thread_dir):
+    """§6.3 分配约束：背景层 ≤ 20% window，是**地板配额**——即便 fixed+focus+bg
+    总量不超 window，超 20% 配额的背景层也必须被压缩至 ≤20%（Lead 裁决）。
+
+    构造：小背景件很多（撑过 20% 配额），但正文短、焦点很小，使
+    fixed+focus+bg 仍 < window（旧的"仅总量比较"压缩不会触发）。断言：
+      - 背景段 token ≤ 20% window（配比被强制）；
+      - meta.dropped 含 background 类丢弃（反映裁剪）；
+      - 焦点触发件仍在焦点段（焦点保底不被误伤）。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    # 40 条短背景件：每条 body 约 40 ASCII 字符 -> 背景段整体远超 20% 小窗配额，
+    # 但总量（fixed+focus+bg）仍应低于 window（下方 window=4000 足够宽）。
+    bg_specs = [
+        {"sender": "frontend", "type": "report", "to": ["moderator"],
+         "body": f"BGRATIO{i:02d} short background summary line here"}
+        for i in range(40)
+    ]
+    seed_events(st, bg_specs)
+    # 单个小焦点触发件（焦点极小，不至于把总量顶到超窗）。
+    fid = st.append_event(sender="tester", type="defect", to=["backend"],
+                          body="small focus body")
+    # window 取中等大小：20% = 800 token 配额；40 条背景约 > 800 token 需被裁到 ≤800，
+    # 但 fixed(系统层含 prompt) + 焦点 + 背景 全量估计 < 4000（不触发旧总量压缩）。
+    cfg = m1_config(context_window=4000)
+
+    view = orch.render.render_view(
+        st, cfg, role="backend", event_ids=[fid],
+        cold_start=True, instruction="x",
+    )
+    budget = view["meta"]["budget"]["context_window"]
+    bg_quota = int(budget * 0.20)
+    bg_tokens = orch.render.estimate_tokens(view["sections"]["background"])
+
+    assert bg_tokens <= bg_quota, (
+        f"背景层须被强制压缩至 ≤20% window 配额（§6.3）："
+        f"bg_tokens={bg_tokens} > quota={bg_quota}"
+    )
+    dropped = view["meta"].get("dropped")
+    assert isinstance(dropped, list) and dropped, (
+        "背景超配额时 meta.dropped 须记录背景裁剪（§6.3）"
+    )
+    assert any(
+        (isinstance(d, dict) and d.get("layer") == "background")
+        for d in dropped
+    ), "meta.dropped 须含 background 类丢弃（配比裁剪反映其中）"
+    # 焦点保底：触发件不得被误删。
+    assert f"#{fid}" in view["sections"]["focus"], "焦点触发件须保留（焦点≥50%保底不误伤）"
+
+
+def test_budget_background_ratio_drops_oldest_first(thread_dir):
+    """§6.3 配比裁剪仍按压缩顺序：背景超配额时**丢最旧摘要**（oldest first）。
+
+    背景件按事件号升序即时间序；裁到 ≤20% 后，留下的应是较新的背景件，
+    最旧的若干件被丢。断言最旧背景件不在背景段、最新背景件仍在。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    bg_ids = seed_events(st, [
+        {"sender": "frontend", "type": "report", "to": ["moderator"],
+         "body": f"BGORDER{i:02d} background summary content padding here"}
+        for i in range(40)
+    ])
+    fid = st.append_event(sender="tester", type="defect", to=["backend"],
+                          body="focus anchor body")
+    cfg = m1_config(context_window=4000)
+
+    view = orch.render.render_view(
+        st, cfg, role="backend", event_ids=[fid],
+        cold_start=True, instruction="x",
+    )
+    background = view["sections"]["background"]
+    dropped = view["meta"].get("dropped")
+    bg_dropped_ids = [
+        d.get("event_id") for d in dropped
+        if isinstance(d, dict) and d.get("layer") == "background"
+    ]
+    assert bg_dropped_ids, "应发生背景配比裁剪（§6.3）"
+    # 被丢的应是最旧的一段（升序前缀）；最新背景件应仍在背景段。
+    # 用 "#{id} [" 作精确边界，避免 "#1" 误配 "#10/#11"（背景行格式 '#id [from->@to] ...'）。
+    assert f"#{bg_ids[0]} [" not in background, "最旧背景件应先被丢（oldest first，§6.3）"
+    assert bg_ids[0] in bg_dropped_ids, "最旧背景件应记入 dropped(background)"
+    assert f"#{bg_ids[-1]} [" in background, "最新背景件应保留（未超配额时不丢新件）"
+
+
+def test_budget_blackboard_ratio_tail_truncated_keeps_head(thread_dir):
+    """§6.3 分配约束：黑板层 ≤ 20% window。超配额时**尾部截断、保留头部结构**
+    （Lead 裁决），且总量仍未超窗时也强制（地板配额）。
+
+    构造：一个很长的 board.md（远超 20% 小窗配额），焦点/背景极小，
+    使总量本不超窗。断言黑板段被截到 ≤20%、头部结构（首行）仍在、
+    meta.dropped 记录 blackboard 裁剪。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    # 直接写一份很长的 board.md（黑板层 = board.md 全文，§6.1）。
+    board_dir = Path(st.thread_dir) / "blackboard"
+    board_dir.mkdir(parents=True, exist_ok=True)
+    head_line = "# BOARD_HEAD_STRUCTURE 冻结契约头部"
+    tail_marker = "BOARD_TAIL_SHOULD_TRUNCATE"
+    long_board = head_line + "\n" + "\n".join(
+        f"- 决策条目 {i:03d} 填充内容占位以撑过黑板配额上限 padding line"
+        for i in range(120)
+    ) + "\n" + tail_marker
+    (board_dir / "board.md").write_text(long_board, encoding="utf-8")
+
+    fid = st.append_event(sender="tester", type="defect", to=["backend"],
+                          body="small focus")
+    cfg = m1_config(context_window=2000)
+
+    view = orch.render.render_view(
+        st, cfg, role="backend", event_ids=[fid],
+        cold_start=True, instruction="x",
+    )
+    blackboard = view["sections"]["blackboard"]
+    budget = view["meta"]["budget"]["context_window"]
+    board_quota = int(budget * 0.20)
+    board_tokens = orch.render.estimate_tokens(blackboard)
+
+    assert board_tokens <= board_quota, (
+        f"黑板层须被截至 ≤20% window 配额（§6.3）："
+        f"board_tokens={board_tokens} > quota={board_quota}"
+    )
+    # 保留头部结构（Lead 裁决：尾部截断、保头部）。
+    assert "BOARD_HEAD_STRUCTURE" in blackboard, "黑板截断须保留头部结构（§6.3 裁决）"
+    assert tail_marker not in blackboard, "黑板超配额尾部内容应被截断（§6.3 裁决）"
+    dropped = view["meta"].get("dropped")
+    assert any(
+        (isinstance(d, dict) and d.get("layer") == "blackboard")
+        for d in dropped
+    ), "meta.dropped 须记录 blackboard 裁剪（§6.3）"

@@ -331,6 +331,27 @@ def _join_focus(focus_rendered: list[str]) -> str:
     return "=== 焦点窗 ===\n" + "\n\n".join(focus_rendered)
 
 
+def _truncate_blackboard_to_quota(board_text: str, quota: int) -> str:
+    """§6.3 黑板层 ≤20% window：超配额时**尾部截断、保留头部结构**（Lead 裁决）。
+
+    board_text 为已带 "=== 黑板层 ===" 头的黑板段全文；按行自尾向前丢弃，直到
+    整段 estimate_tokens ≤ quota，始终保留段头（"=== 黑板层 ==="）与其后首行
+    结构。返回截断后的黑板段文本（若本就 ≤quota 原样返回）。
+    """
+    if not board_text.strip() or estimate_tokens(board_text) <= quota:
+        return board_text
+    lines = board_text.split("\n")
+    # 段头（"=== 黑板层 ==="）恒保留；其后为 board.md 首行=头部结构，亦力保。
+    # 至少保留前两行（段头 + 头部结构首行）；自尾逐行丢弃直至 ≤quota。
+    keep = list(lines)
+    while len(keep) > 2 and estimate_tokens("\n".join(keep)) > quota:
+        keep.pop()  # 尾部先截（保头部结构）。
+    truncated = "\n".join(keep)
+    # 仍超配额（头部两行本身即超）——保底截到段头 + 头部结构首行，不再强截字符
+    # （§6.3 语义为"保留头部结构"，宁可略超也不破坏结构可读性；实践中配额远大于两行）。
+    return truncated
+
+
 def _compress(
     *,
     focus_events: list[dict],
@@ -338,15 +359,23 @@ def _compress(
     role: str,
     fixed_tokens: int,
     budget: int,
+    bg_quota: int,
 ) -> tuple[list[str], str, list[dict]]:
-    """§6.3 超预算压缩：先丢背景最旧摘要 → 再截断焦点窗最旧事件正文（保首尾各一段）。
+    """§6.3 分层配比 + 超预算压缩：
+
+    先按**分配约束（地板配额）**强制配比——背景层 ≤ bg_quota（=20% window）：
+    即便总量未超窗，超配额的背景层也丢最旧摘要至 ≤ 配额（Lead 裁决）。随后若
+    总量仍超预算，继续走既有两阶段总量压缩：先丢背景最旧摘要 → 再截断焦点窗
+    最旧事件正文（保首尾各一段）。焦点窗受 ≥50% 保底保护：总量压缩时最后动、
+    且保首尾。
 
     返回 (focus_rendered_lines, background_text, dropped)。dropped 元素为
     {'layer': 'background'|'focus', 'event_id': int, 'order': int}，顺序即压缩发生
     顺序（背景整体先于焦点）——供测试断言。
 
-    fixed_tokens = 系统层 + 黑板层 + 指令尾（不参与压缩）的 token 估算之和。
-    budget = context_window 上限。压缩目标：fixed + 焦点 + 背景 ≤ budget。
+    fixed_tokens = 系统层 + 黑板层 + 指令尾（不参与本函数压缩）的 token 估算之和。
+    budget = context_window 上限。总量压缩目标：fixed + 焦点 + 背景 ≤ budget。
+    bg_quota = 背景层配额上限（20% window），配比裁剪的地板。
     """
     dropped: list[dict] = []
     order = 0
@@ -366,13 +395,21 @@ def _compress(
     def _over() -> bool:
         return fixed_tokens + _focus_tokens() + _bg_tokens() > budget
 
-    # —— 第一阶段：丢背景最旧摘要（oldest first）——
-    while _over() and bg:
+    # —— 配比约束（地板）：背景层 ≤ 20% window，超配额丢最旧摘要（oldest first）——
+    # 即便总量未超窗也强制（§6.3 分配约束）；与总量压缩同用"最旧先丢"顺序，二者
+    # 连续记入 dropped(background)，不破坏"背景整体先于焦点"的既有顺序断言。
+    while bg and _bg_tokens() > bg_quota:
         ev, _line = bg.pop(0)          # 最旧在列首。
         dropped.append({"layer": "background", "event_id": ev["id"], "order": order})
         order += 1
 
-    # —— 第二阶段：截断焦点窗最旧事件正文，保首尾各一段 ——
+    # —— 总量压缩第一阶段：仍超预算则继续丢背景最旧摘要 ——
+    while _over() and bg:
+        ev, _line = bg.pop(0)
+        dropped.append({"layer": "background", "event_id": ev["id"], "order": order})
+        order += 1
+
+    # —— 总量压缩第二阶段：截断焦点窗最旧事件正文，保首尾各一段 ——
     # 可截断集合 = 焦点事件去掉首(head)与尾(tail=本轮触发件)，最旧在前。
     if len(focus_events) > 2:
         truncatable = focus_events[1:-1]  # 中间段，最旧在前。
@@ -449,7 +486,7 @@ def render_view(
     # —— 分桶（§3.2）——
     focus_events, background_items = _classify(events, role, chat_ttl)
 
-    # —— 不参与压缩的三段（系统层 / 黑板层 / 指令尾）——
+    # —— 不参与总量压缩的三段（系统层 / 黑板层 / 指令尾）——
     system_text = _build_system(config, role)
     blackboard_text = _build_blackboard(store)
     instruction_text = _build_instruction(role, ids, instruction)
@@ -458,20 +495,41 @@ def render_view(
     #   分支保留：真实 CLI（M2）在此把 git log/status/diff 摘要插在黑板层后。
     # （M1 mock：不追加任何现场段。）
 
+    # —— 分层配比约束（地板配额，§6.3）：焦点 ≥50% / 黑板 ≤20% / 背景 ≤20% window ——
+    #   黑板层是"固定段"，其配额强制在此处（尾部截断保头部结构）；背景配额随
+    #   焦点/背景一起进 _compress。焦点 ≥50% 保底 = 总量压缩时焦点最后动且保首尾。
+    board_quota = int(budget * _BLACKBOARD_MAX_RATIO)
+    bg_quota = int(budget * _BACKGROUND_MAX_RATIO)
+
+    blackboard_dropped: list[dict] = []
+    if blackboard_text.strip() and estimate_tokens(blackboard_text) > board_quota:
+        blackboard_text = _truncate_blackboard_to_quota(blackboard_text, board_quota)
+        blackboard_dropped.append({"layer": "blackboard", "event_id": None, "order": 0})
+
     fixed_tokens = (
         estimate_tokens(system_text)
         + estimate_tokens(blackboard_text)
         + estimate_tokens(instruction_text)
     )
 
-    # —— 预算压缩（§6.3）：仅当超上限才动作 ——
+    # —— 预算压缩（§6.3）：配比裁剪（地板）+ 超上限总量压缩 ——
     focus_rendered, background_text, dropped = _compress(
         focus_events=focus_events,
         background_items=background_items,
         role=role,
         fixed_tokens=fixed_tokens,
         budget=budget,
+        bg_quota=bg_quota,
     )
+    # dropped 顺序：背景（配比+总量，最旧先丢）→ 黑板尾截 → 焦点截断，保持
+    # "背景整体先于焦点"的既有断言，黑板裁剪夹在二者之间（既非 background 亦非 focus）。
+    if blackboard_dropped:
+        bg_count = sum(1 for d in dropped if d["layer"] == "background")
+        dropped = (
+            dropped[:bg_count] + blackboard_dropped + dropped[bg_count:]
+        )
+        for i, d in enumerate(dropped):
+            d["order"] = i
     focus_text = _join_focus(focus_rendered)
 
     sections = {
