@@ -29,13 +29,10 @@ import orch.adapters   # 包级
 import orch.scheduler  # 包级（M2 契约 §3 权限模块）
 import orch.store      # 包级
 
-# 测试层适配器桩：多回复脚本 + 越权注入（M2 契约 §2）。src FakeCliAdapter 尚未支持
-# inject_side_effect（M2 契约 §2 描述的能力）→ 测试层薄包装桩承载该行为；
+# src FakeCliAdapter/FakeApiAdapter 现原生支持 scripted_replies + inject_side_effect
+# （M2 契约 §2/§6 回 B-建议1 补齐），测试层包装桩已退役，直接用 src 权威实现。
 # 断言逻辑（越权拒收、reset、审计事件）走 src 权威路径不弱化。
-from tests.adapters_helpers import (
-    MultiReplyFakeApiAdapter,
-    MultiReplyFakeCliAdapter,
-)
+from orch.adapters import FakeApiAdapter, FakeCliAdapter
 
 
 # ——————————————————————————————————————————————————————————————
@@ -282,7 +279,7 @@ def test_scheduler_rejects_cross_scope_write_and_appends_audit(tmp_dir):
     # 把 worktree 位置显式塞入 config 供调度层查询（M2 契约 §3）。
     cfg.setdefault("worktrees", {})["backend"] = str(wt)
 
-    ad = MultiReplyFakeCliAdapter(
+    ad = FakeCliAdapter(
         role="backend",
         config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
         worktree=wt,
@@ -291,7 +288,7 @@ def test_scheduler_rejects_cross_scope_write_and_appends_audit(tmp_dir):
     )
     # moderator 是 pending 目标"审计事件转 moderator"的接收方，需存在 adapter；
     # 用 terminate 结束控制流以便断言（moderator 可发 terminate，§3.2）。
-    moderator = MultiReplyFakeApiAdapter(
+    moderator = FakeApiAdapter(
         role="moderator", config={"kind": "api"},
         scripted_replies={1: {"to": [], "type": "terminate", "body": "audit done"}},
     )
@@ -335,7 +332,7 @@ def test_scheduler_compliant_write_is_accepted(tmp_dir):
     cfg["last_ok_commit"] = base
     cfg.setdefault("worktrees", {})["backend"] = str(wt)
 
-    ad = MultiReplyFakeCliAdapter(
+    ad = FakeCliAdapter(
         role="backend",
         config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
         worktree=wt,
@@ -344,11 +341,11 @@ def test_scheduler_compliant_write_is_accepted(tmp_dir):
     )
     # pm 收到 backend 的 report 后 → 转手给 moderator（chat 兜底路由，§4.4(1)）；
     # moderator 收到后 terminate 结束控制流以断言 backend 报文已合规入盘。
-    pm = MultiReplyFakeApiAdapter(
+    pm = FakeApiAdapter(
         role="pm", config={"kind": "api"},
         scripted_replies={1: {"to": [], "type": "chat", "body": "acked"}},
     )
-    moderator = MultiReplyFakeApiAdapter(
+    moderator = FakeApiAdapter(
         role="moderator", config={"kind": "api"},
         scripted_replies={1: {"to": [], "type": "terminate", "body": "done"}},
     )
@@ -361,3 +358,169 @@ def test_scheduler_compliant_write_is_accepted(tmp_dir):
         ev.get("from") == "backend" and ev.get("type") == "report"
         for ev in events
     ), "§8.2 合规写入下：backend 的 report 应正常落盘"
+
+
+# ==============================================================
+# (C-4) last_ok_commit 生产回路：autocommit 产出的 sha 必须回写 store，
+#       下一轮审计对齐点用**新 sha** 而非静态 config[last_ok_commit]。
+# ==============================================================
+#
+# 三维评审 C-4：生产路径下 config[last_ok_commit] 只有测试补丁塞入，
+# 生产恒 skip → §8.2 审计 fail open。修复：autocommit 成功后把 sha 落
+# store.set_meta("last_ok_commit:{role}", sha)；下一轮 _last_ok_commit 优先
+# 读 store.get_meta（新 sha），config 兜底。
+# ==============================================================
+
+
+def test_autocommit_sha_persists_to_store_and_drives_next_audit(tmp_dir):
+    """C-4：autocommit 成功后 sha 落 store.get_meta("last_ok_commit:{role}")，
+    第二轮调用即以该 sha 作为审计对齐点，即便 config 从未提供 last_ok_commit。
+
+    模拟两轮 backend invoke：
+      - 第 1 轮：写 server/a.py（合规）→ autocommit 生成 sha X。
+      - 第 2 轮：写 web/xss.js（越权）→ 审计**必须**以 sha X 为对齐点触发拒收
+                （若仍读 config[last_ok_commit]（未提供）→ 审计 skip，越权信封会误入盘）。
+    """
+    target = _init_target_repo(tmp_dir / "target")
+    thread_dir = tmp_dir / "t-c4-a"
+    store = orch.store.Store(thread_dir)
+    store.set_meta("status", "running")
+
+    # 只播 E1（round1）；round2 由 pm 回一条 assign 到 backend 触发（避免同批聚合
+    # 成单次 invoke，只有分两次 dispatch 才能验证第 1 轮的 sha 影响第 2 轮审计）。
+    store.append_event(sender="human", type="assign", body="round1", to=["backend"])
+
+    wt = _make_worktree(target, "tc4a-backend")
+    base_head = _git(wt, "rev-parse", "HEAD").strip()
+
+    # 关键：config 不塞 last_ok_commit —— 模拟生产路径无外部补丁。
+    cfg = _m2_config(target)
+    cfg.setdefault("worktrees", {})["backend"] = str(wt)
+    assert "last_ok_commit" not in cfg
+
+    call_counter = {"n": 0}
+
+    def _side_effect(worktree: Path):
+        call_counter["n"] += 1
+        if call_counter["n"] == 1:
+            (worktree / "server" / "a.py").write_text("a=1\n", encoding="utf-8")
+        else:
+            (worktree / "web").mkdir(exist_ok=True)
+            (worktree / "web" / "xss.js").write_text("bad\n", encoding="utf-8")
+
+    ad = FakeCliAdapter(
+        role="backend",
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
+        worktree=wt,
+        scripted_replies={
+            1: {"to": ["pm"], "type": "report", "body": "round1 done"},
+            2: {"to": ["moderator"], "type": "report", "body": "round2 done"},
+        },
+        inject_side_effect=_side_effect,
+    )
+    # pm 收到 backend 的 round1 报告后，assign 一条给 backend 触发 round2。
+    pm = FakeApiAdapter(
+        role="pm", config={"kind": "api"},
+        scripted_replies={
+            1: {"to": ["backend"], "type": "assign", "body": "round2 please"},
+        },
+    )
+    moderator = FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_replies={
+            1: {"to": [], "type": "terminate", "body": "audited"},
+            2: {"to": [], "type": "terminate", "body": "audited-fallback"},
+        },
+    )
+
+    orch.scheduler.run_thread(
+        store, cfg, {"backend": ad, "moderator": moderator, "pm": pm}
+    )
+
+    # ① sha 已持久化到 store（生产回路的必要证据）。
+    stored_sha = store.get_meta("last_ok_commit:backend")
+    assert stored_sha, (
+        "C-4：autocommit 成功后必须把 sha 落 store.get_meta('last_ok_commit:backend')；"
+        "当前为空 → 生产路径 §8.2 审计 fail open。"
+    )
+    assert stored_sha != base_head, (
+        "C-4：落盘 sha 应为 autocommit 产出的新 sha，不应等于初始 base_head。"
+    )
+
+    # ② 第 2 轮越权：越权信封未落盘（审计以 store 里的 sha X 为对齐点触发拒收）。
+    events = store.events()
+    round2_reports = [
+        ev for ev in events
+        if ev.get("from") == "backend" and ev.get("type") == "report"
+        and ev.get("body") == "round2 done"
+    ]
+    assert not round2_reports, (
+        "C-4：第 2 轮越权信封应被审计整体拒收，不入 events；"
+        f"实际找到 {len(round2_reports)} 条 backend/round2 report。"
+    )
+
+    audit_events = [
+        ev for ev in events
+        if ev.get("from") == "system"
+        and "moderator" in (ev.get("to") or [])
+        and ("越权" in ev.get("body", "") or "write_scope" in ev.get("body", ""))
+    ]
+    assert audit_events, "C-4：越权时应追加 system 审计事件转 moderator"
+
+
+def test_last_ok_commit_read_prefers_store_over_config(tmp_dir):
+    """C-4：_last_ok_commit(role) 应优先读 store.get_meta('last_ok_commit:{role}')，
+    config[last_ok_commit] 仅作兜底。
+
+    构造：
+      - store 里预置 base_head（模拟前一轮 autocommit 已回写）；
+      - config 里塞一个明显"虚假"值（"0"*40，git 认不出的假 sha）；
+      - 单次 backend 越权写入 web/ → 审计对齐点走 store 的 base_head 时能识别越权
+        并触发拒收；若误用 config 的假 sha，diff 命令会失败 → 权限模块视为无 diff 走
+        fail-open，越权信封会落盘。
+    """
+    target = _init_target_repo(tmp_dir / "target")
+    thread_dir = tmp_dir / "t-c4-b"
+    store = orch.store.Store(thread_dir)
+    store.set_meta("status", "running")
+    store.append_event(
+        sender="human", type="assign", body="please implement", to=["backend"],
+    )
+
+    wt = _make_worktree(target, "tc4b-backend")
+    base_head = _git(wt, "rev-parse", "HEAD").strip()
+
+    store.set_meta("last_ok_commit:backend", base_head)
+
+    cfg = _m2_config(target)
+    cfg.setdefault("worktrees", {})["backend"] = str(wt)
+    cfg["last_ok_commit"] = "0" * 40  # 虚假 sha —— 若被误用则审计 fail open
+
+    def _cross_scope(worktree: Path):
+        (worktree / "web").mkdir(exist_ok=True)
+        (worktree / "web" / "bad.js").write_text("pwn\n", encoding="utf-8")
+
+    ad = FakeCliAdapter(
+        role="backend",
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
+        worktree=wt,
+        scripted_replies={1: {"to": ["moderator"], "type": "report", "body": "done"}},
+        inject_side_effect=_cross_scope,
+    )
+    moderator = FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_replies={1: {"to": [], "type": "terminate", "body": "audited"}},
+    )
+
+    orch.scheduler.run_thread(store, cfg, {"backend": ad, "moderator": moderator})
+
+    head_now = _git(wt, "rev-parse", "HEAD").strip()
+    assert head_now == base_head, (
+        "C-4：应优先读 store 的 last_ok_commit（base_head 是有效对齐点，越权被拒），"
+        f"实际 HEAD={head_now[:8]}"
+    )
+    events = store.events()
+    assert not any(
+        ev.get("from") == "backend" and ev.get("type") == "report"
+        for ev in events
+    ), "C-4：优先读 store 的对齐点 → 越权信封应被拒收，不入 events"
