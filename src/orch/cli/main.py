@@ -12,6 +12,8 @@ typer 单文件实现，命令与 spec §12 表一致：
   orch attach t-xxx role                打印该角色原生会话接入命令（sid=None 兜底）
   orch threads                          列 workspace 下所有 t-xxx 线程
   orch bench resume --fixture X --runs N   开/关 resume 的 tokens_in 对比实验（§12/§13，M3-T4）
+  orch metrics [--thread t-xxx]         §13 指标汇总表（M4-T4）
+  orch replay --thread t-xxx            按事件号升序渲染第三人称群聊 markdown（M4-T4）
 
 【M2 骨架边界】
   - worktrees / 权限 三件套由 T3 落地；本层新建 workspace/t-xxx/{events.db, blackboard, logs}。
@@ -21,7 +23,14 @@ typer 单文件实现，命令与 spec §12 表一致：
   - 各命令的具体 flag 措辞取自 spec §12 表 + M2 契约 §5；与真实 CLI 的 flag 联跑差异属 §17
     开放决策（升级 QUESTIONS.md）。
 
-【M3-T4 边界（本卡新增）】
+【M4-T4 边界（本卡新增）】
+  - `orch metrics`：从 metrics 表 + events 表汇总 §13 全表指标，纯文本表格输出。
+    空 workspace / 无采集数据时对应字段显示 "N/A"（不采信具体数值，只保证字段名齐全）。
+  - `orch replay`：按事件 id 升序，把某线程的事件日志渲染成"第三人称"markdown 群聊，
+    每条形如 `#{id} [{from}->@{to1},@{to2}] ({type}): {body}`（§16.1：路由只认 to 字段，
+    不从 body 解析 @）。
+
+【M3-T4 边界】
   - `orch bench resume`：不启真子进程，只跑内部 render_view + estimate_tokens 估算
     （M3 契约 §5：bench resume 用 pytest fixture 生成简化任务而非附录B）。
   - "关 resume"（冷启动）路径：每轮都对完整事件流跑一次 orch.render.render_view
@@ -793,6 +802,217 @@ def cmd_threads(
         except (OSError, ValueError):
             status = "?"
         _echo(f"{d.name}\tstatus={status}")
+
+
+# ——————————————————————————————————————————————————————————————
+# orch metrics（spec §13 全表汇总，M4-T4）
+# ——————————————————————————————————————————————————————————————
+
+def _thread_dirs_for_metrics(workspace: Path, thread: str | None) -> list[Path]:
+    """--thread 指定单线程；否则 workspace 下全部 t-xxx（无则空列表）。"""
+    if thread:
+        d = workspace / thread
+        return [d] if d.exists() else []
+    return _find_thread_dirs(workspace)
+
+
+def _collect_metric_values(store: "orch.store.Store", key: str) -> list[float]:
+    """从 metrics 表读某 key 的全部 value（无表/无行 → 空列表，宽松兜底）。"""
+    try:
+        rows = store._con.execute(
+            "SELECT value FROM metrics WHERE key=?", (key,)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - metrics 表缺失等极端情况兜底为空
+        return []
+    return [float(r["value"]) for r in rows]
+
+
+def _fmt_num(x: float | None, suffix: str = "") -> str:
+    if x is None:
+        return "N/A"
+    return f"{x:.2f}{suffix}"
+
+
+def _fmt_pct(x: float | None) -> str:
+    return _fmt_num(x, suffix="%")
+
+
+@app.command("metrics")
+def cmd_metrics(
+    thread: str | None = typer.Option(
+        None, "--thread", help="只统计单个线程；缺省汇总 workspace 全部线程。",
+    ),
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    ),
+) -> None:
+    """§13 指标汇总表（M4-T4）：从 metrics 表 + events 表聚合，空数据显示 N/A。
+
+    覆盖 §13 全部七类指标（数值为相对/近似估算，非精确计费）：
+      1) 端到端任务数 / 平均轮数 / 成本
+      2) 聚合节省 %（Σ(batch_size-1)/总调用数）
+      3) 首次合法率 %（1 - schema_retry/total）
+      4) 背景层压缩比（summarized/orig token 均值）
+      5) resume 输入 token 节省 %（bench resume 结果，见 orch bench resume）
+      6) 混沌轮数与两层结果（mock 100% / 真实 %）
+      7) 新增供应商 adapter 行数（cloc，从第 3 家起算）
+    """
+    ws = _resolve_workspace(workspace)
+    dirs = _thread_dirs_for_metrics(ws, thread)
+
+    # —— 1) 任务数 / 平均轮数 / 成本 ——
+    task_count = len(dirs)
+    round_counts: list[int] = []
+    cost_values: list[float] = []
+    batch_sizes: list[float] = []
+    schema_retry_vals: list[float] = []
+    schema_total_vals: list[float] = []
+    bg_orig_vals: list[float] = []
+    bg_summarized_vals: list[float] = []
+
+    for d in dirs:
+        store = orch.store.Store(d)
+        events = store.events()
+        round_counts.append(len(events))
+        cost_values.extend(_collect_metric_values(store, "cost"))
+        batch_sizes.extend(_collect_metric_values(store, "batch_size"))
+        schema_retry_vals.extend(_collect_metric_values(store, "schema_retry"))
+        schema_total_vals.extend(_collect_metric_values(store, "schema_total"))
+        bg_orig_vals.extend(_collect_metric_values(store, "bg_orig_tokens"))
+        bg_summarized_vals.extend(_collect_metric_values(store, "bg_summarized_tokens"))
+
+    avg_rounds = statistics.mean(round_counts) if round_counts else None
+    total_cost = sum(cost_values) if cost_values else None
+
+    # —— 2) 聚合节省 %：Σ(batch_size-1)/总调用数 ——
+    if batch_sizes:
+        saved = sum(max(0.0, b - 1.0) for b in batch_sizes)
+        agg_save_pct = (saved / sum(batch_sizes) * 100.0) if sum(batch_sizes) > 0 else None
+    else:
+        agg_save_pct = None
+
+    # —— 3) 首次合法率 %：1 - retry/total ——
+    total_calls = sum(schema_total_vals) if schema_total_vals else sum(batch_sizes) if batch_sizes else None
+    retry_calls = sum(schema_retry_vals) if schema_retry_vals else None
+    if total_calls and total_calls > 0 and retry_calls is not None:
+        first_legal_pct = (1.0 - retry_calls / total_calls) * 100.0
+    else:
+        first_legal_pct = None
+
+    # —— 4) 背景层压缩比：summarized/orig 均值 ——
+    if bg_orig_vals and bg_summarized_vals:
+        orig_sum = sum(bg_orig_vals)
+        comp_ratio = (sum(bg_summarized_vals) / orig_sum) if orig_sum > 0 else None
+    else:
+        comp_ratio = None
+
+    # —— 5) resume 输入 token 节省 %：走 orch.render 估算（依赖 orch bench resume 采集，
+    #        本命令不重跑 bench；若 metrics 表已有该采集点则汇总，否则 N/A）——
+    resume_save_vals = []
+    for d in dirs:
+        store = orch.store.Store(d)
+        resume_save_vals.extend(_collect_metric_values(store, "resume_token_save_pct"))
+    resume_save_pct = statistics.mean(resume_save_vals) if resume_save_vals else None
+
+    # —— 6) 混沌轮数与两层结果 ——
+    chaos_rounds_vals: list[float] = []
+    chaos_mock_pass_vals: list[float] = []
+    chaos_real_pass_vals: list[float] = []
+    for d in dirs:
+        store = orch.store.Store(d)
+        chaos_rounds_vals.extend(_collect_metric_values(store, "chaos_rounds"))
+        chaos_mock_pass_vals.extend(_collect_metric_values(store, "chaos_mock_pass_pct"))
+        chaos_real_pass_vals.extend(_collect_metric_values(store, "chaos_real_pass_pct"))
+    chaos_rounds = sum(chaos_rounds_vals) if chaos_rounds_vals else None
+    chaos_mock_pct = statistics.mean(chaos_mock_pass_vals) if chaos_mock_pass_vals else None
+    chaos_real_pct = statistics.mean(chaos_real_pass_vals) if chaos_real_pass_vals else None
+
+    # —— 7) 新增供应商 adapter 行数（cloc，从第 3 家起算）——
+    adapter_loc = _count_adapter_loc_from_third()
+
+    # —— 输出：保守纯文本表格（不锁死具体措辞，字段名齐全即可）——
+    _echo(f"orch metrics —— workspace={ws} thread={thread or '(all)'}")
+    _echo("=" * 60)
+    _echo(f"[1] 任务数(tasks)              : {task_count}")
+    _echo(f"    平均轮数(avg rounds)        : {_fmt_num(avg_rounds)}")
+    _echo(f"    成本(cost)                  : {_fmt_num(total_cost)}")
+    _echo(f"[2] 聚合节省 %(aggregate save)  : {_fmt_pct(agg_save_pct)}")
+    _echo(f"[3] 首次合法率 %(first-legal)   : {_fmt_pct(first_legal_pct)}")
+    _echo(f"[4] 背景压缩比(background compression ratio): {_fmt_num(comp_ratio)}")
+    _echo(f"[5] resume 输入 token 节省 %     : {_fmt_pct(resume_save_pct)}")
+    _echo(f"    (via `orch bench resume` 采集；未采集显示 N/A)")
+    _echo(f"[6] 混沌(chaos)轮数              : {_fmt_num(chaos_rounds)}")
+    _echo(f"    mock 层通过率 %              : {_fmt_pct(chaos_mock_pct)}")
+    _echo(f"    真实层通过率 %               : {_fmt_pct(chaos_real_pct)}")
+    _echo(f"[7] 新增供应商 adapter 行数(adapter LoC, cloc, 从第3家起算): {adapter_loc}")
+
+
+def _count_adapter_loc_from_third() -> str:
+    """粗略 cloc：src/orch/adapters/ 下按文件名排序，从第 3 个 adapter 文件起累加行数。
+
+    §13：只关心"新增供应商 adapter"的行数（前两家视为基线 CLI/API 骨架，不计入）；
+    未找到 adapters 目录或不足 3 个文件 → "N/A"（不臆造数值）。
+    """
+    adapters_dir = Path(__file__).resolve().parents[1] / "adapters"
+    if not adapters_dir.exists():
+        return "N/A"
+    files = sorted(
+        p for p in adapters_dir.iterdir()
+        if p.is_file() and p.suffix == ".py" and p.name != "__init__.py"
+    )
+    if len(files) < 3:
+        return "N/A (< 3 adapters)"
+    extra_files = files[2:]
+    total = 0
+    for f in extra_files:
+        try:
+            total += sum(1 for _ in f.open("r", encoding="utf-8"))
+        except OSError:
+            continue
+    return str(total)
+
+
+# ——————————————————————————————————————————————————————————————
+# orch replay（spec §12：按事件号升序渲染第三人称群聊 markdown，M4-T4）
+# ——————————————————————————————————————————————————————————————
+
+def _render_replay_line(ev: dict) -> str:
+    """一条事件 → 第三人称群聊 markdown 行（§16.1：路由只认 to 字段）。
+
+    形状：`#{id} [{from}->@{to1},@{to2}...] ({type}): {body}`
+    """
+    ev_id = ev.get("id")
+    sender = ev.get("from", "?")
+    to_list = ev.get("to") or []
+    etype = ev.get("type")
+    body = ev.get("body", "")
+    to_part = ",".join(f"@{r}" for r in to_list) if to_list else "@(none)"
+    return f"#{ev_id} [{sender}->{to_part}] ({etype}): {body}"
+
+
+@app.command("replay")
+def cmd_replay(
+    thread: str = typer.Option(..., "--thread", help="线程 id（如 t-abc123）。"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    ),
+) -> None:
+    """§12 orch replay：按事件 id 升序渲染第三人称群聊 markdown（M4-T4）。
+
+    第三人称标签 `[from->@to1,@to2...]` 只取自事件 to 字段（§16.1 硬约束：
+    不从 body 正文解析 @ 提及进入路由标签）。
+    """
+    ws = _resolve_workspace(workspace)
+    store = _open_thread_store(ws, thread)
+    events = store.events()
+
+    _echo(f"# orch replay —— thread={thread} workspace={ws}")
+    if not events:
+        _echo(f"(thread {thread} 暂无事件)")
+        return
+
+    for ev in events:
+        _echo(_render_replay_line(ev))
 
 
 # ——————————————————————————————————————————————————————————————
