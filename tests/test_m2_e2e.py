@@ -26,13 +26,9 @@ import orch.adapters
 import orch.scheduler
 import orch.store
 
-# 测试层适配器桩：多回复脚本 + 越权注入（M2 契约 §2）。M2 T5 任务卡仅可写 tests/，
-# src Fake* 目前只支持单次 scripted_output/scripted_reply → 测试层薄包装桩承载
-# call_no-envelope 分发（不弱化断言：调度层路由/落盘/审计仍走 src 权威路径）。
-from tests.adapters_helpers import (
-    MultiReplyFakeApiAdapter,
-    MultiReplyFakeCliAdapter,
-)
+# src Fake* 现已原生支持 scripted_replies（call_no→信封）+ inject_side_effect
+# （M2 契约 §2/§6 回 B-建议1 补齐），测试层包装桩已退役，直接用 src 权威实现。
+from orch.adapters import FakeApiAdapter, FakeCliAdapter
 
 
 def _git(cwd, *args) -> str:
@@ -86,13 +82,13 @@ def _cfg(target_repo: Path) -> dict:
     }
 
 
-def _fake_cli(role: str, wt: Path, scripted: dict) -> MultiReplyFakeCliAdapter:
+def _fake_cli(role: str, wt: Path, scripted: dict) -> FakeCliAdapter:
     """构造 CLI 型测试双：scripted 为逐次调用返回的信封字典表 {call_no: env}。
 
-    行为等价 M2 契约 §2 描述的 FakeCliAdapter（cwd=worktree，超时可模拟，
-    session_id 可提取）；本包装承载多回复语义（src Fake* 只支持单次输出）。
+    src FakeCliAdapter 原生支持 scripted_replies（call_no 从 1 起分派，
+    M2 契约 §2/§6）。
     """
-    return MultiReplyFakeCliAdapter(
+    return FakeCliAdapter(
         role=role,
         config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
         worktree=wt,
@@ -100,9 +96,9 @@ def _fake_cli(role: str, wt: Path, scripted: dict) -> MultiReplyFakeCliAdapter:
     )
 
 
-def _fake_api(role: str, scripted: dict) -> MultiReplyFakeApiAdapter:
+def _fake_api(role: str, scripted: dict) -> FakeApiAdapter:
     """构造 API 型测试双（§7.3 单步，无会话，supports_resume=False）。"""
-    return MultiReplyFakeApiAdapter(
+    return FakeApiAdapter(
         role=role, config={"kind": "api"},
         scripted_replies=scripted,
     )
