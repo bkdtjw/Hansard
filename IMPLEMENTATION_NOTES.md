@@ -108,3 +108,12 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   （terminated 拒新派发、recover 不处理 pending、不违反 §5.4/exactly-once）→ **留 M1 清理**。
 - ③_dispatch.py 短生命周期只读 sqlite 旁路 Store 公开面 → 合规（读盘即弃、契约 §7 授权）
   → **留后续内聚，不改**。
+
+### 2026-07-05 全面审核（用户指令：是否完全按 spec / 是否可正常运行）
+- 方法：Lead 亲手验证（pytest 基线 + chaos-50 复跑 + spec git 历史零改动 + CLI 真实冒烟
+  + import 白名单扫描 + 重点缺陷抽验）+ 8 维只读评审 workflow（wf_9f18b874）+ 逐条对抗核实。
+- 结论：可运行；主体忠实；确认 9 簇真缺陷（2 blocking + 6 major + minor 若干），
+  详见 docs/audit-20260705.md。M4 验收中"注入面覆盖 §4.4 全部间隙"与"§13 全表可复算"
+  两条未真正达标，M4 完成宣告部分收回，待回环 R-A…R-J 修复后重新验收。
+- 驳回 15 条误报/已豁免项（含 §5.5 凭据误读、render_delta 接线属 §17 已记录决策等），
+  逐条裁决记录在审计报告 §三。
