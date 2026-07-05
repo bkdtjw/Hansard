@@ -117,9 +117,16 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
             "to": ev.get("to") or [],
             "body": ev.get("body", ""),
             "corr": ev.get("corr"),
-            "re": ev.get("re") or [],          # 回复链事件号数组（R3/D12 用；本批端点先备好）
+            "re": ev.get("re") or [],          # 回复链事件号数组（R3/D12 用）
             "ts": ev.get("ts"),                # 原始时间戳 REAL（R3/D13 用）
             "meta": ev.get("meta") or {},      # {tokens_in/out, duration_s, verify…}（R3 用）
+            # D14 artifacts chips：库内 artifacts_json 已由 store.events() 解析为数组直出。
+            "artifacts": ev.get("artifacts") or [],
+            # D17 黑板投影数据源：A 类事件的 bb_ops（store 键名 blackboard_ops，
+            # 已解析为数组或 None）。前端据 A 类事件 + 这些 ops 还原黑板三节
+            # （契约 freeze_contract / 决策 set_decision / 任务 set_task），
+            # 无需新增只读端点——投影足以从已投影事件重建（spec §4.6 增量=重放一致）。
+            "bb_ops": ev.get("blackboard_ops") or [],
             # 第三人称渲染走 orch.render（viewer_role 对单行不改格式，§6.2）。
             # 仅供 replay/审计口径参考；前端阅读列一律渲染 body 原文，绝不渲染此行（§16.7）。
             "third_person": orch.render.render_event_third_person(ev, viewer_role="human"),

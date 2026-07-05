@@ -23,7 +23,7 @@
       <button class="tab active" data-view="threads">线程</button>
       <button class="tab" data-view="config">配置</button>
       <button class="tab" data-view="metrics">指标</button>
-      <button class="tab" data-view="bench">压测</button>
+      <button class="tab" data-view="bench">基准</button>
     </nav>
   </header>
 
@@ -73,55 +73,95 @@
               <div class="ctrl-title">
                 <span id="wk-tid" class="wk-tid">t-…</span>
                 <span id="wk-status" class="badge">—</span>
+                <!-- D18 派发摘要 chips（pending/dispatching/gate/failed）；点击展开完整派发表，
+                     收编原"状态"按钮内容。由 app.js renderDispatchSummary 生成 #btn-status。 -->
+                <span id="dispatch-summary" class="dispatch-summary"></span>
               </div>
               <div class="ctrl-actions">
                 <button id="btn-run" class="btn-primary" title="运行一轮调度">▶ 运行一轮</button>
                 <button id="btn-reopen" class="btn-ghost" title="重开线程">↻ 重开</button>
-                <button id="btn-status" class="btn-ghost" title="查看状态明细">◫ 状态</button>
                 <button id="btn-replay" class="btn-ghost" title="回放群聊">⟲ 回放</button>
                 <button id="btn-attach" class="btn-ghost" title="接入命令">⎘ 接入</button>
                 <button id="btn-stop" class="btn-danger" title="优雅停机">■ 停机</button>
               </div>
             </div>
 
-            <!-- 门禁审批条（有 gate_wait 时显示） -->
-            <div id="gate-bar" class="panel glass gate-bar hidden">
+            <!-- D19 门禁琥珀 banner：suspended 时出现，corr 自动从最近未决 gate_request 提取
+                 （不再手填）。#gate-corr 改为隐藏字段承载自动提取的 corr。 -->
+            <div id="gate-bar" class="gate-banner hidden">
               <span class="gate-icon">⚠</span>
-              <span class="gate-text">门禁等待裁决</span>
-              <input id="gate-corr" class="inp" placeholder="corr" />
-              <button id="btn-approve" class="btn-primary">批准</button>
-              <button id="btn-reject" class="btn-danger">驳回</button>
+              <span id="gate-label" class="gate-label">门禁等待裁决</span>
+              <input id="gate-corr" type="hidden" />
+              <div class="gate-btns">
+                <button id="btn-approve" class="btn-primary">批准</button>
+                <button id="btn-reject" class="btn-danger">拒绝</button>
+              </div>
             </div>
 
-            <!-- 群聊事件流（阅读列：定宽居中，纯 rgba 无 blur，对比优先） -->
-            <div class="chat-panel">
-              <div class="panel-head reading-col">
-                <h3>群聊事件流</h3>
-                <button id="btn-refresh-events" class="btn-ghost" title="刷新事件">⟳</button>
-              </div>
-              <div id="chat-stream" class="chat-stream reading-col"></div>
-            </div>
+            <!-- 主区两栏：阅读列（左，定宽居中）+ 黑板栏（右，可折叠 D17） -->
+            <div class="main-split">
+              <div class="main-reading">
+                <!-- D16 过滤工具条（事件流上方；纯前端投影，不发请求） -->
+                <div class="filter-bar reading-col">
+                  <div class="fb-group">
+                    <span class="fb-lbl">角色</span>
+                    <div id="filter-roles" class="fb-chips"></div>
+                  </div>
+                  <div class="fb-group">
+                    <span class="fb-lbl">类型</span>
+                    <div id="filter-types" class="fb-chips"></div>
+                  </div>
+                  <div class="fb-group fb-inline">
+                    <label class="f-preset"><input type="checkbox" id="filter-aonly" /> 只看 A 类</label>
+                    <span class="fb-goto">
+                      <input id="filter-goto" class="inp fb-goto-inp" placeholder="#n 跳转" />
+                      <button id="filter-goto-btn" class="btn-ghost">跳转</button>
+                    </span>
+                  </div>
+                </div>
 
-            <!-- 发言框（与阅读列同宽对齐） -->
-            <div class="send-panel reading-col">
-              <div class="send-row">
-                <label class="send-field">
-                  <span class="send-lbl">发给</span>
-                  <select id="send-to" class="sel" title="接收方（不指定则由 moderator 兜底路由，spec §5.2）">
-                    <option value="">不指定（由 moderator 路由）</option>
-                  </select>
-                </label>
-                <label class="send-field">
-                  <span class="send-lbl">类型</span>
-                  <!-- 选项由 app.js populateSendType 按 §3.2 human 允许类型动态填充 -->
-                  <select id="send-type" class="sel" title="事件类型（仅 human 允许类型，spec §3.2）"></select>
-                </label>
+                <!-- 群聊事件流（阅读列：定宽居中，纯 rgba 无 blur，对比优先） -->
+                <div class="chat-panel">
+                  <div class="panel-head reading-col">
+                    <h3>群聊事件流</h3>
+                    <button id="btn-refresh-events" class="btn-ghost" title="刷新事件">⟳</button>
+                  </div>
+                  <div id="chat-stream" class="chat-stream reading-col"></div>
+                </div>
+
+                <!-- 发言框（与阅读列同宽对齐） -->
+                <div class="send-panel reading-col">
+                  <div class="send-row">
+                    <label class="send-field">
+                      <span class="send-lbl">发给</span>
+                      <select id="send-to" class="sel" title="接收方（不指定则由 moderator 兜底路由，spec §5.2）">
+                        <option value="">不指定（由 moderator 路由）</option>
+                      </select>
+                    </label>
+                    <label class="send-field">
+                      <span class="send-lbl">类型</span>
+                      <!-- 选项由 app.js populateSendType 按 §3.2 human 允许类型动态填充 -->
+                      <select id="send-type" class="sel" title="事件类型（仅 human 允许类型，spec §3.2）"></select>
+                    </label>
+                  </div>
+                  <textarea id="send-body" class="ta" rows="2" placeholder="发言正文…"></textarea>
+                  <div class="send-actions">
+                    <span id="send-hint" class="send-hint"></span>
+                    <button id="btn-send" class="btn-primary">发送 ➤</button>
+                  </div>
+                </div>
               </div>
-              <textarea id="send-body" class="ta" rows="2" placeholder="发言正文…"></textarea>
-              <div class="send-actions">
-                <span id="send-hint" class="send-hint"></span>
-                <button id="btn-send" class="btn-primary">发送 ➤</button>
-              </div>
+
+              <!-- D17 黑板栏（事实层投影：契约/决策/任务状态）。占 R2 预留留白，
+                   可折叠 320–360px；纯 rgba + border（禁 blur，E2）。只读。 -->
+              <aside id="board-panel" class="board-panel">
+                <div class="board-head">
+                  <button id="board-toggle" class="btn-ghost board-toggle" title="折叠黑板栏">▶ 黑板</button>
+                  <h3 class="board-title">黑板 · 事实层</h3>
+                </div>
+                <div id="board-content" class="board-content"></div>
+                <p class="board-note">A 类事件（decision/acceptance/gate/terminate）投影，与流内一致（spec §4.6）。</p>
+              </aside>
             </div>
           </div>
         </div>
@@ -165,10 +205,10 @@
       </div>
     </section>
 
-    <!-- ========== 压测视图 ========== -->
+    <!-- ========== 基准视图（对应 orch bench resume；原"压测"入口改名"基准"，保留不删） ========== -->
     <section id="view-bench" class="view">
       <div class="panel glass">
-        <div class="panel-head"><h3>压测 · bench resume（spec §12/§13）</h3></div>
+        <div class="panel-head"><h3>基准 · bench resume（spec §12/§13）</h3></div>
         <div class="bench-form">
           <label>fixture <input id="bench-fixture" class="inp" value="like" /></label>
           <label>runs <input id="bench-runs" class="inp" type="number" value="3" min="1" /></label>

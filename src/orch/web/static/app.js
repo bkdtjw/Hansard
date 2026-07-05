@@ -2,6 +2,11 @@
  *
  * 铁律：每个可点击控件都发起真实 fetch("/api/...") 并渲染真实响应/错误；
  * 无 alert("TODO")、无写死假数据、空状态显示真实空。
+ *
+ * 版式/性能红线（console-ui-revision.md E2）：阅读列/黑板栏/工具条一律纯
+ * rgba + border，绝不 blur（全站唯一 backdrop-filter 仅顶栏）；transition
+ * 只用 transform/opacity/background-color/border-color/color/box-shadow；
+ * 闪烁/高亮只用 transform:scale + opacity 或 background-color 过渡。
  */
 
 "use strict";
@@ -10,6 +15,12 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 let selectedThread = null;
+// D16 过滤状态（纯前端投影，不改数据、不发请求）。null = 不过滤该维度。
+const filterState = { roles: null, types: null, aOnly: false };
+// D18/D19：最近一次 status 明细缓存，供派发表展开与门禁 corr 提取。
+let lastStatus = null;
+// 当前线程事件缓存（供过滤重渲染 / 跳转 / 黑板投影，均为库的只读投影）。
+let currentEvents = [];
 
 // ————————————————————————————————————————————————
 // 通用 fetch 封装：统一 JSON + 错误 toast（用后端真实 error 文案）。
@@ -96,6 +107,38 @@ function switchView(name) {
 // ————————————————————————————————————————————————
 // 线程列表 + 新建
 // ————————————————————————————————————————————————
+// D20：线程列表项增强——主标题=E1 正文前 20 字摘要；次要行=id（等宽）·
+// 状态文字（running/suspended/terminated 取代裸色点）·事件数·最后活动时间。
+// suspended 项加琥珀徽标（D19）。数据全来自 /api/threads（后端已投影）。
+const STATUS_TEXT = { running: "running", suspended: "suspended", terminated: "terminated" };
+
+function summarize(text, n) {
+  const s = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  if (!s) return "（无正文）";
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function fmtClock(tsSec) {
+  // ev.ts 是 epoch 秒（REAL）。tabular-nums 由 CSS 提供。
+  const n = Number(tsSec);
+  if (!isFinite(n) || n <= 0) return "";
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function fmtLastActivity(tsSec) {
+  const n = Number(tsSec);
+  if (!isFinite(n) || n <= 0) return "—";
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  if (sameDay) return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 async function loadThreads() {
   const list = $("#thread-list");
   try {
@@ -107,19 +150,60 @@ async function loadThreads() {
     list.innerHTML = "";
     for (const t of threads) {
       const li = document.createElement("li");
+      li.className = "thread-item";
       if (t.id === selectedThread) li.classList.add("selected");
-      const statusClass = t.status === "running" ? "running"
-        : (t.status === "suspended" ? "gate" : "terminated");
+      const status = t.status || "unknown";
+      const statusCls = STATUS_TEXT[status] ? status : "terminated";
+      const title = summarize(t.summary, 20);
+      const suspended = status === "suspended";
+      // D20 主标题=摘要；次要行=id·状态文字·事件数·最后活动。D19 suspended 琥珀徽标。
+      li.dataset.tid = t.id;
+      // 基础行即时渲染（id/状态文字/角色数占位）；摘要/事件数/最后活动由
+      // enrichThreadRow 从 events 端点（本卡唯一放开的只读投影）异步补全——
+      // 不改 /api/threads 端点（本卡 server 白名单只放开 events 端点）。
       li.innerHTML =
-        `<span class="dot ${statusClass}"></span>` +
-        `<span class="t-id">${t.id}</span>` +
-        `<span class="t-roles">${(t.roles || []).length} 角色</span>`;
+        `<div class="ti-title">` +
+          (suspended ? `<span class="ti-gate" title="门禁待审批">⚠ 待审批</span>` : "") +
+          `<span class="ti-summary">${escapeHtml(title)}</span>` +
+        `</div>` +
+        `<div class="ti-meta">` +
+          `<span class="ti-id">${escapeHtml(t.id)}</span>` +
+          `<span class="ti-status s-${statusCls}">${escapeHtml(STATUS_TEXT[status] || status)}</span>` +
+          `<span class="ti-count">${Number((t.roles || []).length)} 角色</span>` +
+          `<span class="ti-time">—</span>` +
+        `</div>`;
       li.addEventListener("click", () => selectThread(t.id));
       list.appendChild(li);
+      enrichThreadRow(li, t.id);
     }
   } catch (e) {
-    list.innerHTML = `<li class="empty">加载失败: ${e.message}</li>`;
+    list.innerHTML = `<li class="empty">加载失败: ${escapeHtml(e.message)}</li>`;
     toast("刷新线程失败: " + e.message, "err");
+  }
+}
+
+// D20 渐进增强：从 events 端点取该线程 E1 摘要 + 事件数 + 最后活动时间，
+// 回填列表行（不阻塞基础渲染；events 是本卡唯一放开的只读投影端点）。
+async function enrichThreadRow(li, tid) {
+  try {
+    const data = await api(`/api/threads/${tid}/events`);
+    const evs = data.events || [];
+    if (!li.isConnected) return;
+    const sumEl = li.querySelector(".ti-summary");
+    const cntEl = li.querySelector(".ti-count");
+    const timeEl = li.querySelector(".ti-time");
+    if (evs.length && sumEl) {
+      // E1 = 首条事件正文（剥自指前缀后）前 20 字。
+      const e1 = evs[0];
+      const clean = stripSelfViewPrefix(e1.body || "", {
+        id: e1.id, sender: e1.sender, type: e1.type, to: e1.to || [],
+      });
+      sumEl.textContent = summarize(clean, 20);
+    }
+    if (cntEl) cntEl.textContent = `${evs.length} 事件`;
+    if (timeEl && evs.length) timeEl.textContent = fmtLastActivity(evs[evs.length - 1].ts);
+  } catch (e) {
+    /* 增强失败静默：基础行仍可用（id/状态/角色数） */
   }
 }
 
@@ -152,7 +236,7 @@ async function selectThread(tid) {
   $("#workspace").classList.remove("hidden");
   $("#wk-tid").textContent = tid;
   $$("#thread-list li").forEach((li) => {
-    li.classList.toggle("selected", li.querySelector(".t-id")?.textContent === tid);
+    li.classList.toggle("selected", li.querySelector(".ti-id")?.textContent === tid);
   });
   await Promise.all([loadEvents(), loadStatus(), populateSendTo()]);
 }
@@ -172,6 +256,8 @@ async function populateSendTo() {
       o.value = r; o.textContent = r;
       sel.appendChild(o);
     }
+    // D16：角色过滤下拉也随线程角色刷新。
+    populateFilterRoles(roles);
   } catch (e) {
     /* 保底：下拉至少有默认项（HTML 内已含首项） */
   }
@@ -219,6 +305,19 @@ function roleColor(role) {
   return ROLE_COLORS[role] || ROLE_COLORS.system;
 }
 
+// D11：type 徽章语义类（14 种全量）。CSS 类 tb-{type} 提供语义色。
+// A 类事件（spec §3.2 保留策略 A）：decision/acceptance/gate_request/
+// gate_decision/terminate——卡片整体加重（边框换 A 类色）+ "已入黑板"图钉。
+const A_CLASS_TYPES = new Set([
+  "decision", "acceptance", "gate_request", "gate_decision", "terminate",
+]);
+// 14 种全量 type（校验/过滤下拉用）。
+const ALL_TYPES = [
+  "assign", "review", "question", "answer", "decision", "handoff",
+  "report", "defect", "acceptance", "gate_request", "gate_decision",
+  "system", "terminate", "chat",
+];
+
 // D1 防御性剥离：库内 body 本身干净（C1 根因=前端曾把 §6.2 视图行当正文），
 // 但仍加一道防御——仅当 body 首行严格等于"本信封自身"的视图行
 // `#{id} [{from}->@{to}] (type): ` 时才剥（id/from/to/type 逐项与卡片头系统字段
@@ -242,7 +341,158 @@ function stripSelfViewPrefix(body, sys) {
   return same ? s.slice(m[0].length) : s;
 }
 
-// D9 卡片头：一行式 = 头像圆点 · 名字 · → · @目标chips · type · (弹性) · #n。
+// ————————————————————————————————————————————————
+// D14 安全 markdown 渲染（原生，无外部库/CDN）。
+// 安全铁律（防 XSS，F7）：
+//   1) 先对整段 body 做 escapeHtml（转义 & < > "），此后原文里任何 HTML
+//      标签都已成为可见文本（`<script>` → `&lt;script&gt;`），不可能执行。
+//   2) 仅在"已转义文本"上，用正则把有限 markdown 语法还原为受控白名单标签
+//      （code/pre/strong/em/ul/ol/li/a/br）。绝不把原始 body 作为 innerHTML 直插。
+//   3) 链接 href 仅允许 http/https（禁 javascript:/data: 等），href 值再次转义引号。
+//   4) 代码块/行内代码内部内容不再二次解析 markdown（用占位符隔离）。
+// ————————————————————————————————————————————————
+function escapeHtmlAttr(s) {
+  // 属性值上下文：在 &<> 基础上再转义引号（escapeHtml 只转 &<>）。
+  return escapeHtml(s).replaceAll('"', "&quot;");
+}
+
+function safeLinkHref(raw) {
+  // 仅放行 http/https 绝对链接；其余（javascript:/data:/相对/协议相对）一律拒绝。
+  const u = String(raw || "").trim();
+  if (/^https?:\/\//i.test(u)) return u;
+  return null;
+}
+
+function renderInlineMd(escaped) {
+  // 输入：已 escapeHtml 的文本片段（无 code 占位）。输出：受控内联 HTML。
+  let s = escaped;
+  // 行内代码 `code`：内容已是转义文本，包进 <code> 即可（内部不再解析）。
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`);
+  // 链接 [text](url)：url 经 http/https 白名单校验，失败则退化为纯文本。
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+    const href = safeLinkHref(url);
+    if (!href) return m; // 非法协议：原样保留转义文本，不生成链接
+    return `<a href="${escapeHtmlAttr(href)}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  });
+  // 粗体 **text**（在斜体前，避免 * 抢占）。
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, t) => `<strong>${t}</strong>`);
+  // 斜体 *text*（避开已消耗的 **）。
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, (_, pre, t) => `${pre}<em>${t}</em>`);
+  return s;
+}
+
+function renderMarkdown(rawBody) {
+  // ① 全文先转义——这一步之后，body 中不可能再存在可执行 HTML。
+  const escapedAll = escapeHtml(String(rawBody == null ? "" : rawBody)).replaceAll('"', "&quot;");
+  // ② 抽取代码块 ```...```，用占位符隔离（内部不参与后续 markdown 解析）。
+  const codeBlocks = [];
+  let text = escapedAll.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(code.replace(/\n$/, ""));
+    return ` CB${idx} `;
+  });
+
+  // ③ 按行处理块级结构：无序/有序列表 + 段落，行内再走 renderInlineMd。
+  const lines = text.split("\n");
+  const out = [];
+  let listType = null; // 'ul' | 'ol' | null
+  const closeList = () => { if (listType) { out.push(`</${listType}>`); listType = null; } };
+
+  for (const line of lines) {
+    // 代码块占位行：整行就是占位符 → 直接吐 <pre><code>。
+    const cbMatch = /^ CB(\d+) $/.exec(line.trim());
+    if (cbMatch) {
+      closeList();
+      out.push(`<pre class="md-pre"><code>${codeBlocks[Number(cbMatch[1])]}</code></pre>`);
+      continue;
+    }
+    const ul = /^\s*[-*]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ul) {
+      if (listType !== "ul") { closeList(); out.push('<ul class="md-ul">'); listType = "ul"; }
+      out.push(`<li>${renderInlineMd(ul[1])}</li>`);
+    } else if (ol) {
+      if (listType !== "ol") { closeList(); out.push('<ol class="md-ol">'); listType = "ol"; }
+      out.push(`<li>${renderInlineMd(ol[1])}</li>`);
+    } else if (line.trim() === "") {
+      closeList();
+      out.push("__BR__");
+    } else {
+      closeList();
+      out.push(`<span class="md-line">${renderInlineMd(line)}</span>`);
+    }
+  }
+  closeList();
+  // 相邻两个 md-line 之间插 <br>（段落内换行）；空行折叠；列表/代码块相邻不插。
+  // 用哨兵 __BR__ 标空行后剔除，避免全局 \n→<br> 触及代码块内部（曾致 bug）。
+  const parts = out.filter((x) => x !== "");
+  const html = [];
+  for (let k = 0; k < parts.length; k++) {
+    const cur = parts[k];
+    if (cur === "__BR__") continue;
+    html.push(cur);
+    const nxt = parts[k + 1];
+    // 仅当当前与下一片段都是 md-line（段落内相邻行）才补 <br>。
+    if (cur.startsWith('<span class="md-line">') && nxt && nxt.startsWith('<span class="md-line">')) {
+      html.push("<br>");
+    }
+  }
+  return html.join("");
+}
+
+// ————————————————————————————————————————————————
+// D12 回复链 chip + D13 时间/meta/verify 徽章 + D11 徽章/A 类加重。
+// ————————————————————————————————————————————————
+function buildReplyChips(ev) {
+  const parts = [];
+  for (const n of (ev.re || [])) {
+    // 平滑滚动至目标卡 + 高亮闪烁（点击处理在 loadEvents 里委托绑定）。
+    parts.push(`<button class="ln-chip re-chip" data-goto="${escapeHtml(String(n))}" title="跳到 #${escapeHtml(String(n))}">↩ 回复 #${escapeHtml(String(n))}</button>`);
+  }
+  if (ev.corr) {
+    const c = String(ev.corr);
+    // corr 语义标签：门禁 gate-xx / 作业 job-xx，其余直出。
+    const label = /^gate/i.test(c) ? c : (/^job/i.test(c) ? c : c);
+    parts.push(`<span class="ln-chip corr-chip" title="关联 corr=${escapeHtml(c)}">🔗 ${escapeHtml(label)}</span>`);
+  }
+  return parts.length ? `<div class="b-links">${parts.join("")}</div>` : "";
+}
+
+// D13 verify 徽章：acceptance 卡必须显示——exit_code===0 绿"verify ✓ exit 0"，
+// 缺失或非零 红"⚠ 无系统侧验证"（spec §8.3：无硬证据的验收会被降级，UI 须可见）。
+function buildVerifyBadge(ev) {
+  if (ev.type !== "acceptance") return "";
+  const v = (ev.meta && ev.meta.verify) || null;
+  if (v && Number(v.exit_code) === 0) {
+    return `<span class="verify-badge ok" title="系统侧 verify 通过（exit 0）">verify ✓ exit 0</span>`;
+  }
+  const code = (v && v.exit_code !== undefined && v.exit_code !== null) ? ` (exit ${escapeHtml(String(v.exit_code))})` : "";
+  return `<span class="verify-badge bad" title="缺 meta.verify 或退出码非 0：spec §8.3 将降级为 report">⚠ 无系统侧验证${code}</span>`;
+}
+
+// D13 meta hover 浮层：tokens_in/out、duration_s（来自 ev.meta）。
+function buildMetaTip(ev) {
+  const m = ev.meta || {};
+  const bits = [];
+  if (m.tokens_in !== undefined && m.tokens_in !== null) bits.push(`tokens_in ${escapeHtml(String(m.tokens_in))}`);
+  if (m.tokens_out !== undefined && m.tokens_out !== null) bits.push(`tokens_out ${escapeHtml(String(m.tokens_out))}`);
+  if (m.duration_s !== undefined && m.duration_s !== null) bits.push(`duration ${escapeHtml(String(m.duration_s))}s`);
+  if (!bits.length) return "";
+  return `<span class="meta-info" tabindex="0" aria-label="事件 meta">ⓘ<span class="meta-pop">${bits.join(" · ")}</span></span>`;
+}
+
+// D14 artifacts chips：路径等宽字体，只读展示（不下载，避免越权）。
+function buildArtifactChips(ev) {
+  const arts = ev.artifacts || [];
+  if (!arts.length) return "";
+  const chips = arts.map((a) =>
+    `<span class="art-chip" title="${escapeHtml(String(a))}">📄 ${escapeHtml(String(a))}</span>`
+  ).join("");
+  return `<div class="b-arts">${chips}</div>`;
+}
+
+// D9 卡片头：一行式 = 头像圆点 · 名字 · → · @目标chips · type 徽章 · [已入黑板]
+//            · (弹性空隙) · meta · #n · 时间。
 // @目标只从信封 to 渲染（§16.1，禁广播）。
 function buildEventHead(ev) {
   const sender = ev.sender || "system";
@@ -253,17 +503,66 @@ function buildEventHead(ev) {
     return `<span class="to-chip" style="color:${c};border-color:${c}66">@${escapeHtml(r)}</span>`;
   }).join("");
   const arrow = (ev.to && ev.to.length) ? '<span class="head-arrow">→</span>' : "";
+  const type = ev.type || "";
+  const isA = A_CLASS_TYPES.has(type);
+  // D11：type 徽章语义类 tb-{type}；A 类附"已入黑板"图钉。
+  const typeBadge = `<span class="ev-type tb-${escapeHtml(type)}">${escapeHtml(type)}</span>`;
+  const pin = isA ? `<span class="bb-pin" title="A 类事件：已投影进黑板（spec §3.2/§4.6）">📌 已入黑板</span>` : "";
+  const clock = fmtClock(ev.ts);
+  const clockEl = clock ? `<span class="ev-time" title="ts">${clock}</span>` : "";
   return (
     `<div class="b-head">` +
       `<span class="avatar" style="background:${col}1f;color:${col};border-color:${col}66">${initial}</span>` +
       `<span class="speaker" style="color:${col}">${escapeHtml(sender)}</span>` +
       arrow +
       `<span class="to-chips">${chips}</span>` +
-      `<span class="ev-type">${escapeHtml(ev.type || "")}</span>` +
+      typeBadge +
+      pin +
       `<span class="head-spacer"></span>` +
+      buildMetaTip(ev) +
       `<span class="ev-id">#${escapeHtml(String(ev.id))}</span>` +
+      clockEl +
     `</div>`
   );
+}
+
+// D15 折叠：正文渲染后若行数 > 8 则 clamp + 展开/收起。
+const CLAMP_LINES = 8;
+
+function buildBubble(ev) {
+  const div = document.createElement("div");
+  const type = ev.type || "";
+  const isA = A_CLASS_TYPES.has(type);
+  div.className = `bubble r-${ev.sender || "system"}` + (isA ? ` a-class a-${escapeHtml(type)}` : "");
+  div.dataset.eid = String(ev.id);
+  // D1：正文渲染 body 原文；先自指前缀防御剥离，再 D14 安全 markdown。
+  const clean = stripSelfViewPrefix(ev.body || "", {
+    id: ev.id, sender: ev.sender, type: ev.type, to: ev.to || [],
+  });
+  const bodyHtml = renderMarkdown(clean);
+  // 行数估算（用于 D15 clamp）：原文换行数 + 1。
+  const lineCount = (clean.match(/\n/g) || []).length + 1;
+  const clampCls = lineCount > CLAMP_LINES ? " clamped" : "";
+  div.innerHTML =
+    buildEventHead(ev) +
+    buildReplyChips(ev) +
+    buildVerifyBadge(ev) +
+    `<div class="b-body${clampCls}">${bodyHtml}</div>` +
+    buildArtifactChips(ev) +
+    (lineCount > CLAMP_LINES
+      ? `<button class="toggle-clamp" data-expanded="0">展开（${lineCount} 行）</button>`
+      : "");
+  return div;
+}
+
+// D16 过滤投影：把 currentEvents 按 filterState 过滤后返回（不改数据）。
+function applyFilters(evs) {
+  return evs.filter((ev) => {
+    if (filterState.aOnly && !A_CLASS_TYPES.has(ev.type)) return false;
+    if (filterState.roles && filterState.roles.size && !filterState.roles.has(ev.sender)) return false;
+    if (filterState.types && filterState.types.size && !filterState.types.has(ev.type)) return false;
+    return true;
+  });
 }
 
 async function loadEvents() {
@@ -272,59 +571,236 @@ async function loadEvents() {
   try {
     const data = await api(`/api/threads/${selectedThread}/events`);
     const evs = data.events || [];
+    currentEvents = evs;
     // D6：据线程是否已有事件决定 type 下拉默认（新线程→assign，进行中→question）。
     populateSendType(evs.length > 0);
-    if (!evs.length) {
-      stream.innerHTML = '<div class="chat-empty">暂无事件</div>';
-      return;
-    }
-    stream.innerHTML = "";
-    let sawGate = false;
-    for (const ev of evs) {
-      if (ev.type === "gate_request") sawGate = ev.corr || true;
-      const div = document.createElement("div");
-      div.className = `bubble r-${ev.sender || "system"}`;
-      // D1：正文渲染 body 原文（escapeHtml + CSS white-space:pre-wrap），
-      // 永远不渲染 third_person 视图行；再叠一道自指前缀防御剥离。
-      const clean = stripSelfViewPrefix(ev.body || "", {
-        id: ev.id, sender: ev.sender, type: ev.type, to: ev.to || [],
-      });
-      div.innerHTML =
-        buildEventHead(ev) +
-        `<div class="b-body">${escapeHtml(clean)}</div>`;
-      stream.appendChild(div);
-    }
-    stream.scrollTop = stream.scrollHeight;
-    // 门禁条：状态 suspended 或有 gate_request 时出现，回填 corr。
-    updateGateBar(sawGate);
+    // D17：黑板栏据 A 类事件 + bb_ops 投影刷新。
+    renderBoard(evs);
+    renderStream();
+    // 门禁条：从事件中提取最近未决 gate_request（D19）。
+    refreshGateFromEvents(evs);
   } catch (e) {
-    stream.innerHTML = `<div class="chat-empty">加载失败: ${e.message}</div>`;
+    stream.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
 }
 
-function updateGateBar(gateCorr) {
-  const bar = $("#gate-bar");
-  const statusBadge = $("#wk-status").textContent;
-  const show = gateCorr || statusBadge === "suspended";
-  bar.classList.toggle("hidden", !show);
-  if (show && typeof gateCorr === "string") {
-    $("#gate-corr").value = gateCorr;
+// 依据当前过滤状态渲染事件流（D15 连续 system 聚合 + clamp/展开委托）。
+function renderStream() {
+  const stream = $("#chat-stream");
+  const shown = applyFilters(currentEvents);
+  if (!shown.length) {
+    stream.innerHTML = currentEvents.length
+      ? '<div class="chat-empty">（当前过滤无匹配事件）</div>'
+      : '<div class="chat-empty">暂无事件</div>';
+    return;
   }
+  stream.innerHTML = "";
+  // D15：连续 system 事件聚合为一条可展开分组行，默认折叠。
+  let i = 0;
+  while (i < shown.length) {
+    const ev = shown[i];
+    if (ev.type === "system") {
+      let j = i;
+      const group = [];
+      while (j < shown.length && shown[j].type === "system") { group.push(shown[j]); j++; }
+      stream.appendChild(buildSystemGroup(group));
+      i = j;
+    } else {
+      stream.appendChild(buildBubble(ev));
+      i++;
+    }
+  }
+  stream.scrollTop = stream.scrollHeight;
 }
 
+// D15：连续 system 事件分组行（默认折叠，点击展开逐条卡片）。
+function buildSystemGroup(group) {
+  const wrap = document.createElement("div");
+  wrap.className = "sys-group";
+  if (group.length === 1) {
+    // 单条 system：直接作为普通（弱化）卡片，不做分组包裹。
+    return buildBubble(group[0]);
+  }
+  const ids = group.map((g) => "#" + g.id).join(" ");
+  wrap.innerHTML =
+    `<button class="sys-group-head" data-expanded="0">▸ ${group.length} 条系统事件（${escapeHtml(ids)}）</button>` +
+    `<div class="sys-group-body hidden"></div>`;
+  const body = wrap.querySelector(".sys-group-body");
+  for (const g of group) body.appendChild(buildBubble(g));
+  return wrap;
+}
+
+// D12 点击 re chip：平滑滚动至目标卡 + 高亮闪烁一次（transform/opacity/bg 过渡）。
+function gotoEvent(eid) {
+  const stream = $("#chat-stream");
+  let target = stream.querySelector(`.bubble[data-eid="${CSS.escape(String(eid))}"]`);
+  // 若目标在折叠的 system 分组里，先展开该分组。
+  if (!target) {
+    const groups = $$("#chat-stream .sys-group");
+    for (const g of groups) {
+      const inner = g.querySelector(`.bubble[data-eid="${CSS.escape(String(eid))}"]`);
+      if (inner) {
+        const head = g.querySelector(".sys-group-head");
+        const gbody = g.querySelector(".sys-group-body");
+        if (gbody && gbody.classList.contains("hidden")) {
+          gbody.classList.remove("hidden");
+          if (head) { head.dataset.expanded = "1"; head.textContent = head.textContent.replace("▸", "▾"); }
+        }
+        target = inner;
+        break;
+      }
+    }
+  }
+  if (!target) { toast(`#${eid} 不在当前过滤视图内`, "err"); return; }
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.remove("flash");
+  // 触发重排以便重放动画。
+  void target.offsetWidth;
+  target.classList.add("flash");
+  setTimeout(() => target.classList.remove("flash"), 1200);
+}
+
+// ————————————————————————————————————————————————
+// D17 黑板栏：据 A 类事件 + bb_ops 投影三节（契约/决策/任务状态）。
+// 数据源=前端投影（不加只读端点）：events 端点已返回 A 类事件与其 bb_ops
+// （store 键名 blackboard_ops → 端点 bb_ops），三种 op 与黑板三节一一对应：
+//   freeze_contract → 契约（name·vX·path，同名后写覆盖）
+//   set_decision    → 决策（逐条 append，带 #evt 链接）
+//   set_task        → 任务状态（key→status，同 key 后写覆盖）
+// 投影顺序=事件 id 升序（与 store.rebuild_blackboard / _apply_ops_into 一致，§4.6）。
+// ————————————————————————————————————————————————
+function projectBoard(evs) {
+  const contracts = {};     // name -> {version, path, evt}
+  const decisions = [];     // {evt, text}
+  const tasks = {};         // key -> {status, evt}
+  for (const ev of evs) {   // evs 已按 id 升序（端点 ORDER BY id ASC）
+    if (!A_CLASS_TYPES.has(ev.type)) continue;
+    for (const op of (ev.bb_ops || [])) {
+      if (op.op === "freeze_contract") {
+        contracts[op.name] = { version: op.version, path: op.path, evt: ev.id };
+      } else if (op.op === "set_decision") {
+        decisions.push({ evt: ev.id, text: op.text });
+      } else if (op.op === "set_task") {
+        tasks[op.key] = { status: op.status, evt: ev.id };
+      }
+    }
+  }
+  return { contracts, decisions, tasks };
+}
+
+function renderBoard(evs) {
+  const el = $("#board-content");
+  if (!el) return;
+  const { contracts, decisions, tasks } = projectBoard(evs);
+  const names = Object.keys(contracts).sort();
+  const taskKeys = Object.keys(tasks).sort();
+
+  const contractRows = names.length
+    ? names.map((n) => {
+        const c = contracts[n];
+        return `<li><span class="bd-name">${escapeHtml(n)}</span>` +
+          `<span class="bd-ver">v${escapeHtml(String(c.version))}</span>` +
+          `<span class="bd-path mono">${escapeHtml(String(c.path || ""))}</span>` +
+          `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(c.evt))}">#${escapeHtml(String(c.evt))}</button></li>`;
+      }).join("")
+    : '<li class="bd-empty">（无冻结契约）</li>';
+
+  const decisionRows = decisions.length
+    ? decisions.map((d) =>
+        `<li><span class="bd-text">${escapeHtml(String(d.text == null ? "" : d.text))}</span>` +
+        `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(d.evt))}">#${escapeHtml(String(d.evt))}</button></li>`
+      ).join("")
+    : '<li class="bd-empty">（无决策）</li>';
+
+  const taskRows = taskKeys.length
+    ? taskKeys.map((k) => {
+        const t = tasks[k];
+        return `<tr><td class="mono">${escapeHtml(k)}</td>` +
+          `<td><span class="task-status ts-${escapeHtml(String(t.status || "").replace(/[^a-z0-9_-]/gi, ""))}">${escapeHtml(String(t.status))}</span></td>` +
+          `<td><button class="ln-chip bd-goto" data-goto="${escapeHtml(String(t.evt))}">#${escapeHtml(String(t.evt))}</button></td></tr>`;
+      }).join("")
+    : '<tr><td colspan="3" class="bd-empty">（无任务）</td></tr>';
+
+  el.innerHTML =
+    `<section class="bd-sec"><h4>契约</h4><ul class="bd-list">${contractRows}</ul></section>` +
+    `<section class="bd-sec"><h4>决策</h4><ul class="bd-list">${decisionRows}</ul></section>` +
+    `<section class="bd-sec"><h4>任务状态</h4><table class="bd-tasks"><thead><tr><th>任务</th><th>状态</th><th></th></tr></thead><tbody>${taskRows}</tbody></table></section>`;
+}
+
+// ————————————————————————————————————————————————
+// D16 过滤工具条：角色多选、type 多选、只看 A 类、#n 跳转。纯前端投影。
+// ————————————————————————————————————————————————
+function populateFilterRoles(roles) {
+  const box = $("#filter-roles");
+  if (!box) return;
+  const uniq = Array.from(new Set(roles || []));
+  if (!uniq.includes("system")) uniq.push("system"); // system 事件可能出现
+  box.innerHTML = uniq.map((r) => {
+    const c = roleColor(r);
+    return `<label class="f-chip"><input type="checkbox" value="${escapeHtml(r)}" data-fkind="role"><span style="color:${c}">${escapeHtml(r)}</span></label>`;
+  }).join("");
+}
+
+function populateFilterTypes() {
+  const box = $("#filter-types");
+  if (!box || box.dataset.built === "1") return;
+  box.innerHTML = ALL_TYPES.map((ty) =>
+    `<label class="f-chip"><input type="checkbox" value="${escapeHtml(ty)}" data-fkind="type"><span class="tb-mini tb-${escapeHtml(ty)}">${escapeHtml(ty)}</span></label>`
+  ).join("");
+  box.dataset.built = "1";
+}
+
+function readFilters() {
+  const roleChecks = $$('#filter-roles input:checked').map((c) => c.value);
+  const typeChecks = $$('#filter-types input:checked').map((c) => c.value);
+  filterState.roles = roleChecks.length ? new Set(roleChecks) : null;
+  filterState.types = typeChecks.length ? new Set(typeChecks) : null;
+  filterState.aOnly = $("#filter-aonly")?.checked || false;
+  renderStream();
+}
+
+// ————————————————————————————————————————————————
+// 状态 / 派发（D18）
+// ————————————————————————————————————————————————
 async function loadStatus() {
   if (!selectedThread) return;
   try {
     const s = await api(`/api/threads/${selectedThread}/status`);
+    lastStatus = s;
     const badge = $("#wk-status");
     badge.textContent = s.status;
     badge.className = `badge ${s.status}`;
     applyStatusMatrix(s.status);
-    updateGateBar(s.status === "suspended" ? $("#gate-corr").value || true : false);
+    renderDispatchSummary(s);
+    // D19：以 status 端点权威状态重评门禁 banner（loadEvents 与 loadStatus 并发，
+    // loadEvents 内首次评估时状态徽章可能尚未落定；此处用已缓存事件 + 权威状态兜底）。
+    refreshGateFromEvents(currentEvents, s.status);
     return s;
   } catch (e) {
     toast("状态加载失败: " + e.message, "err");
   }
+}
+
+// D18：线程头常驻派发摘要 chips（pending/dispatching/gate/failed），
+// 数据来自 status 端点 dispatches（event_id×target×status×attempts）。
+function renderDispatchSummary(s) {
+  const el = $("#dispatch-summary");
+  if (!el) return;
+  const disp = s.dispatches || [];
+  const count = (st) => disp.filter((d) => d.status === st).length;
+  const pending = count("pending");
+  const dispatching = count("dispatching");
+  const failed = count("failed");
+  const gate = s.status === "suspended" ? 1 : 0;
+  el.innerHTML =
+    `<button id="btn-status" class="disp-chips" title="点击展开完整派发表">` +
+      `<span class="dc pending">pending ${pending}</span>` +
+      `<span class="dc dispatching">dispatching ${dispatching}</span>` +
+      `<span class="dc gate">gate ${gate}</span>` +
+      `<span class="dc failed">failed ${failed}</span>` +
+    `</button>`;
+  // 重新绑定（innerHTML 覆盖了旧节点）。
+  $("#btn-status").addEventListener("click", showStatusDetail);
 }
 
 // D4：线程状态→操作矩阵。禁用态视觉可辨（CSS button:disabled 有 opacity）+ title 原因。
@@ -373,9 +849,49 @@ function applyStatusMatrix(status) {
     else hint.textContent = "";
   }
 
-  // 门禁批准/拒绝：仅 suspended 可用（gate-bar 显隐由 updateGateBar 管，这里同步禁用态）。
+  // 门禁批准/拒绝：仅 suspended 可用（gate banner 显隐由 refreshGate 管）。
   setCtl("#btn-approve", suspended, "无挂起门禁");
   setCtl("#btn-reject", suspended, "无挂起门禁");
+}
+
+// ————————————————————————————————————————————————
+// D19 门禁流：suspended 时琥珀 banner，corr 自动从最近未决 gate_request 提取。
+// ————————————————————————————————————————————————
+function refreshGateFromEvents(evs, statusOverride) {
+  evs = evs || [];
+  // 找最近一条 gate_request，且其后没有同 corr 的 gate_decision（未决）。
+  const decidedCorrs = new Set(
+    evs.filter((e) => e.type === "gate_decision" && e.corr).map((e) => String(e.corr))
+  );
+  let pending = null;
+  for (let i = evs.length - 1; i >= 0; i--) {
+    const e = evs[i];
+    if (e.type === "gate_request") {
+      const c = e.corr ? String(e.corr) : "";
+      if (!c || !decidedCorrs.has(c)) { pending = e; break; }
+    }
+  }
+  // 权威状态优先用调用方传入（loadStatus 拿到的 status 端点值）；否则回退当前徽章。
+  const status = (statusOverride || $("#wk-status").textContent || "").trim();
+  updateGateBanner(pending, status);
+}
+
+function updateGateBanner(pendingReq, status) {
+  const bar = $("#gate-bar");
+  if (!bar) return;
+  const show = status === "suspended" || !!pendingReq;
+  bar.classList.toggle("hidden", !show);
+  if (!show) return;
+  const corr = pendingReq && pendingReq.corr ? String(pendingReq.corr) : "";
+  const excerpt = pendingReq ? summarize(pendingReq.body, 60) : "（未找到 gate_request 正文）";
+  const corrEl = $("#gate-corr");
+  if (corrEl) corrEl.value = corr; // 隐藏字段承载 corr，供 gateDecision 复用
+  const label = $("#gate-label");
+  if (label) {
+    label.innerHTML =
+      `<span class="gate-corr-tag">${escapeHtml(corr || "gate")}</span> 待审批：` +
+      `<span class="gate-excerpt">${escapeHtml(excerpt)}</span>`;
+  }
 }
 
 // ————————————————————————————————————————————————
@@ -424,7 +940,7 @@ async function reopenThread() {
   try {
     const r = await api(`/api/threads/${selectedThread}/reopen`, { method: "POST", body: {} });
     toast("已重开，status=" + r.status);
-    await Promise.all([loadStatus(), loadThreads()]);
+    await Promise.all([loadEvents(), loadStatus(), loadThreads()]);
   } catch (e) {
     toast("重开失败: " + e.message, "err");
   }
@@ -443,12 +959,13 @@ async function showStatusDetail() {
   if (!selectedThread) return;
   try {
     const s = await api(`/api/threads/${selectedThread}/status`);
+    lastStatus = s;
     let rows = (s.dispatches || []).map((d) =>
-      `<tr><td>E${d.event_id}</td><td>${d.target}</td><td>${d.status}</td><td>${d.attempts}</td></tr>`
+      `<tr><td>E${escapeHtml(String(d.event_id))}</td><td>${escapeHtml(String(d.target))}</td><td>${escapeHtml(String(d.status))}</td><td>${escapeHtml(String(d.attempts))}</td></tr>`
     ).join("");
     if (!rows) rows = '<tr><td colspan="4">（无 pending 派发）</td></tr>';
     const html =
-      `<div class="b-head">status = ${s.status}</div>` +
+      `<div class="b-head">派发明细 · status = ${escapeHtml(s.status)}</div>` +
       `<table class="tbl"><thead><tr><th>事件</th><th>目标</th><th>状态</th><th>重试</th></tr></thead>` +
       `<tbody>${rows}</tbody></table>`;
     showModalInStream(html);
@@ -475,7 +992,7 @@ async function showAttach() {
   try {
     const r = await api(`/api/threads/${selectedThread}/attach/${encodeURIComponent(role)}`);
     showModalInStream(
-      `<div class="b-head">接入命令 · 角色 ${role}（点击复制）</div>` +
+      `<div class="b-head">接入命令 · 角色 ${escapeHtml(role)}（点击复制）</div>` +
       `<pre class="b-body mono copyable" title="点击复制">${escapeHtml(r.command)}</pre>`
     );
     const pre = $("#chat-stream .copyable");
@@ -501,7 +1018,7 @@ function showModalInStream(html) {
 async function gateDecision(decision) {
   if (!selectedThread) return;
   const corr = $("#gate-corr").value.trim();
-  if (!corr) { toast("请填写门禁 corr", "err"); return; }
+  if (!corr) { toast("未提取到门禁 corr（无未决 gate_request）", "err"); return; }
   try {
     await api("/api/gate", { method: "POST", body: { thread: selectedThread, corr, decision } });
     toast(`门禁已${decision === "approve" ? "批准" : "驳回"}`);
@@ -551,17 +1068,17 @@ async function loadMetrics() {
       card.className = "metric-card";
       const isNa = String(row.value).startsWith("N/A");
       card.innerHTML =
-        `<div class="m-label">${row.label}</div>` +
+        `<div class="m-label">${escapeHtml(String(row.label))}</div>` +
         `<div class="m-value ${isNa ? "na" : ""}">${escapeHtml(String(row.value))}</div>`;
       grid.appendChild(card);
     }
   } catch (e) {
-    grid.innerHTML = `<div class="chat-empty">加载失败: ${e.message}</div>`;
+    grid.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
 }
 
 // ————————————————————————————————————————————————
-// 压测视图
+// 基准视图（对应 orch bench resume；原"压测"入口改名"基准"，保留不删）
 // ————————————————————————————————————————————————
 async function runBench() {
   const fixture = $("#bench-fixture").value.trim() || "like";
@@ -575,15 +1092,15 @@ async function runBench() {
     const rep = r.report;
     const fmt = (v) => (v === null || v === undefined) ? "N/A" : (typeof v === "number" ? v.toFixed(1) : v);
     out.innerHTML =
-      `<div>fixture=<b>${rep.fixture}</b> runs=<b>${rep.runs}</b></div>` +
+      `<div>fixture=<b>${escapeHtml(String(rep.fixture))}</b> runs=<b>${escapeHtml(String(rep.runs))}</b></div>` +
       `<table><thead><tr><th>路径</th><th>每轮 tokens_in</th><th>均值</th></tr></thead><tbody>` +
       `<tr><td>关 resume（冷启动）</td><td>[${rep.no_resume.join(", ")}]</td><td>${fmt(rep.no_resume_mean)}</td></tr>` +
       `<tr><td>开 resume（热续）</td><td>[${rep.with_resume.join(", ")}]</td><td>${fmt(rep.with_resume_mean)}</td></tr>` +
       `</tbody></table>` +
       `<div style="margin-top:8px">tokens 节省 %: <b>${fmt(rep.saved_pct)}</b></div>`;
   } catch (e) {
-    out.innerHTML = `<div class="chat-empty">压测失败: ${e.message}</div>`;
-    toast("压测失败: " + e.message, "err");
+    out.innerHTML = `<div class="chat-empty">基准失败: ${escapeHtml(e.message)}</div>`;
+    toast("基准失败: " + e.message, "err");
   } finally {
     btn.disabled = false;
   }
@@ -609,7 +1126,7 @@ function bind() {
   $("#btn-run").addEventListener("click", runOnce);
   $("#btn-reopen").addEventListener("click", reopenThread);
   $("#btn-stop").addEventListener("click", stopWorkspace);
-  $("#btn-status").addEventListener("click", showStatusDetail);
+  // #btn-status 由 renderDispatchSummary 动态生成并绑定（D18 收编"状态"入口）。
   $("#btn-replay").addEventListener("click", showReplay);
   $("#btn-attach").addEventListener("click", showAttach);
   $("#btn-approve").addEventListener("click", () => gateDecision("approve"));
@@ -618,6 +1135,66 @@ function bind() {
   $("#btn-save-config").addEventListener("click", saveConfig);
   $("#btn-load-metrics").addEventListener("click", loadMetrics);
   $("#btn-run-bench").addEventListener("click", runBench);
+
+  // D16 过滤工具条：多选变更 → 重渲染流；#n 跳转。
+  populateFilterTypes();
+  const froles = $("#filter-roles");
+  const ftypes = $("#filter-types");
+  if (froles) froles.addEventListener("change", readFilters);
+  if (ftypes) ftypes.addEventListener("change", readFilters);
+  const faonly = $("#filter-aonly");
+  if (faonly) faonly.addEventListener("change", readFilters);
+  const fgoto = $("#filter-goto");
+  const fgotoBtn = $("#filter-goto-btn");
+  const doGoto = () => {
+    const raw = (fgoto.value || "").replace(/[^\d]/g, "");
+    if (!raw) { toast("请输入事件号 #n", "err"); return; }
+    gotoEvent(raw);
+  };
+  if (fgotoBtn) fgotoBtn.addEventListener("click", doGoto);
+  if (fgoto) fgoto.addEventListener("keydown", (e) => { if (e.key === "Enter") doGoto(); });
+
+  // D17 黑板栏折叠。
+  const boardToggle = $("#board-toggle");
+  if (boardToggle) boardToggle.addEventListener("click", () => {
+    const panel = $("#board-panel");
+    const collapsed = panel.classList.toggle("collapsed");
+    boardToggle.textContent = collapsed ? "◀ 黑板" : "▶ 黑板";
+    boardToggle.title = collapsed ? "展开黑板栏" : "折叠黑板栏";
+  });
+
+  // 事件流内委托：re/corr/黑板 #evt 跳转（data-goto）+ 折叠展开 + system 分组展开。
+  document.addEventListener("click", (e) => {
+    const goto = e.target.closest("[data-goto]");
+    if (goto) { gotoEvent(goto.dataset.goto); return; }
+    const clamp = e.target.closest(".toggle-clamp");
+    if (clamp) {
+      const body = clamp.previousElementSibling;
+      // b-body 可能被 artifacts chips 隔开：向上找同卡的 .b-body。
+      const bubble = clamp.closest(".bubble");
+      const bodyEl = bubble ? bubble.querySelector(".b-body") : body;
+      const expanded = clamp.dataset.expanded === "1";
+      if (bodyEl) bodyEl.classList.toggle("clamped", expanded);
+      clamp.dataset.expanded = expanded ? "0" : "1";
+      clamp.textContent = expanded
+        ? clamp.textContent.replace("收起", "展开").replace("▾", "").trim() || "展开"
+        : "收起";
+      if (!expanded) clamp.textContent = "收起";
+      else {
+        const n = bubble ? ((bubble.querySelector(".b-body")?.textContent.match(/\n/g) || []).length + 1) : 0;
+        clamp.textContent = "展开" + (n ? `（${n} 行）` : "");
+      }
+      return;
+    }
+    const sysHead = e.target.closest(".sys-group-head");
+    if (sysHead) {
+      const gbody = sysHead.nextElementSibling;
+      const hidden = gbody.classList.toggle("hidden");
+      sysHead.dataset.expanded = hidden ? "0" : "1";
+      sysHead.textContent = (hidden ? "▸ " : "▾ ") + sysHead.textContent.replace(/^[▸▾]\s*/, "");
+      return;
+    }
+  });
 }
 
 // —— 启动 ——
