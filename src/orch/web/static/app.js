@@ -49,14 +49,38 @@ function toast(msg, kind = "ok") {
 // ————————————————————————————————————————————————
 // 顶栏：health + tab 切换
 // ————————————————————————————————————————————————
+// D2：工作区在系统临时目录时告警——事件日志是唯一真相层（spec §0 命题3），
+// Temp 会被 Windows 磁盘清理/存储感知随时清空，属数据安全缺陷而非质感瑕疵。
+function isTempWorkspace(p) {
+  const s = String(p || "");
+  // 兼容正反斜杠 + 大小写：%TEMP% 常见形态 与 AppData\Local\Temp。
+  return /(^|[\\/])temp([\\/]|$)/i.test(s) || /appdata[\\/]local[\\/]temp/i.test(s);
+}
+
 async function loadHealth() {
+  const pathEl = $("#ws-path");
+  const warnEl = $("#ws-warn");
   try {
     const h = await api("/api/health");
-    $("#ws-path").textContent = h.workspace;
-    $("#ws-path").title = h.workspace;
+    pathEl.textContent = h.workspace;
     $("#conn-dot").className = "dot running";
+    const danger = isTempWorkspace(h.workspace);
+    pathEl.classList.toggle("danger", danger);
+    warnEl.classList.toggle("hidden", !danger);
+    if (danger) {
+      const tip = "工作区位于临时目录，事件日志可能被系统清理";
+      pathEl.title = tip;
+      warnEl.title = tip;
+      warnEl.setAttribute("aria-hidden", "false");
+    } else {
+      pathEl.title = h.workspace;
+      warnEl.setAttribute("aria-hidden", "true");
+    }
   } catch (e) {
-    $("#ws-path").textContent = "连接失败";
+    pathEl.textContent = "连接失败";
+    pathEl.classList.remove("danger");
+    pathEl.title = "";
+    warnEl.classList.add("hidden");
     $("#conn-dot").className = "dot terminated";
     toast("连接后端失败: " + e.message, "err");
   }
@@ -133,21 +157,113 @@ async function selectThread(tid) {
   await Promise.all([loadEvents(), loadStatus(), populateSendTo()]);
 }
 
+// D3：目标下拉——首项语义 = to=[]（走 moderator 兜底路由，spec §5.2）；
+// 首项文案不得出现广播式措辞（广播是 spec §16 反模式第3条，禁止）。
 async function populateSendTo() {
   const sel = $("#send-to");
   try {
     const threads = await api("/api/threads");
     const t = threads.find((x) => x.id === selectedThread);
     const roles = (t && t.roles) ? t.roles : [];
-    sel.innerHTML = '<option value="">（全部/默认 moderator）</option>';
+    sel.innerHTML = '<option value="">不指定（由 moderator 路由）</option>';
     for (const r of roles) {
+      if (r === "human") continue; // human 是自己，不作为发送目标项
       const o = document.createElement("option");
       o.value = r; o.textContent = r;
       sel.appendChild(o);
     }
   } catch (e) {
-    /* 保底：下拉至少有默认项 */
+    /* 保底：下拉至少有默认项（HTML 内已含首项） */
   }
+}
+
+// D6：type 下拉按 §3.2 发送者约束过滤——只含 human 允许发送的类型。
+// human 可 can_decide 故保留 decision；排除 system（仅编排器）、gate_decision
+// （仅经门禁审批流产生）、gate_request/acceptance/terminate 等非自由发言类型。
+// 默认值动态：线程无事件（新线程）→ assign（首条派活）；已有事件 → question。
+const HUMAN_SEND_TYPES = [
+  "assign", "chat", "question", "answer",
+  "handoff", "report", "review", "decision",
+];
+
+function populateSendType(hasEvents) {
+  const sel = $("#send-type");
+  if (!sel) return;
+  const prev = sel.value; // 保留用户当前选择（若仍合法）
+  sel.innerHTML = "";
+  for (const ty of HUMAN_SEND_TYPES) {
+    const o = document.createElement("option");
+    o.value = ty; o.textContent = ty;
+    sel.appendChild(o);
+  }
+  if (prev && HUMAN_SEND_TYPES.includes(prev)) {
+    sel.value = prev;
+  } else {
+    sel.value = hasEvents ? "question" : "assign";
+  }
+}
+
+// ————————————————————————————————————————————————
+// D9 角色视觉身份：固定角色→色映射，全站一致（深底）。
+// ————————————————————————————————————————————————
+const ROLE_COLORS = {
+  human: "#4ade80",
+  moderator: "#94a3b8",
+  pm: "#a78bfa",
+  backend: "#60a5fa",
+  frontend: "#22d3ee",
+  tester: "#fbbf24",
+  system: "#64748b",
+};
+function roleColor(role) {
+  return ROLE_COLORS[role] || ROLE_COLORS.system;
+}
+
+// D1 防御性剥离：库内 body 本身干净（C1 根因=前端曾把 §6.2 视图行当正文），
+// 但仍加一道防御——仅当 body 首行严格等于"本信封自身"的视图行
+// `#{id} [{from}->@{to}] (type): ` 时才剥（id/from/to/type 逐项与卡片头系统字段
+// 完全一致）。这样正文中"引用他人消息"的 #n[...] 片段不会被误伤。
+// 参数 sys = {id, sender, type, to:[...]} 取自本信封系统字段。
+function stripSelfViewPrefix(body, sys) {
+  const s = String(body == null ? "" : body);
+  const m = /^#(\d+)\s+\[([^\]]*)\]\s+\(([^)]*)\):[ \t]?/.exec(s);
+  if (!m) return s;
+  const [, idStr, label, typeStr] = m;
+  // 重建"期望前缀"的角色标签：from->@to1,@to2（与 render._to_labels 同序同格式）。
+  const toLabel = (sys.to && sys.to.length)
+    ? sys.to.map((r) => "@" + r).join(",")
+    : "@";
+  const expectLabel = `${sys.sender}->${toLabel}`;
+  const same =
+    Number(idStr) === Number(sys.id) &&
+    label === expectLabel &&
+    typeStr === String(sys.type);
+  // 完全一致才认定是自指视图前缀，剥掉首行前缀；否则原样返回（防误伤引用）。
+  return same ? s.slice(m[0].length) : s;
+}
+
+// D9 卡片头：一行式 = 头像圆点 · 名字 · → · @目标chips · type · (弹性) · #n。
+// @目标只从信封 to 渲染（§16.1，禁广播）。
+function buildEventHead(ev) {
+  const sender = ev.sender || "system";
+  const col = roleColor(sender);
+  const initial = escapeHtml((sender[0] || "?").toUpperCase());
+  const chips = (ev.to || []).map((r) => {
+    const c = roleColor(r);
+    return `<span class="to-chip" style="color:${c};border-color:${c}66">@${escapeHtml(r)}</span>`;
+  }).join("");
+  const arrow = (ev.to && ev.to.length) ? '<span class="head-arrow">→</span>' : "";
+  return (
+    `<div class="b-head">` +
+      `<span class="avatar" style="background:${col}1f;color:${col};border-color:${col}66">${initial}</span>` +
+      `<span class="speaker" style="color:${col}">${escapeHtml(sender)}</span>` +
+      arrow +
+      `<span class="to-chips">${chips}</span>` +
+      `<span class="ev-type">${escapeHtml(ev.type || "")}</span>` +
+      `<span class="head-spacer"></span>` +
+      `<span class="ev-id">#${escapeHtml(String(ev.id))}</span>` +
+    `</div>`
+  );
 }
 
 async function loadEvents() {
@@ -156,6 +272,8 @@ async function loadEvents() {
   try {
     const data = await api(`/api/threads/${selectedThread}/events`);
     const evs = data.events || [];
+    // D6：据线程是否已有事件决定 type 下拉默认（新线程→assign，进行中→question）。
+    populateSendType(evs.length > 0);
     if (!evs.length) {
       stream.innerHTML = '<div class="chat-empty">暂无事件</div>';
       return;
@@ -166,10 +284,14 @@ async function loadEvents() {
       if (ev.type === "gate_request") sawGate = ev.corr || true;
       const div = document.createElement("div");
       div.className = `bubble r-${ev.sender || "system"}`;
-      const toStr = (ev.to || []).map((r) => "@" + r).join(", ") || "@(默认)";
+      // D1：正文渲染 body 原文（escapeHtml + CSS white-space:pre-wrap），
+      // 永远不渲染 third_person 视图行；再叠一道自指前缀防御剥离。
+      const clean = stripSelfViewPrefix(ev.body || "", {
+        id: ev.id, sender: ev.sender, type: ev.type, to: ev.to || [],
+      });
       div.innerHTML =
-        `<div class="b-head">#${ev.id} · ${ev.sender} → ${toStr} · (${ev.type})</div>` +
-        `<div class="b-body">${escapeHtml(ev.third_person || ev.body || "")}</div>`;
+        buildEventHead(ev) +
+        `<div class="b-body">${escapeHtml(clean)}</div>`;
       stream.appendChild(div);
     }
     stream.scrollTop = stream.scrollHeight;
@@ -197,11 +319,63 @@ async function loadStatus() {
     const badge = $("#wk-status");
     badge.textContent = s.status;
     badge.className = `badge ${s.status}`;
+    applyStatusMatrix(s.status);
     updateGateBar(s.status === "suspended" ? $("#gate-corr").value || true : false);
     return s;
   } catch (e) {
     toast("状态加载失败: " + e.message, "err");
   }
+}
+
+// D4：线程状态→操作矩阵。禁用态视觉可辨（CSS button:disabled 有 opacity）+ title 原因。
+// running   : 运行一轮/停机/状态/回放/接入/发言 可 ； 重开 禁
+// suspended : 门禁批准拒绝/状态/回放/接入/发言(入队提示) 可 ； 运行一轮 禁
+// terminated: 重开/回放/状态/接入 可 ； 运行一轮/停机/发言 禁
+function setCtl(id, enabled, reason) {
+  const el = $(id);
+  if (!el) return;
+  el.disabled = !enabled;
+  if (!enabled && reason) {
+    el.dataset.baseTitle = el.dataset.baseTitle || el.title || "";
+    el.title = reason;
+  } else if (el.dataset.baseTitle !== undefined) {
+    el.title = el.dataset.baseTitle;
+  }
+}
+
+function applyStatusMatrix(status) {
+  const running = status === "running";
+  const suspended = status === "suspended";
+  const terminated = status === "terminated";
+
+  setCtl("#btn-run", running, suspended
+    ? "门禁挂起中，待批准/拒绝恢复后方可运行"
+    : (terminated ? "线程已终止，请先重开" : "当前状态不可运行一轮"));
+  setCtl("#btn-reopen", terminated, running
+    ? "线程运行中，无需重开"
+    : (suspended ? "线程挂起中，无需重开" : "仅已终止线程可重开"));
+  setCtl("#btn-stop", running || suspended,
+    terminated ? "线程已终止，无需停机" : "");
+  // 状态/回放/接入：全状态可用。
+  setCtl("#btn-status", true, "");
+  setCtl("#btn-replay", true, "");
+  setCtl("#btn-attach", true, "");
+
+  // 发言：terminated 禁用；suspended 允许但入队提示；running 正常。
+  const canSend = running || suspended;
+  setCtl("#btn-send", canSend, terminated ? "线程已终止，不可发言" : "");
+  const sendBody = $("#send-body");
+  if (sendBody) sendBody.disabled = !canSend;
+  const hint = $("#send-hint");
+  if (hint) {
+    if (suspended) hint.textContent = "线程挂起中：发言将入队，待门禁恢复后派发";
+    else if (terminated) hint.textContent = "线程已终止：发言已禁用（可重开后继续）";
+    else hint.textContent = "";
+  }
+
+  // 门禁批准/拒绝：仅 suspended 可用（gate-bar 显隐由 updateGateBar 管，这里同步禁用态）。
+  setCtl("#btn-approve", suspended, "无挂起门禁");
+  setCtl("#btn-reject", suspended, "无挂起门禁");
 }
 
 // ————————————————————————————————————————————————

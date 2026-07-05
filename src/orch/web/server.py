@@ -107,6 +107,9 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
     store = _require_thread(ws, tid)
     out = []
     for ev in store.events():
+        # store.events() 已按协议名解析：re/meta 为已解析结构、ts 为原始 REAL、
+        # body 为库内原文（只读投影，不做规范化——C1 根因是前端把 §6.2 视图行
+        # 当正文渲染，库内 body 本身干净，故此处直出原文）。
         out.append({
             "id": ev["id"],
             "sender": ev.get("from"),
@@ -114,7 +117,11 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
             "to": ev.get("to") or [],
             "body": ev.get("body", ""),
             "corr": ev.get("corr"),
+            "re": ev.get("re") or [],          # 回复链事件号数组（R3/D12 用；本批端点先备好）
+            "ts": ev.get("ts"),                # 原始时间戳 REAL（R3/D13 用）
+            "meta": ev.get("meta") or {},      # {tokens_in/out, duration_s, verify…}（R3 用）
             # 第三人称渲染走 orch.render（viewer_role 对单行不改格式，§6.2）。
+            # 仅供 replay/审计口径参考；前端阅读列一律渲染 body 原文，绝不渲染此行（§16.7）。
             "third_person": orch.render.render_event_third_person(ev, viewer_role="human"),
         })
     return 200, {"events": out}

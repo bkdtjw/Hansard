@@ -16,6 +16,7 @@
     </div>
     <div class="ws-info">
       <span id="conn-dot" class="dot terminated" title="连接状态"></span>
+      <span id="ws-warn" class="ws-warn hidden" aria-hidden="true">⚠</span>
       <span id="ws-path" class="ws-path">连接中…</span>
     </div>
     <nav class="tabs">
@@ -46,12 +47,16 @@
             <div class="panel-head"><h3>新建线程</h3></div>
             <textarea id="new-task" class="ta" rows="3" placeholder="任务描述（作为 E1 body）…"></textarea>
             <div class="roles-chips" id="new-roles">
+              <label class="chip chip-locked" title="兜底路由必需（spec §5.2）：无 moderator 的线程在 to 为空时无处派发">
+                <input type="checkbox" value="moderator" checked disabled /> moderator
+                <span class="chip-lock" aria-hidden="true">🔒</span>
+              </label>
               <label class="chip"><input type="checkbox" value="pm" checked /> pm</label>
-              <label class="chip"><input type="checkbox" value="moderator" checked /> moderator</label>
               <label class="chip"><input type="checkbox" value="backend" /> backend</label>
               <label class="chip"><input type="checkbox" value="frontend" /> frontend</label>
               <label class="chip"><input type="checkbox" value="tester" /> tester</label>
             </div>
+            <p class="form-note">moderator 为兜底路由必需，已锁定勾选（spec §5.2）。</p>
             <button id="btn-create-thread" class="btn-primary">＋ 建线程</button>
           </div>
         </aside>
@@ -88,32 +93,35 @@
               <button id="btn-reject" class="btn-danger">驳回</button>
             </div>
 
-            <!-- 群聊事件流 -->
-            <div class="panel glass chat-panel">
-              <div class="panel-head">
+            <!-- 群聊事件流（阅读列：定宽居中，纯 rgba 无 blur，对比优先） -->
+            <div class="chat-panel">
+              <div class="panel-head reading-col">
                 <h3>群聊事件流</h3>
                 <button id="btn-refresh-events" class="btn-ghost" title="刷新事件">⟳</button>
               </div>
-              <div id="chat-stream" class="chat-stream"></div>
+              <div id="chat-stream" class="chat-stream reading-col"></div>
             </div>
 
-            <!-- 发言框 -->
-            <div class="panel glass send-panel">
+            <!-- 发言框（与阅读列同宽对齐） -->
+            <div class="send-panel reading-col">
               <div class="send-row">
-                <select id="send-to" class="sel" title="接收方">
-                  <option value="">（全部/默认 moderator）</option>
-                </select>
-                <select id="send-type" class="sel" title="事件类型">
-                  <option value="assign">assign</option>
-                  <option value="chat">chat</option>
-                  <option value="report">report</option>
-                  <option value="handoff">handoff</option>
-                  <option value="decision">decision</option>
-                  <option value="answer">answer</option>
-                </select>
+                <label class="send-field">
+                  <span class="send-lbl">发给</span>
+                  <select id="send-to" class="sel" title="接收方（不指定则由 moderator 兜底路由，spec §5.2）">
+                    <option value="">不指定（由 moderator 路由）</option>
+                  </select>
+                </label>
+                <label class="send-field">
+                  <span class="send-lbl">类型</span>
+                  <!-- 选项由 app.js populateSendType 按 §3.2 human 允许类型动态填充 -->
+                  <select id="send-type" class="sel" title="事件类型（仅 human 允许类型，spec §3.2）"></select>
+                </label>
               </div>
               <textarea id="send-body" class="ta" rows="2" placeholder="发言正文…"></textarea>
-              <button id="btn-send" class="btn-primary">发送 ➤</button>
+              <div class="send-actions">
+                <span id="send-hint" class="send-hint"></span>
+                <button id="btn-send" class="btn-primary">发送 ➤</button>
+              </div>
             </div>
           </div>
         </div>

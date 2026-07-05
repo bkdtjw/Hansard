@@ -29,3 +29,6 @@ orchestrator/threads/*/events.db-shm
 Thumbs.db
 
 .claude/
+
+# 项目根不应出现线程目录（冒烟误建）
+/t-*/

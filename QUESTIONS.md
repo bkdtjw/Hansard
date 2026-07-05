@@ -37,3 +37,11 @@ Q2 [M2/T-realE2E] 真实后端小功能全流程 + 停机三小时验收
         session_id。全链路：render 视图→kimi.exe subprocess→stream-json 解包→信封入队→调度→session
         提取→终止清单。遗留：≥2 家异构厂商（claude 待认证）、"停机三小时"长时段（控制流已由 M2
         假适配器 停机-重启-approve 端到端验证；真实长时段可即时 Ctrl+C 重启演示，未跑满三小时）。
+
+Q3 [UI/web] web events 端点需扩展返回 re/ts/meta/artifacts（console-ui-revision.md D12/D13/D14 渲染数据必需）
+  背景: 文档 §A 限后端只改 D1(b)+D2；但 D12(回复链 re)、D13(时间戳 ts/meta/verify)、D14(artifacts)
+        要渲染的字段虽在 events 表 DDL（re_json/ts/meta_json/artifacts_json）内，现有 _ep_thread_events
+        未投影返回，前端拿不到。C1 经查库判为纯前端分支(a)（库 body 干净），故 D1 不需后端。
+  选项: A 扩展 events 端点返回这些已有列（只读投影，不改 DDL/协议/调度、不加功能）——推荐，
+        符合"UI 是持久层只读投影"(§E1)精神；B 不做 D12-D14（信息损失，违 spec §8.3 verify 可视化）。
+  裁决: 采 A（第三处后端改动，仅投影既有库字段，属 §7 输出规范化/投影职责）；记录备查。
