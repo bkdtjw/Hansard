@@ -162,6 +162,39 @@ def _caps_from_config(config: dict, *, supports_resume: bool) -> Caps:
     }
 
 
+# ——————————————————————————————————————————————————————————————
+# §8.1 权限三件套之二：工具白名单——适配器配置注入 CLI 参数
+# 三维评审 C-1 修复：CliAdapter / FakeCliAdapter 组装 argv 时**自动**根据
+# self.caps["tools"] 追加 --allowedTools 参数，用户无需在 start_cmd 手拼。
+# §17 开放决策（IMPLEMENTATION_NOTES.md 记录）：
+#   - config["allowed_tools_flag"] 覆盖默认 "--allowedTools"（真实 CLI 差异陪跑）。
+#   - config["allowed_tools_style"] ∈ {"spaced" 默认, "joined"}：
+#       spaced：单个 flag 后跟多值（"--allowedTools" "Edit" "Write" ...）；
+#       joined：一次一 flag（"--allowedTools" "Edit" "--allowedTools" "Write" ...）。
+#   - 当 caps["tools"] 为空时不追加 flag（避免空 flag 垃圾）。
+#   - 注入是**追加式**，不去删除 start_cmd 里可能手拼的旧 --allowedTools（back-compat）；
+#     使用自动注入的 config 不应再在 start_cmd 手写该 flag。
+# ——————————————————————————————————————————————————————————————
+_DEFAULT_ALLOWED_TOOLS_FLAG = "--allowedTools"
+_DEFAULT_ALLOWED_TOOLS_STYLE = "spaced"
+
+
+def _build_allowed_tools_args(config: dict, tools: list[str]) -> list[str]:
+    """按 §17 决策，把 caps.tools 折成 argv 片段。空列表返回 []（不注入 flag）。"""
+    if not tools:
+        return []
+    flag = str(config.get("allowed_tools_flag", _DEFAULT_ALLOWED_TOOLS_FLAG))
+    style = str(config.get("allowed_tools_style", _DEFAULT_ALLOWED_TOOLS_STYLE))
+    if style == "joined":
+        out: list[str] = []
+        for t in tools:
+            out.append(flag)
+            out.append(str(t))
+        return out
+    # spaced（默认）：单 flag 多值。
+    return [flag, *[str(t) for t in tools]]
+
+
 class CliAdapter:
     """CLI 型适配器骨架（spec §7.2）。
 
@@ -201,7 +234,11 @@ class CliAdapter:
         - 返回 (env_dict, {"sid":..., "gen": gen+1})；无 sid 时 sess 仍带 gen（gen+1）。
         """
         start_cmd = str(self.config["start_cmd"])
-        cmd = start_cmd.split() + [str(view["text"])]
+        # §8.1 R-a：根据 self.caps["tools"] 自动追加 --allowedTools（含各工具名）。
+        tools_args = _build_allowed_tools_args(
+            self.config, list(self.caps.get("tools", []) or [])
+        )
+        cmd = start_cmd.split() + tools_args + [str(view["text"])]
         timeout_s = int(self.config.get("timeout_s", self.caps.get("timeout_s", 0)) or 0)
         proc = subprocess.Popen(  # noqa: S603 — 冷启动子进程是 §7.2 明列职责
             cmd,
@@ -294,9 +331,19 @@ class FakeCliAdapter:
     """CliAdapter 的测试双（M2 契约 §2）。
 
     对外行为等价于 CliAdapter，但不启动真实子进程：
-      - scripted_output：假子进程 stdout（供解析最后一个 json 块）。
-      - simulate_timeout=True：模拟超时 → kill + attempts+1 + TimeoutError。
-      - last_cwd / attempts / killed / gen：暴露给测试断言的可观测点。
+      - scripted_output：假子进程 stdout（单次/兜底，供解析最后一个 json 块）。
+      - scripted_replies：多步控制流脚本 `{call_no: 作者字段信封}`（M2 契约 §2/§6）。
+        call_no **从 1 起**（第一次 invoke 记为 call_no=1，与 §4.5 事件序号习惯一致，
+        更符合直觉；非 0 起）。invoke 每次调用先自增 self.call_no 再查表。
+        提供 scripted_replies 时优先于 scripted_output/simulate_timeout（脚本化多步
+        场景不再模拟单次超时路径——如需超时仍用 scripted_output+simulate_timeout）。
+        缺对应 call_no 的表项 → KeyError（暴露测试脚本编排错误，不静默兜底）。
+      - inject_side_effect：`Callable[[Path], None] | None`，每次 invoke **首行**调用
+        一次（在返回信封前，模拟 CLI 子进程刚落文件的时序，供 §8.2 越权注入验证）。
+        参数为 self.worktree。
+      - simulate_timeout=True：模拟超时 → kill + attempts+1 + TimeoutError（仅在未提供
+        scripted_replies 时的单次路径生效）。
+      - last_cwd / attempts / killed / gen / call_no：暴露给测试断言的可观测点。
 
     session_id 提取策略与 CliAdapter 一致（§17）。
     """
@@ -311,6 +358,8 @@ class FakeCliAdapter:
         worktree: Path,
         scripted_output: str = "",
         simulate_timeout: bool = False,
+        scripted_replies: dict[int, dict] | None = None,
+        inject_side_effect: Callable[[Path], None] | None = None,
         caps: Caps | None = None,
     ) -> None:
         self.role = role
@@ -318,23 +367,68 @@ class FakeCliAdapter:
         self.worktree = Path(worktree)
         self.scripted_output = scripted_output
         self.simulate_timeout = simulate_timeout
+        self.scripted_replies = (
+            dict(scripted_replies) if scripted_replies is not None else None
+        )
+        self._inject_side_effect = inject_side_effect
         self.caps = caps if caps is not None else _caps_from_config(
             config, supports_resume=True
         )
         # —— 测试可观测点 —— #
         self.last_cwd: str | None = None
         self.last_view_text: str | None = None
+        self.last_argv: list[str] | None = None
         self.attempts: int = 0
         self.killed: bool = False
         self.gen: int = 0
+        self.call_no: int = 0
 
     def invoke(
         self, view: dict, sess: dict | None
     ) -> tuple[dict, dict | None]:
-        """假子进程冷启动：不真启动进程，直接使用 scripted_output 走同样的解析路径。"""
+        """假子进程冷启动：不真启动进程。
+
+        scripted_replies 提供时按 call_no（从 1 起）分派；否则回退到既有
+        scripted_output/simulate_timeout 单次路径。inject_side_effect 存在则
+        本次 invoke 首行调用一次（cwd=self.worktree），模拟"CLI 子进程刚落文件"
+        的时序，供调度环随后走 §8.2 audit_write_scope 审计。
+        """
         self.attempts += 1
+        self.call_no += 1
         self.last_cwd = str(self.worktree)
         self.last_view_text = str(view.get("text", ""))
+        # §8.1 R-a：等价于 CliAdapter 的 argv 组装（含自动注入 --allowedTools）；
+        # last_argv 供测试断言"配置注入生效"。
+        start_cmd = str(self.config.get("start_cmd", ""))
+        tools_args = _build_allowed_tools_args(
+            self.config, list(self.caps.get("tools", []) or [])
+        )
+        self.last_argv = (
+            start_cmd.split() + tools_args + [str(view.get("text", ""))]
+        )
+
+        # —— 越权/合规注入：在返回信封前执行一次（§8.2）—— #
+        if self._inject_side_effect is not None:
+            self._inject_side_effect(self.worktree)
+
+        if self.scripted_replies is not None:
+            if self.call_no not in self.scripted_replies:
+                raise KeyError(
+                    f"FakeCliAdapter[{self.role}] no scripted reply for "
+                    f"call_no={self.call_no}"
+                )
+            raw = self.scripted_replies[self.call_no]
+            env = _strip_to_author_fields(raw)
+            sid = None
+            for f in _DEFAULT_SID_FIELDS:
+                v = raw.get(f)
+                if isinstance(v, str) and v:
+                    sid = v
+                    break
+            prev_gen = int((sess or {}).get("gen", 0))
+            self.gen = prev_gen + 1
+            new_sess: dict | None = {"sid": sid, "gen": self.gen}
+            return env, new_sess
 
         if self.simulate_timeout:
             # 模拟 kill 语义（§5.3/§7.2）：不真 sleep，直接抛超时（测试语义等价）。
@@ -368,8 +462,19 @@ class FakeCliAdapter:
 class FakeApiAdapter:
     """ApiAdapter 的测试双（M2 契约 §2）。
 
-    直接使用可注入 scripted_reply（模拟 messages 返回的 dict），
+    直接使用可注入 scripted_reply（模拟 messages 返回的 dict，单步/兜底），
+    或 scripted_replies（多步控制流脚本 `{call_no: 信封}`，M2 契约 §2/§6），
     走与 ApiAdapter 一致的归一化路径（§3.1/§7.6：只留作者字段）。
+
+    scripted_replies 的 call_no 分派规则与 FakeCliAdapter 一致：**从 1 起**，
+    每次 invoke 先自增 self.call_no 再查表；提供 scripted_replies 时优先于
+    scripted_reply。缺对应 call_no 的表项 → KeyError。
+
+    inject_side_effect：ApiAdapter 无 worktree 概念（§7.3 直连 messages，无子进程/
+    无 cwd），因此本参数在 FakeApiAdapter 上是 **None-兼容占位**——不做任何调用；
+    仅为与 FakeCliAdapter 签名对称、便于测试代码统一构造而保留。若传入非 None
+    值，本类**忽略**它（API 型无落盘 worktree 可越权注入，§8.2 审计只对 CLI 型
+    worktree 生效）。
     """
 
     caps: Caps
@@ -379,12 +484,20 @@ class FakeApiAdapter:
         *,
         role: str,
         config: dict,
-        scripted_reply: dict,
+        scripted_reply: dict | None = None,
+        scripted_replies: dict[int, dict] | None = None,
+        inject_side_effect: Callable[[Any], None] | None = None,
         caps: Caps | None = None,
     ) -> None:
         self.role = role
         self.config = dict(config)
-        self.scripted_reply = dict(scripted_reply)
+        self.scripted_reply = dict(scripted_reply) if scripted_reply is not None else None
+        self.scripted_replies = (
+            dict(scripted_replies) if scripted_replies is not None else None
+        )
+        # ApiAdapter 无 worktree；inject_side_effect 在本类上是 None-兼容占位（见 docstring），
+        # 记录但不调用——API 型无 cwd/子进程时序可模拟。
+        self._inject_side_effect = inject_side_effect
         self.caps = caps if caps is not None else _caps_from_config(
             config, supports_resume=False
         )
@@ -395,13 +508,29 @@ class FakeApiAdapter:
         # —— 测试可观测点 —— #
         self.last_view_text: str | None = None
         self.step_count: int = 0
+        self.call_no: int = 0
 
     def invoke(
         self, view: dict, sess: dict | None
     ) -> tuple[dict, dict | None]:
-        """§7.3：单步；忽略入参 sess；返回 sess=None（每次全量组装，不复用会话）。"""
+        """§7.3：单步；忽略入参 sess；返回 sess=None（每次全量组装，不复用会话）。
+
+        scripted_replies 提供时按 call_no（从 1 起）分派；否则回退到既有
+        scripted_reply 单次路径。
+        """
         # 观察点：每次都记录 view.text 全量（不做增量差分）。
         self.last_view_text = str(view.get("text", ""))
         self.step_count += 1
-        env = _strip_to_author_fields(self.scripted_reply)
+        self.call_no += 1
+
+        if self.scripted_replies is not None:
+            if self.call_no not in self.scripted_replies:
+                raise KeyError(
+                    f"FakeApiAdapter[{self.role}] no scripted reply for "
+                    f"call_no={self.call_no}"
+                )
+            env = _strip_to_author_fields(self.scripted_replies[self.call_no])
+            return env, None
+
+        env = _strip_to_author_fields(self.scripted_reply or {})
         return env, None

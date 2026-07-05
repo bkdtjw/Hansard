@@ -263,3 +263,205 @@ def test_cli_adapter_class_exposed_from_package(tmp_dir):
     inst = cls(role="backend", config=_cfg(), worktree=wt)
     # 构造完成后 caps 应有值（默认 Caps 或 config 推导）。
     assert isinstance(inst.caps, dict)
+
+
+# ——————————————————————————————————————————————————————————————
+# R-a：§8.1 权限三件套之二"工具白名单：适配器配置注入 CLI 参数"
+# 三维评审 C-1：CliAdapter/FakeCliAdapter 必须**自动**根据 caps["tools"] 追加
+# --allowedTools 参数，用户无需在 start_cmd 手拼。
+# ——————————————————————————————————————————————————————————————
+
+def _cfg_no_hardcoded_tools(**over) -> dict:
+    """本组测试专用：start_cmd 不手拼 --allowedTools（验证自动注入）。"""
+    base = {
+        "kind": "cli",
+        "start_cmd": "fake-claude -p",
+        "resume_cmd": "fake-claude -p --resume {sid}",
+        "timeout_s": 5,
+    }
+    base.update(over)
+    return base
+
+
+def test_fake_cli_adapter_auto_injects_allowed_tools_flag_spaced_default(tmp_dir):
+    """§8.1 权限三件套之二：FakeCliAdapter.invoke 组装 argv 时应**自动**
+    根据 caps.tools=["Edit","Write","Bash(pytest:*)"] 追加 --allowedTools 参数。
+
+    缺省风格 spaced：单个 --allowedTools 后跟多个工具名（spec §7.2 示例即此形态）。
+    argv 由测试双通过 last_argv 属性暴露。
+    """
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    tools = ["Edit", "Write", "Bash(pytest:*)"]
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend",
+        config=_cfg_no_hardcoded_tools(tools=tools),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+    )
+    ad.invoke(_view(), None)
+    argv = ad.last_argv
+    assert argv is not None, "FakeCliAdapter 应记录组装后的 argv 供测试断言"
+    # 自动注入 --allowedTools（不需要 start_cmd 手写）。
+    assert "--allowedTools" in argv
+    # spaced 风格：--allowedTools 只出现一次，其后紧跟各工具名。
+    idx = argv.index("--allowedTools")
+    tail = argv[idx + 1 : idx + 1 + len(tools)]
+    assert tail == tools, (
+        f"spaced 风格下 --allowedTools 后应紧跟工具列表 {tools}，实际 {tail}"
+    )
+    # 未附加额外 --allowedTools 副本（单 flag 多值）。
+    assert argv.count("--allowedTools") == 1
+
+
+def test_fake_cli_adapter_auto_injects_allowed_tools_flag_joined_style(tmp_dir):
+    """§17 开放决策：allowed_tools_style='joined' → 一次一 flag（每个工具单独一个 --allowedTools）。"""
+    wt = tmp_dir / "wt-tester"
+    wt.mkdir()
+    tools = ["Edit", "Bash(pytest:*)"]
+    cfg = _cfg_no_hardcoded_tools(tools=tools, allowed_tools_style="joined")
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester", config=cfg, worktree=wt,
+        scripted_output='```json\n{"to":["moderator"],"type":"acceptance","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    # joined 风格：--allowedTools 出现 N 次，每次带 1 工具。
+    assert argv.count("--allowedTools") == len(tools)
+    # 相邻校验：每个 --allowedTools 后紧跟一个工具（顺序保持）。
+    positions = [i for i, a in enumerate(argv) if a == "--allowedTools"]
+    for pos, tool in zip(positions, tools):
+        assert argv[pos + 1] == tool
+
+
+def test_fake_cli_adapter_custom_allowed_tools_flag_via_config(tmp_dir):
+    """§17 开放决策：允许 config.allowed_tools_flag 覆盖默认 flag 名（真实 CLI 差异陪跑）。"""
+    wt = tmp_dir / "wt-x"
+    wt.mkdir()
+    cfg = _cfg_no_hardcoded_tools(tools=["Edit"], allowed_tools_flag="--tools")
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend", config=cfg, worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+    )
+    ad.invoke(_view(), None)
+    argv = ad.last_argv
+    assert argv is not None
+    assert "--tools" in argv
+    # 默认 --allowedTools 不应出现（被 config 覆盖）。
+    assert "--allowedTools" not in argv
+
+
+def test_fake_cli_adapter_no_tools_does_not_inject_flag(tmp_dir):
+    """caps.tools 为空时不注入 --allowedTools（避免空 flag 垃圾）。"""
+    wt = tmp_dir / "wt-mod"
+    wt.mkdir()
+    # 无 tools 字段（沿用 _caps_from_config 默认 []）。
+    ad = orch.adapters.FakeCliAdapter(
+        role="pm", config=_cfg_no_hardcoded_tools(),
+        worktree=wt,
+        scripted_output='```json\n{"to":["backend"],"type":"assign","body":"go"}\n```',
+    )
+    ad.invoke(_view("pm"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    assert "--allowedTools" not in argv
+
+
+def test_fake_cli_adapter_last_argv_places_view_text_last(tmp_dir):
+    """§7.2：view['text'] 是最后一个位置参数；自动注入的 --allowedTools 应在其之前。"""
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend",
+        config=_cfg_no_hardcoded_tools(tools=["Edit", "Write"]),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+    )
+    view_text = "全量视图 payload"
+    ad.invoke(_view(text=view_text), None)
+    argv = ad.last_argv
+    assert argv is not None
+    assert argv[-1] == view_text
+    # --allowedTools 位于 view_text 之前。
+    assert argv.index("--allowedTools") < len(argv) - 1
+
+
+def test_cli_adapter_real_class_auto_injects_allowed_tools(tmp_dir, monkeypatch):
+    """§8.1 R-a：真实 CliAdapter 也必须自动注入 --allowedTools（不仅 FakeCliAdapter）。
+
+    通过 monkeypatch subprocess.Popen 截获真实 argv，避免真启动 CLI 子进程。
+    这里断言 CliAdapter 与 FakeCliAdapter 在权限注入上语义一致（骨架层三件套齐）。
+    """
+    wt = tmp_dir / "wt-y"
+    wt.mkdir()
+
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = list(argv)
+            captured["cwd"] = kw.get("cwd")
+
+        def communicate(self, timeout=None):
+            return (
+                'here is the reply:\n```json\n'
+                '{"to":["pm"],"type":"question","body":"?",'
+                '"session_id":"sid-real"}\n```',
+                "",
+            )
+
+        def kill(self):
+            captured["killed"] = True
+
+    monkeypatch.setattr(
+        "orch.adapters.subprocess.Popen", _FakeProc
+    )
+
+    cls = orch.adapters.CliAdapter
+    inst = cls(
+        role="backend",
+        config=_cfg_no_hardcoded_tools(tools=["Edit", "Write", "Bash(pytest:*)"]),
+        worktree=wt,
+    )
+    env, sess = inst.invoke(_view(), None)
+    argv = captured.get("argv")
+    assert argv is not None, "CliAdapter 应把 argv 传给 subprocess.Popen"
+    assert "--allowedTools" in argv
+    # 默认 spaced：--allowedTools 出现一次，其后跟三个工具。
+    idx = argv.index("--allowedTools")
+    assert argv[idx + 1 : idx + 4] == ["Edit", "Write", "Bash(pytest:*)"]
+    # view['text'] 仍是最后一个位置参数。
+    assert argv[-1] == "hello view"
+    # cwd 仍是 worktree。
+    assert Path(captured.get("cwd", "")) == wt
+
+
+def test_cli_adapter_real_class_no_tools_no_flag(tmp_dir, monkeypatch):
+    """§8.1 R-a：真实 CliAdapter tools 空时不注入 flag（对称 FakeCliAdapter）。"""
+    wt = tmp_dir / "wt-z"
+    wt.mkdir()
+
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = list(argv)
+
+        def communicate(self, timeout=None):
+            return (
+                '```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+                "",
+            )
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _FakeProc)
+    inst = orch.adapters.CliAdapter(
+        role="backend", config=_cfg_no_hardcoded_tools(), worktree=wt,
+    )
+    inst.invoke(_view(), None)
+    argv = captured.get("argv")
+    assert argv is not None
+    assert "--allowedTools" not in argv
