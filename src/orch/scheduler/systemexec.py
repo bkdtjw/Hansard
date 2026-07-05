@@ -102,6 +102,31 @@ def run_privileged_and_callbacks(store, config: dict, gate: dict, callback_to: s
             )
 
 
+def _find_gate_decision(store, corr: str) -> dict | None:
+    """按 corr 定位已存在的 gate_decision 事件（§9.1 恢复算法所需：只查表，禁猜测）。"""
+    match = None
+    for ev in store.events():
+        if ev.get("type") == "gate_decision" and ev.get("corr") == corr:
+            match = ev  # 取最后一个（同 corr 理论唯一）。
+    return match
+
+
+def _ci_callback_exists(store, gate_corr: str) -> bool:
+    """§9.1：run_privileged_and_callbacks 的产物是否已落盘（防重复 CI 回调）。
+
+    run_privileged_and_callbacks 会为每个 gate_op 追加 system 事件；对 run_ci 类
+    会用 corr=`job-{op_name}` 关联 jobs 表 + system 回调事件。恢复时只要看到
+    jobs 表里有非空行即视作"已跑过一次" —— jobs 表恰好是 §5.2 冻结的落盘真相，
+    §9.1 允许"只查表"。
+    """
+    # 用 jobs 表判定（§5.2 落盘真相）：任一已登记的作业 = privileged callbacks 已启动过。
+    con = store._con  # 已在 store 内的连接（读旁路合法：§7）
+    row = con.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
+    if row is None:
+        return False
+    return int(row[0]) > 0
+
+
 def apply_gate_decision(
     store: "orch.store.Store",
     config: dict,
@@ -118,6 +143,14 @@ def apply_gate_decision(
     ③ approve 且 gate 关联特权操作 → 系统执行器按 config['gate_ops'] 执行，结果作为 system
        事件入队；run_ci 类经 jobs 登记（M0 同步退化）后回调 system 事件 to=[callback_to]、
        corr 回填（§5.2/§5.5）。reject：只入 gate_decision 并 resume，不执行特权操作。
+
+    §9.1 R-a 幂等修复：apply_gate_decision 的四步（append_event / mark_done / set_meta /
+    privileged callbacks）不是单事务；若在 append_event 与 mark_done 之间崩溃，落盘会留下
+    一个 orphan gate_decision + 未 done 的 gate_wait + 未 running 的状态。恢复驱动再进入
+    本函数就会**重复**追加同 corr 的 gate_decision，进而让 moderator 收到成对/成三份的
+    pending 派发行、view.event_ids 里出现脚本外的最大触发号（KeyError）。
+    修复：进入前**只查表**（§16.10 禁止猜测）看同 corr 是否已有 gate_decision；已有则复用
+    该事件，只补做后续未完成步骤——严格按 §9.1"只查表数日志"的恢复语义。
     """
     gate = _find_gate_request(store, corr)
     if gate is None:
@@ -125,17 +158,24 @@ def apply_gate_decision(
 
     requester = gate.get("from")  # 原申请者（gate_request 的 sender）。
 
-    # ① gate_decision 事件：from=sender（human），corr 回填，to=[申请者]（§10）。
-    store.append_event(
-        sender=sender, type="gate_decision",
-        body="approve" if approve else "reject",
-        to=[requester], corr=corr, re=[gate["id"]],
-    )
+    # §9.1 幂等：先查同 corr 是否已有 gate_decision（前一次崩溃前已 append）。
+    existing = _find_gate_decision(store, corr)
+    if existing is None:
+        # ① gate_decision 事件：from=sender（human），corr 回填，to=[申请者]（§10）。
+        store.append_event(
+            sender=sender, type="gate_decision",
+            body="approve" if approve else "reject",
+            to=[requester], corr=corr, re=[gate["id"]],
+        )
+    # 若 existing 非空：复用之前那条，不再重复追加（§9.1 R-a 幂等）。
+    # existing["type"]/["from"]/["corr"] 已落盘；本函数唯一"再修一次"的只有下游派发/状态。
 
     # ② gate_wait 行标 done + resume（§10）。gate_request 的 target 是 human。
+    # 若之前已被标 done，mark_done 幂等（SET status='done' 是无副作用重复）。
     store.mark_done(gate["id"], "human")
     store.set_meta("status", "running")
 
     # ③ approve 且关联特权操作 → 系统执行器（§5.5）。reject 不执行。
-    if approve:
+    # §9.1 幂等：若 jobs 表已有登记（前次崩溃前 privileged callbacks 已启动），跳过重跑。
+    if approve and not _ci_callback_exists(store, corr):
         run_privileged_and_callbacks(store, config, gate, callback_to=requester)

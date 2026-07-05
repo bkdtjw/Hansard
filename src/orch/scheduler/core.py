@@ -358,8 +358,26 @@ def _dispatch_group(
 
     落盘顺序严格对齐 §5.1：mark_dispatching(+deadline) → invoke → schema 校验（原地重调一次）
     → reply_and_done（系统字段 from/re） → apply bb_ops → verify 钩子已并入定稿 → 终止检查。
+
+    §9.1 崩溃恢复兼容（R-a 修复）：本组进入 invoke 前**再查一次**当前所有 pending 派发行，
+    把 target 相同的新行合并入本批 event_ids（§5.1"同目标同批一次 invoke, re=全部 event_ids"）。
+    背景：崩溃恢复后可能同时留下上游 pending（recover set_pending）与下游 pending（上一轮已
+    落盘），两者在同一 groups 里被分成两组；处理上游组时会立即产出新的下游 pending 派发行，
+    与已排在后面的下游组同 target。若不合批就会用**过时的** event_ids 触发号查表，命中 mock
+    脚本以外的键（比如 backend.script 无 E4 因为 E4 应聚合到 E5 一起触发 pm）。合批后 max
+    (event_ids) 与"若无崩溃则正常聚合"一致，脚本命中恢复正常。合并仅新增 event_ids（不覆盖
+    已排入的），也不改变派发行 (event_id, target) 唯一约束。
     """
     adapter = adapters[target]
+
+    # §9.1 R-a：崩溃恢复后再查一次同 target 的 pending 行，合并入本批。
+    # `pending_dispatches()` 只返回 status='pending' 的行；本组在这一步尚未 mark_dispatching。
+    # 用 set 去重后按升序落回，保持确定性（§5.1）。
+    fresh_ids = {int(r["event_id"]) for r in store.pending_dispatches()
+                 if r["target"] == target}
+    merged_ids = sorted(set(event_ids) | fresh_ids)
+    if merged_ids != list(event_ids):
+        event_ids = merged_ids
 
     # 标 dispatching + 落盘绝对截止时间戳（§4.4 事务(2)、§16.2）。
     deadline_ts = time.time() + _timeout_for(config, target)

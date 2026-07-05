@@ -206,8 +206,16 @@ async def _dispatch_group_async(
     adapter = adapters[target]
 
     # § 4.4 事务(2)：标 dispatching + 落 deadline_ts。
+    # §9.1 R-a：崩溃恢复兼容——进入 invoke 前再查一次同 target 的 pending 派发行，
+    # 把新出现的合并入本批 event_ids（§5.1"同目标同批一次 invoke, re=全部 event_ids"）。
+    # 详见 core._dispatch_group 同名注释；异步版同源同修。
     deadline_ts = time.time() + _timeout_for(config, target)
     async with lock:
+        fresh_ids = {int(r["event_id"]) for r in store.pending_dispatches()
+                     if r["target"] == target}
+        merged_ids = sorted(set(event_ids) | fresh_ids)
+        if merged_ids != list(event_ids):
+            event_ids = merged_ids
         for eid in event_ids:
             store.mark_dispatching(eid, target, deadline_ts)
         view = _assemble_view(store, config, target, event_ids)
