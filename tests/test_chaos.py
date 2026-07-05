@@ -76,7 +76,7 @@ def test_chaos_report_has_required_fields(tmp_dir, like_feature_script):
 # ==================================================================
 
 def test_chaos_harness_covers_five_gaps_plus_random(tmp_dir, like_feature_script):
-    """M4 契约 §2：注入点必须覆盖 §4.4 五间隙 + 纯随机（共 6 种模式）。
+    """M4 契约 §2 + R-T1：注入点必须覆盖 §4.4 五间隙 + 纯随机（共 6 种模式）。
 
     harness 应对外暴露 `INJECTION_SITES`（或等价常量）—— 长度必须 ≥ 6，
     且包含五个 §4.4 site 与 "random" 关键字。
@@ -101,6 +101,45 @@ def test_chaos_harness_covers_five_gaps_plus_random(tmp_dir, like_feature_script
     missing = expected_gap_sites - site_set
     assert not missing, f"缺 §4.4 注入点：{missing}"
     assert any("random" in s for s in site_set), "应含纯随机注入模式"
+
+
+def test_resolve_site_returns_real_injection_for_all_five_gaps(
+    tmp_dir, like_feature_script
+):
+    """R-T1（审计 A1）：_resolve_site 对 §4.4 五个 site 必须**均返回非 None** 真实注入。
+
+    这直接顶替旧版"集合包含"断言——旧实现把 invoke_post/autocommit_post 静默降级为
+    None（"本轮未触发,仍完整跑通"），使 50 轮硬门槛实际只在 3/5 间隙注入 = fail-open。
+    本用例锁死：删除 None 降级后，五个 site 逐一解析为可真实注入的 site 名（自身或，
+    对 random_mix，五者之一）。
+    """
+    import orch.chaos
+
+    ws = tmp_dir / "chaos-ws"
+    ws.mkdir()
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws, script=like_feature_script, seed=1,
+    )
+    five_gaps = [
+        "append_event_post",
+        "mark_dispatching_post",
+        "invoke_post",
+        "autocommit_post",
+        "reply_and_done_post",
+    ]
+    for site in five_gaps:
+        resolved = harness._resolve_site(site)
+        assert resolved is not None, (
+            f"§4.4 site {site!r} 必须解析为真实注入（不得 None 降级）"
+        )
+        assert resolved in five_gaps, (
+            f"{site!r} 解析结果 {resolved!r} 应是 §4.4 五个真实 site 之一"
+        )
+
+    # random_mix 也必须落到五个真实 site 之一（多次采样均非 None）。
+    for _ in range(20):
+        r = harness._resolve_site("random_mix")
+        assert r in five_gaps, f"random_mix 解析结果 {r!r} 应是五个真实 site 之一"
 
 
 # ==================================================================

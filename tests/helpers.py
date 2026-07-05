@@ -18,41 +18,10 @@ LIKE_FEATURE_YAML = FIXTURE_DIR / "like_feature.yaml"
 
 
 # —— 附录B 期望事件序列（类型层面；顺序与类型必须一致，事件号允许偏移）——
-# (from, to, type) 三元组，供 E2E 断言事件类型序列。E2E 仅断言**类型**序列
-# （EXPECTED_TYPE_SEQUENCE）；(from, to) 为可读文档，不参与断言。
-#
-# 相对附录B 行637-658 原始清单的两处 spec 对齐（详见 tests/fixtures/like_feature.yaml 抬头
-# 与 T6 最终回复"③"）：
-#   · E9 的 to 记为 [tester]（附录B 记 moderator）：report 经 moderator 会被强制回一条事件、
-#     打断类型序列（§5.1 每个派发目标必被 invoke）；改走与 E8 同目标聚合，类型/序位不变。
-#   · 末尾追加 E20 system：§5.4 规定 terminate 触发"终止清单 system 总结事件"；附录B 行657
-#     在 E19 注解里点明该总结事件，却未编入 E1-E19 清单。落盘真相含此事件（id=20），故期望
-#     序列如实补上，保持与 spec §5.4 一致（这是忠实实现的必然产物，非测试凑绿）。
-EXPECTED_SEQUENCE = [
-    ("human", [], "assign"),                            # E1
-    ("moderator", ["pm"], "assign"),                    # E2 兜底路由
-    ("pm", ["backend", "frontend"], "review"),          # E3 PRD/评审（v1 不入黑板，§3.3）
-    ("backend", ["pm"], "question"),                    # E4  ── 同批聚合
-    ("frontend", ["pm"], "answer"),                     # E5  ──
-    ("pm", ["moderator"], "decision"),                  # E6 freeze v2 + set_task done
-    ("moderator", ["backend", "frontend"], "assign"),   # E7 并行
-    ("backend", ["tester"], "handoff"),                 # E8  ── 同批聚合(→tester)
-    ("frontend", ["tester"], "report"),                 # E9  ──（附录B 记 moderator，见抬头）
-    ("tester", ["backend"], "defect"),                  # E10 环路计数 1
-    ("backend", ["tester"], "handoff"),                 # E11
-    ("tester", ["moderator"], "acceptance"),            # E12 verify.exit_code=0
-    ("moderator", ["human"], "gate_request"),           # E13 gate_wait + suspended
-    ("human", ["moderator"], "gate_decision"),          # E14 approve
-    ("system", ["moderator"], "system"),                # E15 CI 回调（run_ci 系统执行器）
-    ("moderator", ["frontend"], "assign"),              # E16
-    ("frontend", ["tester"], "handoff"),                # E17
-    ("tester", ["moderator"], "acceptance"),            # E18
-    ("moderator", [], "terminate"),                     # E19 终止清单（不生成派发行）
-    ("system", ["moderator"], "system"),                # E20 §5.4 终止清单 system 总结事件
-]
-
-# 期望的事件类型序列（仅类型，最宽松的一致性判据）。
-EXPECTED_TYPE_SEQUENCE = [t for (_frm, _to, t) in EXPECTED_SEQUENCE]
+# 审计 G 解耦（R-T1）：事实源已移入产品包 `orch.chaos.expected`（src 不得依赖 tests，
+# 但 tests 反向依赖 src 合法）。本处**反向 import** 以保持既有测试的
+# `from tests.helpers import EXPECTED_SEQUENCE / EXPECTED_TYPE_SEQUENCE` 兼容不破。
+from orch.chaos.expected import EXPECTED_SEQUENCE, EXPECTED_TYPE_SEQUENCE  # noqa: E402,F401
 
 
 def load_like_feature_script() -> dict:

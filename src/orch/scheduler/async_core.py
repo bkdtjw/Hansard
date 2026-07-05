@@ -265,6 +265,10 @@ async def _dispatch_group_async(
             )
         return
 
+    # §4.4 间隙(3) invoke_post：与 core._dispatch_group 同源同修——invoke 已返回、
+    # reply_and_done 尚未落盘时崩溃（"崩溃高发区"）。按控制流位置触发（R-T1 Lead §17）。
+    orch.store.fault_check("invoke_post")
+
     # 权限三件套（M2）：仅当有 worktree 时启用（M0/M1/M3 mock skip）。
     worktree_path = _role_worktree(config, target)
     if worktree_path is not None:
@@ -297,6 +301,11 @@ async def _dispatch_group_async(
         if new_sha:
             async with lock:
                 store.set_meta(f"last_ok_commit:{target}", new_sha)
+
+    # §4.4 间隙(4) autocommit_post：与 core._dispatch_group 同源同修——autocommit + 审计
+    # 已完成、reply_and_done 尚未落盘时崩溃。按控制流位置触发（R-T1 Lead §17）：mock 无
+    # worktree、autocommit 为 no-op 时位置依然存在，照样触发。
+    orch.store.fault_check("autocommit_post")
 
     # 定稿信封 + 系统字段 + verify 钩子
     reply = _finalize_envelope(store, config, target, env)

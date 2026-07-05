@@ -1,15 +1,23 @@
-"""§9.4 混沌 harness（mock 层）——M4-T3 owner。
+"""§9.4 混沌 harness（mock 层）——M4-T3 owner / R-T1 注入面补全。
 
 在附录B fixture 上跑 mock 编排回路，注入 SIGKILL 于 §4.4 事务边界间隙；每轮 kill 后
-重开 Store 走 `orch.scheduler.recover` 续跑至 terminate。校验：
-  - ledger 无重复事件号（exactly-once，§9.4）；
-  - 终态类型序列 == 附录B EXPECTED_TYPE_SEQUENCE（helpers），黑板 contracts.v==2 且 tasks 全 done。
+重开 Store 走 `orch.scheduler.recover` 续跑至 terminate。校验附录B 四断言：
+  - 事件类型序列 == EXPECTED_TYPE_SEQUENCE（本包自有常量，审计 G 解耦）；
+  - 黑板终态一致（contracts.like-api.version==2 且 tasks 全 done）；
+  - mock ledger 无重复事件号（exactly-once，§9.4）；
+  - **混沌轮终态与不中断基准逐字节一致**（附录B 第四断言，R-T1 补全）。
 
 分层铁律（spec §2/CLAUDE.md）：本模块只是**驱动**，不 mock 被测；故障注入依赖
 `orch.store` 已冻结的 FaultInjector / set_fault_injector / clear_fault_injector（M4 契约 §1）。
-mock 语境无 worktree/无真实 CLI 进程，故 `invoke_post` / `autocommit_post` 两个 §4.4 站点
-在本 harness 中列为可选注入面（若上层 hook 未落到 mock 路径则该轮不崩，视为"未触发"→
-仍走完整跑通路径），保持 site 名齐备以满足 M4 契约 §2 覆盖清单。
+
+R-T1 注入面补全（审计 A1/A2/G）：
+  - §4.4 五个事务边界 site 全部映射为**真实注入**（删除 invoke_post/autocommit_post
+    的 None 降级）：前三个（append/mark/reply）落在 store 内嵌 _fault_check；后两个
+    （invoke_post/autocommit_post）落在调度层 core/async_core 的控制流位置经
+    store.fault_check 触发（Lead §17 裁决：按控制流位置触发，mock 无 worktree 照样命中）。
+  - 附录B 第四断言：每 harness 先跑一次不中断基准，捕获终态产物字节（ledger + 黑板
+    规范化 JSON），混沌轮终态逐字节比较，不一致=该轮失败。产物本就确定化（ledger 无
+    时间戳；黑板 state.json 由 store._write_state 以 sort_keys=True dump），无需裁剪断言。
 """
 
 from __future__ import annotations
@@ -17,34 +25,81 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
 
 import orch.adapters
 import orch.scheduler
 import orch.store
 
-from tests.helpers import EXPECTED_TYPE_SEQUENCE
+from orch.chaos.expected import EXPECTED_TYPE_SEQUENCE
+
 
 # ——————————————————————————————————————————————————————————————
-# 注入点清单（M4 契约 §1/§2）
-# 覆盖 §4.4 五个事务边界 site + 一个纯随机 mix 模式。random 模式在候选中随机挑选一个
-# 已实际生效的 store 钩子（append_event_post / mark_dispatching_post / reply_and_done_post），
-# 因此"覆盖五间隙"与"纯随机"在语义上正交（前者按名称轮转，后者按 rng 派生）。
+# 幂等 mock 适配器（§9.2 层 2/3 的 mock 身：崩溃恢复后同 (role,event_id) 只落一次副作用）
+# ——————————————————————————————————————————————————————————————
+
+class _IdempotentMockAdapter(orch.adapters.MockAdapter):
+    """MockAdapter 的**幂等**变体，供混沌 harness 忠实模拟"崩溃恢复后重发不重做"。
+
+    根因（R-T1，审计 A1）：§4.4 间隙(3)invoke_post/(4)autocommit_post 是"崩溃高发区，
+    盘上无痕迹"——invoke 已返回（mock 已向 ledger 追加一行副作用）但 reply_and_done 未
+    落盘就 kill。§9.1 恢复对该无回复、未超时的 dispatching 行走 c) 重派发 → 主循环
+    重新 invoke → 若 mock 无脑再追加一行，就产生**重复副作用**（ledger 重复行），违反
+    §9.4 exactly-once。
+
+    这**不是** orchestrator 的缺陷：§4.4 有意把"回复落盘 + 标 done"合并单事务消除该
+    窗口，但 invoke↔reply 之间的窗口天然是"至少一次投递"（§9.2）。§9.2 明列去重责任
+    分三层，其中**活会话/死会话层**要求 agent 幂等——"见重复编号原样重发上次信封，不重做
+    操作"（层2）、"git log 已有 wip:{T}@E{n} → 只需补发信封"（层3）。mock 的 ledger 行
+    `{role}:{event_id}` 正是那个 `wip:{T}@E{n}` 去重标记的 mock 对应物。
+
+    本类据此做**通用规则**（非对某 seed 特判）：invoke 前先查 ledger 是否已含本批触发号
+    对应的 `{role}:{event_id}` 行；已含 → 跳过副作用追加（"补发信封不重做"），否则委托
+    父类正常追加。返回信封仍由父类查表得到（同 (role,event_id) 恒定，故补发一致）。
+    """
+
+    def invoke(self, view: dict, sess: dict | None) -> tuple[dict, dict | None]:
+        event_id = max(view["event_ids"])
+        marker = f"{self.role}:{event_id}"
+        already = False
+        if self.ledger_path.exists():
+            existing = self.ledger_path.read_text(encoding="utf-8").splitlines()
+            already = marker in existing
+        if not already:
+            # 首次处理该 (role,event_id)：父类正常查表 + 追加 ledger 副作用。
+            return super().invoke(view, sess)
+        # 重发（崩溃恢复后重派发）：只补发信封，不重做副作用（§9.2 层2/3）。
+        scripted = self.script[event_id]
+        env = {
+            k: scripted[k]
+            for k in orch.adapters._AUTHOR_FIELDS
+            if k in scripted
+        }
+        return env, sess
+
+
+# ——————————————————————————————————————————————————————————————
+# 注入点清单（M4 契约 §1/§2；R-T1 补全为 5 site 全真实注入）
+# 覆盖 §4.4 五个事务边界 site + 一个纯随机 mix 模式。random 模式从五个真实 site 中
+# 随机挑选（rng 派生），因此"覆盖五间隙"与"纯随机"在语义上正交。
 # ——————————————————————————————————————————————————————————————
 
 INJECTION_SITES: tuple[str, ...] = (
-    "append_event_post",     # §4.4 (1) 事件追加 + 派发行 单事务 提交后
-    "mark_dispatching_post", # §4.4 (2) status→dispatching 提交后
-    "invoke_post",           # §4.4 (3) invoke 结束后 / autocommit 前（mock 语境无实际 hook 点）
-    "autocommit_post",       # §4.4 (4) worktree autocommit 后（mock 无 worktree）
-    "reply_and_done_post",   # §4.4 (5) 回复落盘 + 标 done + 会话 upsert 提交后
-    "random_mix",            # 纯随机：从上面五个中挑一个（rng 派生）
+    "append_event_post",     # §4.4 (1) 事件追加 + 派发行 单事务 提交后（store 内嵌）
+    "mark_dispatching_post", # §4.4 (2) status→dispatching 提交后（store 内嵌）
+    "invoke_post",           # §4.4 (3) invoke 结束后 / reply 前（调度层控制流位置）
+    "autocommit_post",       # §4.4 (4) autocommit + 越权审计后 / reply 前（调度层控制流位置）
+    "reply_and_done_post",   # §4.4 (5) 回复落盘 + 标 done + 会话 upsert 提交后（store 内嵌）
+    "random_mix",            # 纯随机：从上面五个真实 site 中挑一个（rng 派生）
 )
 
-# store 里实际内嵌 `_fault_check` 的 site（未列入者：mock 语境不触发 → 该轮不崩溃）。
+# R-T1：五个 §4.4 site 全部为真实注入面（不再有 None 降级）。
+# store 内嵌 3 个（append/mark/reply）；调度层控制流 2 个（invoke_post/autocommit_post）
+# 经 store.fault_check 从同一全局 FaultInjector 触发。
 _ACTIVE_SITES: tuple[str, ...] = (
     "append_event_post",
     "mark_dispatching_post",
+    "invoke_post",
+    "autocommit_post",
     "reply_and_done_post",
 )
 
@@ -69,6 +124,23 @@ class ChaosReport:
 
 
 # ——————————————————————————————————————————————————————————————
+# 不中断基准终态产物（附录B 第四断言的比较基线）
+# ——————————————————————————————————————————————————————————————
+
+@dataclass
+class BaselineArtifacts:
+    """一次不中断基准跑的终态产物字节（逐字节比较基线，R-T1）。
+
+    ledger_bytes：mock ledger 文件原始字节（无时间戳，天然确定化）。
+    state_bytes：黑板 state.json 原始字节（store._write_state 已 sort_keys=True dump，
+                 确定化；frozen_at 是事件号而非时间戳，无非确定字段）。
+    """
+
+    ledger_bytes: bytes
+    state_bytes: bytes
+
+
+# ——————————————————————————————————————————————————————————————
 # ChaosHarness
 # ——————————————————————————————————————————————————————————————
 
@@ -83,7 +155,8 @@ class ChaosHarness:
       5. 跑 run_thread → 可能 SystemExit(137)；捕获即视为"kill -9"
       6. clear_fault_injector；重开 Store（同目录）走 recover 续跑
       7. 若 status='suspended' → apply_gate_decision(approve=True) → 再跑到 terminate
-      8. 校验 ledger 无重复 + 事件类型序列 == EXPECTED_TYPE_SEQUENCE + 黑板终态 v2/done
+      8. 校验附录B 四断言：ledger 无重复 + 类型序列一致 + 黑板 v2/done +
+         终态产物与不中断基准逐字节一致
     """
 
     INJECTION_SITES = INJECTION_SITES
@@ -99,12 +172,17 @@ class ChaosHarness:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.script = script
         self.seed = 0 if seed is None else int(seed)
+        # 不中断基准：懒计算一次并缓存（fixture 确定性 → 终态与 seed 无关）。
+        self._baseline: BaselineArtifacts | None = None
 
     # ------------------------------------------------------------------
     # 对外主入口
     # ------------------------------------------------------------------
     def run(self, rounds: int = 50) -> ChaosReport:
         report = ChaosReport(rounds=rounds, passed=0)
+
+        # 先跑不中断基准（附录B 第四断言的逐字节比较基线，R-T1）。
+        baseline = self._ensure_baseline()
 
         # 主 rng：seed 决定所有子决策（可复现）。
         main_rng = random.Random(self.seed)
@@ -124,6 +202,7 @@ class ChaosHarness:
             try:
                 ok, reason = self._run_one_round(
                     target_dir=tdir, ledger_path=ledger, site=site, count=count,
+                    baseline=baseline,
                 )
             except Exception as exc:  # noqa: BLE001
                 # 双重兜底：即便 _run_one_round 内部漏兜（如 _build_adapters/_config
@@ -141,10 +220,44 @@ class ChaosHarness:
                 )
                 if "ledger" in reason:
                     report.ledger_ok = False
-                if "terminal" in reason or "types" in reason or "board" in reason:
+                if ("terminal" in reason or "types" in reason
+                        or "board" in reason or "baseline" in reason):
                     report.terminal_ok = False
 
         return report
+
+    # ------------------------------------------------------------------
+    # 不中断基准
+    # ------------------------------------------------------------------
+    def _ensure_baseline(self) -> BaselineArtifacts:
+        """跑一次不中断（无故障注入）的完整流程，捕获终态产物字节（懒计算，缓存）。"""
+        if self._baseline is not None:
+            return self._baseline
+        base_dir = self.workspace / "_baseline"
+        base_ledger = self.workspace / "_baseline-ledger.txt"
+        orch.store.clear_fault_injector()
+        st = orch.store.Store(base_dir)
+        st.set_meta("status", "running")
+        st.append_event(sender="human", type="assign", body="点赞功能开工", to=[])
+        adapters = self._build_adapters(base_ledger)
+        cfg = self._config()
+        self._drive_until_stopped(st, cfg, adapters)
+        # 终态：必须已 terminated（基准跑不注入故障，应一次到底）。
+        status = st.get_meta("status")
+        if status != "terminated":
+            raise RuntimeError(f"baseline 未到达 terminated：status={status!r}")
+        self._baseline = self._capture_artifacts(base_dir, base_ledger)
+        return self._baseline
+
+    @staticmethod
+    def _capture_artifacts(target_dir: Path, ledger_path: Path) -> BaselineArtifacts:
+        """读终态产物原始字节：ledger 文件 + 黑板 state.json（均已确定化）。"""
+        ledger_bytes = (
+            ledger_path.read_bytes() if ledger_path.exists() else b""
+        )
+        state_path = target_dir / "blackboard" / "state.json"
+        state_bytes = state_path.read_bytes() if state_path.exists() else b""
+        return BaselineArtifacts(ledger_bytes=ledger_bytes, state_bytes=state_bytes)
 
     # ------------------------------------------------------------------
     # 单轮驱动
@@ -156,8 +269,11 @@ class ChaosHarness:
         ledger_path: Path,
         site: str,
         count: int,
+        baseline: BaselineArtifacts | None = None,
     ) -> tuple[bool, str]:
         target_dir.mkdir(parents=True, exist_ok=True)
+        if baseline is None:
+            baseline = self._ensure_baseline()
 
         # ① 首次开 Store + seed E1（无注入器；E1 是外部触发，不应被本轮混沌打断）。
         orch.store.clear_fault_injector()
@@ -231,6 +347,19 @@ class ChaosHarness:
         if not tasks or not all(v == "done" for v in tasks.values()):
             return False, f"board-tasks-not-all-done:{tasks}"
 
+        # ⑧ 附录B 第四断言：终态产物与不中断基准逐字节一致（R-T1）。
+        actual = self._capture_artifacts(target_dir, ledger_path)
+        if actual.ledger_bytes != baseline.ledger_bytes:
+            return False, (
+                "baseline-ledger-mismatch:"
+                f"len={len(actual.ledger_bytes)}!=base{len(baseline.ledger_bytes)}"
+            )
+        if actual.state_bytes != baseline.state_bytes:
+            return False, (
+                "baseline-board-mismatch:"
+                f"len={len(actual.state_bytes)}!=base{len(baseline.state_bytes)}"
+            )
+
         return True, "ok"
 
     # ------------------------------------------------------------------
@@ -267,8 +396,11 @@ class ChaosHarness:
     # 装配辅助
     # ------------------------------------------------------------------
     def _build_adapters(self, ledger_path: Path) -> dict:
+        # R-T1：用幂等 mock 变体（§9.2 层2/3）——崩溃恢复后同 (role,event_id) 只落一次
+        # ledger 副作用，模拟"重发信封不重做操作"。基准跑与混沌轮共用同一构造，故基准
+        # 产物与混沌恢复终态可逐字节比较（不引入构造差异）。
         return {
-            role: orch.adapters.MockAdapter(
+            role: _IdempotentMockAdapter(
                 role=role, script=table, ledger_path=ledger_path
             )
             for role, table in self.script.items()
@@ -315,13 +447,15 @@ class ChaosHarness:
         return rng.choice(INJECTION_SITES)
 
     def _resolve_site(self, site: str) -> str | None:
-        """把 site 名映射为 store 内嵌 _fault_check 支持的实际 site。
+        """把 site 名映射为实际注入 site（R-T1：5 个 §4.4 site 全部真实注入，无 None 降级）。
 
-        - random_mix → 从 _ACTIVE_SITES（append/mark/reply）中 rng 挑一个
+        - random_mix → 从 _ACTIVE_SITES（5 个真实 site）中 rng 挑一个
           （rng 隔离在此，避免污染主决策）；
-        - 已在 _ACTIVE_SITES 内 → 原样返回；
-        - 其余（invoke_post / autocommit_post，mock 无 hook 点） → None，
-          表示本轮"未触发"崩溃点，仍完整跑通（属于 §4.4 覆盖清单里的"覆盖 site 名"）。
+        - 已在 _ACTIVE_SITES 内（含 invoke_post / autocommit_post）→ 原样返回；
+          它们的 fault_check 已在 store（append/mark/reply）或调度层控制流位置
+          （invoke_post/autocommit_post，经 store.fault_check）落到 mock 路径上，故本轮
+          真的会在该 site 崩溃。
+        - 其余（仅 "random_mix" 以外的未知名）→ None（防御，正常不会到达）。
         """
         if site == "random_mix":
             local = random.Random()  # 独立 rng：不影响主 seed 派生。
@@ -353,4 +487,4 @@ class ChaosHarness:
         return None
 
 
-__all__ = ["ChaosHarness", "ChaosReport", "INJECTION_SITES"]
+__all__ = ["ChaosHarness", "ChaosReport", "BaselineArtifacts", "INJECTION_SITES"]

@@ -74,6 +74,20 @@ def _fault_check(site: str) -> None:
     _CURRENT_FAULT.check(site)
 
 
+def fault_check(site: str) -> None:
+    """公共故障注入检查点（R-T1：§4.4 间隙(3)invoke_post/(4)autocommit_post 复用）。
+
+    store 内嵌的 3 个落盘边界 site（append_event_post / mark_dispatching_post /
+    reply_and_done_post）调用私有 `_fault_check`；调度层（core/async_core）的两个
+    **控制流位置** site（invoke_post / autocommit_post）经此公共入口触发，共享同一
+    全局 FaultInjector 单例与计数语义。未注入时零开销直接返回。
+
+    Lead 裁决（§17）：invoke_post/autocommit_post 按**控制流位置**触发——mock 语境
+    无 worktree、autocommit 为 no-op 时位置依然存在，照样触发；不依赖是否真的产生 commit。
+    """
+    _fault_check(site)
+
+
 # ——————————————————————————————————————————————————————————————
 # 常量：DDL 与门槛
 # ——————————————————————————————————————————————————————————————

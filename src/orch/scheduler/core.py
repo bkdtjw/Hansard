@@ -244,6 +244,21 @@ def _collect_branches(store, config: dict) -> list[str]:
     return branches
 
 
+def _find_terminate_summary(store, term_event_id: int) -> dict | None:
+    """按 re=[term_event_id] + sender=system 定位已落盘的终止总结事件（§9.1 只查表）。
+
+    终止总结事件用 re=[触发终止事件号] 标识其血缘（见 _handle_terminate）。恢复/重入时
+    据此判断"总结事件是否已落盘"，避免重复追加（幂等）。同一 term 理论唯一，取最后一条。
+    """
+    match = None
+    for ev in store.events():
+        if (ev.get("from") == "system"
+                and ev.get("type") == "system"
+                and term_event_id in (ev.get("re") or [])):
+            match = ev
+    return match
+
+
 def _handle_terminate(store, config: dict, term_event: dict) -> None:
     """§5.4 终止清单：汇总产物 → system 总结事件 → status=terminated → 拒绝新派发。
 
@@ -254,52 +269,99 @@ def _handle_terminate(store, config: dict, term_event: dict) -> None:
     评审建议②（契约 §3）：终止**总结 system 事件不生成 pending 派发行**——本函数落盘该
     system 事件后立即把其派发行标 done（"建后即 done"），保持派发表整洁；不残留任何指向
     总结事件的 pending 行。
+
+    R-T1 崩溃安全 + 幂等（§4.4 间隙(1)/§9.1）：本函数的三步（append 总结 / mark_done /
+    set status=terminated）不是单事务。若在 append 总结事件（其 append_event_post 钩子）
+    与后续两步之间崩溃，盘上会留下：总结事件已落盘、其 moderator 派发行仍 pending、status
+    仍 running。恢复主循环会把该 pending 行当普通派发去 invoke moderator → 脚本无该事件号
+    → KeyError。修复：
+      1) 总结事件带 re=[term_event.id] 标识血缘，可被 _find_terminate_summary 只查表定位；
+      2) 本函数进入先查是否已存在总结事件——已存在则**复用**（不重复 append），只补做
+         mark_done + 清扫 pending + set status（幂等重入）。
+    这是通用规则（任何在此边界崩溃的轮都靠"查表复用总结事件"闭合），非对特定 seed 特判。
     """
-    state = orch.store.board_state(store)
-    contracts = state.get("contracts") or {}
-    tasks = state.get("tasks") or {}
+    term_id = int(term_event.get("id")) if term_event.get("id") is not None else None
 
-    # 全部 artifacts（去重、保序，§5.4）。
-    artifacts: list[str] = []
-    for ev in store.events():
-        for a in ev.get("artifacts") or []:
-            if a not in artifacts:
-                artifacts.append(a)
+    # §9.1 幂等：先查同一 term 的总结事件是否已落盘（前次崩溃前已 append）。
+    existing = _find_terminate_summary(store, term_id) if term_id is not None else None
 
-    # 分支列表（§5.4；mock 退化为空）。
-    branches = _collect_branches(store, config)
+    if existing is None:
+        state = orch.store.board_state(store)
+        contracts = state.get("contracts") or {}
+        tasks = state.get("tasks") or {}
 
-    # 会话台账（§5.4；读 sessions 表，mock 常为空）。
-    sessions = session_rows(store)
-    session_lines = [
-        f"{s.get('role')}@{s.get('backend')}"
-        f"(sid={s.get('sid')}, gen={s.get('gen')}, last_evt={s.get('last_evt')})"
-        for s in sessions
-    ]
+        # 全部 artifacts（去重、保序，§5.4）。
+        artifacts: list[str] = []
+        for ev in store.events():
+            for a in ev.get("artifacts") or []:
+                if a not in artifacts:
+                    artifacts.append(a)
 
-    summary = (
-        "线程终止清单：\n"
-        f"- 冻结契约：{ {k: v.get('version') for k, v in contracts.items()} }\n"
-        f"- 任务状态：{tasks}\n"
-        f"- 产物 artifacts：{artifacts}\n"
-        f"- 分支列表：{branches}\n"
-        f"- 会话台账：{session_lines}\n"
-        f"- 触发终止事件：E{term_event.get('id')}"
-    )
+        # 分支列表（§5.4；mock 退化为空）。
+        branches = _collect_branches(store, config)
 
-    # system 总结事件（§5.4）。to=[] → 兜底 moderator 落一行 pending 派发（§4.4(1)）；
-    # 评审建议②要求它不留待办：落盘后立即把该派发行标 done（"建后即 done"，契约 §3）。
-    # 系统字段编排器权威赋值（sender='system'，§16.11）。
-    summary_id = append_system_event(store, body=summary, to=["moderator"])
+        # 会话台账（§5.4；读 sessions 表，mock 常为空）。
+        sessions = session_rows(store)
+        session_lines = [
+            f"{s.get('role')}@{s.get('backend')}"
+            f"(sid={s.get('sid')}, gen={s.get('gen')}, last_evt={s.get('last_evt')})"
+            for s in sessions
+        ]
+
+        summary = (
+            "线程终止清单：\n"
+            f"- 冻结契约：{ {k: v.get('version') for k, v in contracts.items()} }\n"
+            f"- 任务状态：{tasks}\n"
+            f"- 产物 artifacts：{artifacts}\n"
+            f"- 分支列表：{branches}\n"
+            f"- 会话台账：{session_lines}\n"
+            f"- 触发终止事件：E{term_id}"
+        )
+
+        # system 总结事件（§5.4）。to=[moderator] 落一行 pending 派发（§4.4(1)）；
+        # 系统字段编排器权威赋值（sender='system'，§16.11）。带 re=[term_id] 标识血缘，
+        # 供恢复/重入只查表定位（§9.1）。
+        summary_id = store.append_event(
+            sender="system", type="system", body=summary,
+            to=["moderator"], re=[term_id] if term_id is not None else [],
+        )
+    else:
+        summary_id = int(existing["id"])
+
+    # 总结事件不留待办：其派发行立即标 done（"建后即 done"，契约 §3；幂等重复 SET 无副作用）。
     store.mark_done(summary_id, "moderator")
 
     # §5.4 拒绝新派发 + 终态整洁：线程终止后不再消费任何 pending，把残留的 pending 派发行
     # 一并标 done（终止前尚未被派发的待办作废——线程已终止，不会再处理它们）。总结事件的
-    # pending 上面已 done；此处清扫其余（如终止前未及处理的 handoff/report 等）。
+    # pending 上面已 done；此处清扫其余（如终止前未及处理的 handoff/report 等，含崩溃恢复后
+    # 残留的总结事件 pending 行）。
     for row in store.pending_dispatches():
         store.mark_done(int(row["event_id"]), row["target"])
 
     store.set_meta("status", "terminated")
+
+
+def _finish_interrupted_terminate(store, config: dict) -> None:
+    """§9.1 恢复补完：若盘上有 terminate 事件但线程未 terminated，幂等重入终止清算。
+
+    只查表数日志（§16.10 禁猜测）：
+      - 无 terminate 事件 → no-op（正常运行中的线程）；
+      - status 已 terminated → no-op（已闭合）；
+      - status == suspended → 不动（挂起线程等 gate_decision，§9.1；terminate 与 suspend
+        互斥，理论不共存，防御性跳过）；
+      - 否则（有 terminate 且未 terminated 且非挂起）→ 对最后一条 terminate 事件调用幂等
+        _handle_terminate 补完（复用已存在的总结事件、清扫 pending、置 terminated）。
+    """
+    status = store.get_meta("status")
+    if status in ("terminated", "suspended"):
+        return
+    term_ev = None
+    for ev in store.events():
+        if ev.get("type") == "terminate":
+            term_ev = ev  # 取最后一条（理论唯一）。
+    if term_ev is None:
+        return
+    _handle_terminate(store, config, term_ev)
 
 
 def run_thread(
@@ -308,6 +370,13 @@ def run_thread(
     adapters: dict,
 ) -> None:
     """§5.1 核心循环单线程串行版。跑到 thread status ∈ {suspended, terminated} 返回。"""
+    # R-T1 崩溃恢复：进入前先补完可能被 kill 打断的终止清算（§9.1/§5.4）。
+    # 若盘上已有 terminate 事件但 status != terminated（在 _handle_terminate 三步中途被
+    # kill），主循环若直接跑会把总结事件的残留 pending 当普通派发去 invoke → 脚本无该事件号
+    # → KeyError。此处只查表（§16.10）：发现未闭合的 terminate 即幂等重入 _handle_terminate
+    # 补完（复用已存在的总结事件、清扫 pending、置 terminated），再进主循环。
+    _finish_interrupted_terminate(store, config)
+
     while True:
         status = store.get_meta("status")
         if status in ("suspended", "terminated"):
@@ -418,6 +487,12 @@ def _dispatch_group(
         )
         return False
 
+    # §4.4 间隙(3) invoke_post：adapter.invoke 已返回、reply_and_done 尚未落盘时崩溃
+    # （spec 亲标"崩溃高发区，盘上无痕迹"）。此刻盘上：本批派发行仍是 dispatching、
+    # 无回复事件——恢复走 §9.1 b)（超时→attempt）或 c)（重派发）。按控制流位置触发
+    # （R-T1 Lead §17 裁决）。
+    orch.store.fault_check("invoke_post")
+
     # ————————————————————————————————————————————————————————
     # §4.5 + §8.2 权限三件套接入：仅当该角色有 worktree 时启用（M0/M1 mock skip）。
     # 顺序（spec §5.1 伪代码 (4)）：autocommit → audit_write_scope → 违规拒收+reset+审计。
@@ -460,6 +535,12 @@ def _dispatch_group(
         # audit 的对齐点（不改 spec DDL，用现有 thread_meta 表，键名 last_ok_commit:{role}）。
         if new_sha:
             store.set_meta(f"last_ok_commit:{target}", new_sha)
+
+    # §4.4 间隙(4) autocommit_post：autocommit + 越权审计（§8.2 权限层）已完成、
+    # reply_and_done 尚未落盘时崩溃。按**控制流位置**触发（R-T1 Lead §17 裁决）：
+    # mock 无 worktree、autocommit 为 no-op 时该位置依然存在，照样触发；不依赖是否
+    # 真的产生 commit。此刻盘上态与 invoke_post 同（回复未落盘），恢复走 §9.1 b)/c)。
+    orch.store.fault_check("autocommit_post")
 
     # 定稿信封：系统字段 from + §8.3 verify 钩子（含 acceptance 降级）。
     reply = _finalize_envelope(store, config, target, env)
