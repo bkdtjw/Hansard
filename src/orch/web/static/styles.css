@@ -1,0 +1,222 @@
+/* orch 玻璃感控制台 —— glassmorphism，原生 CSS，无外链。 */
+
+:root {
+  --txt: #eef5f7;
+  --txt-dim: #9fbcc6;
+  --glass-bg: rgba(255, 255, 255, 0.08);
+  --glass-brd: rgba(255, 255, 255, 0.18);
+  --blue: rgba(96, 165, 250, 0.35);
+  --blue-solid: #60a5fa;
+  --danger: rgba(248, 113, 113, 0.32);
+  --run: #4ade80;
+  --gate: #fbbf24;
+  --term: #94a3b8;
+  --radius: 15px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--txt);
+  background: linear-gradient(135deg, #0b1e27, #1b3a44, #2c5364);
+  background-attachment: fixed;
+  font-size: 14px;
+}
+
+/* —— 磨砂玻璃通用面板 —— */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--glass-brd);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+}
+
+/* —— 顶栏 —— */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin: 14px;
+  padding: 12px 20px;
+  position: sticky;
+  top: 14px;
+  z-index: 20;
+}
+.brand { display: flex; align-items: baseline; gap: 8px; }
+.brand-mark { font-size: 22px; color: var(--blue-solid); }
+.brand-name { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+.brand-sub { font-size: 12px; color: var(--txt-dim); }
+.ws-info { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.ws-path { font-size: 12px; color: var(--txt-dim); max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; box-shadow: 0 0 8px currentColor; }
+.dot.running { background: var(--run); color: var(--run); }
+.dot.gate { background: var(--gate); color: var(--gate); }
+.dot.terminated { background: var(--term); color: var(--term); }
+
+.tabs { display: flex; gap: 6px; }
+.tab {
+  background: transparent; border: 1px solid transparent; color: var(--txt-dim);
+  padding: 7px 16px; border-radius: 10px; cursor: pointer; font-size: 14px;
+  transition: all 0.15s;
+}
+.tab:hover { color: var(--txt); background: rgba(255, 255, 255, 0.06); }
+.tab.active { color: var(--txt); background: var(--blue); border-color: var(--glass-brd); }
+
+/* —— 视图切换 —— */
+.content { padding: 0 14px 40px; }
+.view { display: none; }
+.view.active { display: block; }
+.hidden { display: none !important; }
+
+/* —— 面板通用 —— */
+.panel { padding: 16px; margin-bottom: 14px; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.panel-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+
+/* —— 按钮 —— */
+button { font-family: inherit; }
+.btn-primary, .btn-ghost, .btn-danger {
+  cursor: pointer; border-radius: 10px; padding: 8px 14px; font-size: 13px;
+  color: var(--txt); transition: all 0.15s; border: 1px solid var(--glass-brd);
+}
+.btn-primary { background: var(--blue); }
+.btn-primary:hover { background: rgba(96, 165, 250, 0.5); }
+.btn-ghost { background: rgba(255, 255, 255, 0.06); }
+.btn-ghost:hover { background: rgba(255, 255, 255, 0.14); }
+.btn-danger { background: var(--danger); }
+.btn-danger:hover { background: rgba(248, 113, 113, 0.5); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* —— 线程视图布局 —— */
+.threads-layout { display: grid; grid-template-columns: 320px 1fr; gap: 14px; align-items: start; }
+.left-col { display: flex; flex-direction: column; }
+
+.thread-list { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow-y: auto; }
+.thread-list li {
+  padding: 10px 12px; border-radius: 10px; margin-bottom: 6px; cursor: pointer;
+  display: flex; align-items: center; gap: 8px; border: 1px solid transparent;
+  transition: background 0.15s;
+}
+.thread-list li:hover { background: rgba(255, 255, 255, 0.07); }
+.thread-list li.selected { background: var(--blue); border-color: var(--glass-brd); }
+.thread-list li.empty { color: var(--txt-dim); cursor: default; justify-content: center; font-style: italic; }
+.thread-list li.empty:hover { background: transparent; }
+.thread-list .t-id { font-weight: 600; }
+.thread-list .t-roles { margin-left: auto; font-size: 11px; color: var(--txt-dim); }
+
+.ta {
+  width: 100%; background: rgba(0, 0, 0, 0.22); color: var(--txt);
+  border: 1px solid var(--glass-brd); border-radius: 10px; padding: 10px;
+  font-family: inherit; font-size: 13px; resize: vertical; margin-bottom: 10px;
+}
+.ta.code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; line-height: 1.5; }
+.ta:focus, .inp:focus, .sel:focus { outline: none; border-color: var(--blue-solid); }
+
+.roles-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--glass-brd);
+  border-radius: 999px; font-size: 12px; cursor: pointer;
+}
+.chip input { accent-color: var(--blue-solid); }
+
+/* —— 右列工作区 —— */
+.empty-workspace { text-align: center; color: var(--txt-dim); padding: 60px 20px; }
+
+.ctrl-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.ctrl-title { display: flex; align-items: center; gap: 10px; }
+.wk-tid { font-weight: 700; font-size: 16px; }
+.badge {
+  padding: 3px 10px; border-radius: 999px; font-size: 12px; background: rgba(255,255,255,0.1);
+  border: 1px solid var(--glass-brd);
+}
+.badge.running { background: rgba(74, 222, 128, 0.22); }
+.badge.suspended { background: rgba(251, 191, 36, 0.22); }
+.badge.terminated { background: rgba(148, 163, 184, 0.22); }
+.ctrl-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.gate-bar { display: flex; align-items: center; gap: 10px; background: rgba(251, 191, 36, 0.12); }
+.gate-icon { color: var(--gate); font-size: 18px; }
+.gate-text { color: var(--gate); font-weight: 600; }
+
+/* —— 群聊 —— */
+.chat-panel { }
+.chat-stream { max-height: 42vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.bubble {
+  padding: 9px 13px; border-radius: 12px; border: 1px solid var(--glass-brd);
+  background: rgba(255, 255, 255, 0.06); max-width: 92%; word-break: break-word;
+}
+.bubble .b-head { font-size: 11px; color: var(--txt-dim); margin-bottom: 3px; }
+.bubble .b-body { font-size: 13.5px; white-space: pre-wrap; }
+/* 角色配色（不同发送方不同底色） */
+.bubble.r-human { align-self: flex-end; background: rgba(96, 165, 250, 0.18); }
+.bubble.r-moderator { border-left: 3px solid #a78bfa; }
+.bubble.r-pm { border-left: 3px solid #34d399; }
+.bubble.r-backend { border-left: 3px solid #60a5fa; }
+.bubble.r-frontend { border-left: 3px solid #f472b6; }
+.bubble.r-tester { border-left: 3px solid #fbbf24; }
+.bubble.r-system { border-left: 3px solid var(--term); font-style: italic; }
+.chat-empty { color: var(--txt-dim); text-align: center; padding: 24px; font-style: italic; }
+
+/* —— 发言框 —— */
+.send-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.sel, .inp {
+  background: rgba(0, 0, 0, 0.22); color: var(--txt); border: 1px solid var(--glass-brd);
+  border-radius: 10px; padding: 7px 10px; font-family: inherit; font-size: 13px;
+}
+.sel { flex: 1; }
+.inp { max-width: 160px; }
+
+/* —— 配置视图 —— */
+.config-layout { display: grid; grid-template-columns: 1fr 320px; gap: 14px; align-items: start; }
+.config-notes dl { margin: 0; }
+.config-notes dt { font-weight: 700; color: var(--blue-solid); margin-top: 12px; }
+.config-notes dd { margin: 4px 0 0; font-size: 12.5px; color: var(--txt-dim); line-height: 1.5; }
+.config-notes code { background: rgba(0,0,0,0.3); padding: 1px 5px; border-radius: 5px; font-size: 11.5px; }
+
+/* —— 指标网格 —— */
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.metric-card {
+  padding: 16px; border-radius: 12px; border: 1px solid var(--glass-brd);
+  background: rgba(255, 255, 255, 0.06);
+}
+.metric-card .m-label { font-size: 12px; color: var(--txt-dim); margin-bottom: 6px; }
+.metric-card .m-value { font-size: 22px; font-weight: 700; }
+.metric-card .m-value.na { color: var(--term); opacity: 0.7; font-weight: 500; }
+
+/* —— 压测 —— */
+.bench-form { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
+.bench-form label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--txt-dim); }
+.bench-result { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.bench-result table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.bench-result th, .bench-result td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--glass-brd); }
+.bench-result th { color: var(--txt-dim); font-weight: 600; }
+
+/* —— toast —— */
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  padding: 12px 22px; border-radius: 12px; z-index: 50; max-width: 70vw;
+  background: rgba(15, 30, 39, 0.92); backdrop-filter: blur(14px);
+  border: 1px solid var(--glass-brd); box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  font-size: 13.5px;
+}
+.toast.ok { border-left: 4px solid var(--run); }
+.toast.err { border-left: 4px solid #f87171; }
+
+/* —— 表格（status 弹层） —— */
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th, .tbl td { padding: 6px 10px; border-bottom: 1px solid var(--glass-brd); text-align: left; }
+.tbl th { color: var(--txt-dim); }
+
+.mono { font-family: ui-monospace, Consolas, monospace; }
+.copyable { cursor: copy; }
+
+@media (max-width: 900px) {
+  .threads-layout, .config-layout { grid-template-columns: 1fr; }
+}

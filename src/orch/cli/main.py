@@ -1021,6 +1021,39 @@ def cmd_replay(
 
 
 # ——————————————————————————————————————————————————————————————
+# orch serve（spec 之外的补充工具：玻璃感 Web 控制台入口，W1）
+# ——————————————————————————————————————————————————————————————
+
+@app.command("serve")
+def cmd_serve(
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址。"),
+    port: int = typer.Option(8787, "--port", help="监听端口。"),
+) -> None:
+    """启动玻璃感 Web 控制台（spec 之外的补充工具）。
+
+    命令体尽量薄：真正逻辑在 orch.web.server.make_server；此处只解析 workspace、
+    起 ThreadingHTTPServer 常驻、打印访问地址、Ctrl-C 优雅退出。
+    """
+    from orch.web.server import make_server
+
+    ws = _resolve_workspace(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+    srv = make_server(ws, host, port)
+    actual_port = srv.server_address[1]
+    _echo(f"[serve] http://{host}:{actual_port}  workspace={ws}")
+    _echo("[serve] Ctrl-C 停止。")
+    try:  # pragma: no cover - 常驻循环，测试走 make_server 直接起停
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        _echo("[serve] shutting down")
+        srv.shutdown()
+        srv.server_close()
+
+
+# ——————————————————————————————————————————————————————————————
 # 入口
 # ——————————————————————————————————————————————————————————————
 

@@ -27,3 +27,5 @@ orchestrator/threads/*/events.db-shm
 .vscode/
 .DS_Store
 Thumbs.db
+
+.claude/

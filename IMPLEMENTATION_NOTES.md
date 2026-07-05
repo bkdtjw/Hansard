@@ -171,3 +171,23 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   只能类型级比较,board.md 是 state.json 确定性投影);orch/chaos/expected.py 携带
   E9→tester(fixture 自决)与 E20 终止总结(§5.4 忠实产物)两处对附录B 字面的偏移,
   文件抬头已自陈。
+
+### W1 玻璃感 Web 控制台（spec 之外补充交付，2026-07-05）
+- 性质：spec 之外的补充工具，不改任何 spec 实现语义；HTTP↔现有 orch 函数适配层 + 原生玻璃感前端。
+  零新增依赖（stdlib http.server + 已有 orch 包 + 白名单 pyyaml；前端纯原生无 CDN/npm，离线可用）。
+- 落点：src/orch/web/{server.py,__init__.py,static/{index.html,app.js,styles.css}}；orch serve 命令
+  （cli/main.py 薄入口 +33 行，逻辑在 web.make_server）；tests/test_web.py 26 用例。
+- Lead 胶水：上一 commit 已加 orch 入口([project.scripts])；本次 .gitignore 加 .claude/（launch.json 含本机路径不入库）。
+- 派工与纪律：workflow 单卡 W1（opus 全栈）。审计发现 worker 越权改本文件（W1 白名单未含 NOTES），
+  已 git checkout 回滚，本段由 Lead 依"亲验结果"重写——worker 自述（含其替 Lead 声称的"亲验"）一律不采信。
+- Lead 亲验（真起 make_server + urllib 打真实 HTTP + 查 sqlite，非采信 worker）：
+  · 15 端点全部真副作用坐实：health / POST threads（磁盘真出 t-*/events.db + E1）/ run{once}→terminated /
+    events（第三人称 4 条）/ status / send / gate approve→gate_decision(approve) 真落盘 / stop / reopen /
+    attach（真实接入命令）/ replay（markdown）/ config（非法 yaml 拒写盘·合法写盘·读回一致）/
+    metrics（§13 全 11 字段）/ bench（对比报告）/ 非法路径 404。
+  · 玻璃感真实：styles.css 14 处玻璃属性 + backdrop-filter blur(14px) + 深色渐变，index.html 外链之。
+  · 布局：桌面 1280 视口 layout/topbar 实测 1237px 撑满（两栏，≤900px 单列）。
+  · tab 是真按钮：DOM .click() 令 view-config 显示 / view-threads 隐藏 / activeTab=config / textarea 存在。
+  · 前端零 console 错误、后端零异常。Chrome 扩展未连，改用 Claude Preview 起服务截图（玻璃感主界面清晰）；
+    配置/指标视图截图因 preview 渲染器对 backdrop-filter 重绘超时（工具兼容问题，非产品缺陷，已用 DOM/HTTP 证据替代）。
+- 全量回归：pytest -q → 275 passed, 1 skipped（249 基线 + 26 web）；未改 chaos/scheduler，硬门槛不受影响。
