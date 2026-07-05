@@ -152,8 +152,13 @@ def _ep_thread_run(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
     roles = clim._thread_roles(store)
     if not roles:
         raise _ApiError(400, f"线程 {tid} 无角色配置，无法装配 adapters")
-    adapters = clim._build_default_adapters(roles)
     config = clim._load_config(ws)
+    # config 定义了真实 adapters+roles → 装真实 CLI 后端（与 orch run 同一判断，Q1/Q2 陪跑）；
+    # 否则回退默认 Fake（mock 冒烟）。真实后端下 run_thread 会同步跑真实 CLI，请求耗时较长。
+    if config.get("adapters") and config.get("roles"):
+        adapters = clim._build_adapters_from_config(roles, config, ws / tid)
+    else:
+        adapters = clim._build_default_adapters(roles)
     # 等价 orch run --once 对单线程：run_thread 跑到 terminated/suspended 返回。
     orch.scheduler.run_thread(store, config, adapters)
     return 200, {"ran": True, "status": store.get_meta("status") or "unknown"}

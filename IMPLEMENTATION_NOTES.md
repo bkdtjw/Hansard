@@ -203,3 +203,12 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   · tests/test_cli_adapter.py：+3 解包单测（kimi/claude/text），样例取自实测、json.dumps 构造，零测试计费。
 - 真实联跑（Lead 亲跑，线程 t-91bb9e71）：config 三角色全 kimi_cli → orch new 小任务 → 真实三方协作 E1..E7 全真实 kimi（backend 给方案→moderator 派 tester→tester 确认→moderator 汇报 human→human 指令→moderator terminate）→ terminated；E8 终止台账记录三角色真实 session_id。全链路：render 视图→kimi.exe subprocess→stream-json 解包→信封入队→调度→session 提取→终止清单。
 - 真实发现（记录，未即时修）：真实 agent 会自主 handoff 给未配置角色（moderator→tester，初次 roles 无 tester 时 run 抛 `KeyError('tester')`）。即时以"加 tester 角色"绕过；健壮性缺口=装配/调度对未知 target 应优雅拒收+审计而非崩环，属 spec 边界外增强，留后续（真实场景配全角色规避）。
+
+### web 控制台接真实后端（2026-07-05 续，Lead 亲做）
+- src/orch/web/server.py `_ep_thread_run`：与 orch run 同一判断——config 有 adapters+roles 时用
+  `_build_adapters_from_config`（真实 CLI），否则 Fake。玻璃控制台由此可真驱动 kimi。
+- Lead 亲验（make_server 指向 orch-real-ws，经 HTTP run 端点，线程 t-3b262e97）：E2 backend(kimi)
+  真实输出 `return s[::-1]`（非 Fake ack）；E5 展示真实 LLM 输出非法 type=ack 时 §5.1 schema 校验
+  + 携带错误说明重调（R-T2 的 D）+ 降级 system 审计正确生效。web 端点真驱动真实 kimi 坐实。
+- 边界：真实后端下 run 端点同步跑真实 CLI，HTTP 请求耗时较长（分钟级）；异步化（后台跑 + 轮询）
+  属后续优化，未做。test_cli_adapter 补 2 装配单测（cli 型/非 cli 报错，纯逻辑不调 CLI）；280 全绿。

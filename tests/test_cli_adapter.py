@@ -515,3 +515,26 @@ def test_unwrap_text_mode_backward_compatible():
     text, sid = _unwrap_agent_output(raw, {})
     assert text == raw
     assert sid is None
+
+
+def test_build_adapters_from_config_cli_kind():
+    """真实装配：config kind=cli → CliAdapter，role 层字段覆盖 adapter 层（Q1/Q2 陪跑）。"""
+    from orch.cli.main import _build_adapters_from_config
+    import orch.adapters as _ad
+    config = {
+        "adapters": {"kimi_cli": {"kind": "cli", "start_cmd": "kimi -p",
+                                  "wire_format": "stream-json"}},
+        "roles": {"backend": {"adapter": "kimi_cli", "can_decide": False,
+                              "write_scope": []}},
+    }
+    ads = _build_adapters_from_config(["backend"], config, Path("."))
+    assert isinstance(ads["backend"], _ad.CliAdapter)
+    assert ads["backend"].config.get("wire_format") == "stream-json"
+
+
+def test_build_adapters_from_config_rejects_non_cli():
+    """真实装配暂只支持 kind=cli；其它 kind 显式报错，不臆造后端（诚实边界）。"""
+    from orch.cli.main import _build_adapters_from_config
+    config = {"adapters": {"a": {"kind": "api"}}, "roles": {"m": {"adapter": "a"}}}
+    with pytest.raises(ValueError):
+        _build_adapters_from_config(["m"], config, Path("."))
