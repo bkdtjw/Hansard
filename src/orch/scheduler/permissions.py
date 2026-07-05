@@ -211,3 +211,20 @@ def autocommit(worktree: Path, role: str, event_id: int) -> str | None:
 def reset_hard(worktree: Path, commit: str) -> None:
     """`git reset --hard {commit}`：§8.2 越权后回上个合法 commit。"""
     _git(Path(worktree), "reset", "--hard", commit)
+
+
+def head_sha(worktree: Path) -> str | None:
+    """`git rev-parse HEAD` 返回 worktree 当前 HEAD 的完整 sha；失败返回 None。
+
+    R-T2 · E（§8.2 首轮审计兜底）：worktree 存在而 store/config 均无 last_ok_commit 时，
+    调度层在本轮 invoke **之前**用本函数取当前 HEAD 落盘为对齐点——只查 git，不猜测
+    （§16.10）。使审计分支恒有对齐点、恒执行；首轮越权写入也能被 diff 出来。
+    """
+    try:
+        proc = _git(Path(worktree), "rev-parse", "HEAD", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = (proc.stdout or "").strip()
+    return sha or None

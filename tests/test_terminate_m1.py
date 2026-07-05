@@ -136,15 +136,44 @@ def test_terminate_summary_system_event_has_no_pending_dispatch(thread_dir, tmp_
     )
 
 
-def test_terminate_leaves_no_pending_dispatches_at_all(thread_dir, tmp_dir):
-    """终止后派发表应整洁：不残留任何 pending 行（含总结事件与 terminate 本身）。
+def test_terminate_preserves_preexisting_pending(thread_dir, tmp_dir):
+    """R-T2 · H（§5.4 忠实语义，审计 §二 H）：终止**只拒绝新派发**，
+    **不作废**终止前既有的 pending 待办。
 
-    §5.4：terminate 拒绝新派发、总结事件不建待办 -> 终态无 pending 悬挂。
-    （terminate 信号本身不生成派发行 M0 已实现；本用例合并断言终态整洁。）
+    审计否定的旧行为：`_handle_terminate` 把终止前所有 pending 一并 mark_done（静默作废
+    既有待办），超出 spec §5.4"此后拒绝新派发"的字面语义。此用例先确认被否定的旧行为
+    确实存在于本驱动流（`_drive_to_terminate` 铺了一条 handoff→tester 的 pending，它在
+    moderator 发 terminate 时**尚未被处理**），再断言修复后的忠实语义：
+
+      1) 终止**总结 system 事件其自身**派发行不悬挂（done，不是 pending）——契约 §3；
+      2) 终止**前既有**的 tester pending 派发行**被保留**（未被静默作废）——H 修复点。
+
+    旧实现下第 (2) 条为红（既有 pending 被 mark_done）；H 修复后转绿。
     """
     st = _drive_to_terminate(thread_dir, tmp_dir)
+    assert st.get_meta("status") == "terminated", "terminate 后线程应 terminated"
+
+    # (1) 总结事件自身派发行不 pending（"建后即 done"）。
+    summary = _summary_system_event(st)
+    assert summary is not None, "应有终止总结 system 事件"
+    assert all(d["event_id"] != summary["id"] for d in st.pending_dispatches()), (
+        "§5.4/契约§3：终止总结 system 事件其自身派发行不得悬挂为 pending"
+    )
+
+    # (2) 终止前既有的 handoff→tester pending 被保留（H：不作废终止前既有待办）。
+    handoff = next(
+        (e for e in st.events()
+         if e["type"] == "handoff" and "tester" in (e.get("to") or [])),
+        None,
+    )
+    assert handoff is not None, "驱动流应铺了一条 handoff→tester 事件"
     pending = st.pending_dispatches()
-    assert pending == [], f"终止后不应残留任何 pending 派发行，实际 {pending}"
+    preserved = [d for d in pending
+                 if d["event_id"] == handoff["id"] and d["target"] == "tester"]
+    assert preserved, (
+        "§5.4（H 忠实语义）：终止前既有的 tester pending 待办不得被静默作废，"
+        f"应保留为 pending；实际 pending={pending}"
+    )
 
 
 # ==================================================================

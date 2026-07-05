@@ -33,6 +33,19 @@ spec §5.3 表格原文（宪法定义，逐字抄录，不做任何简化）：
     线程 status→suspended（§10：整体停机，挂起不消耗资源）。
   - 所有写一律走冻结 store 原语（bump_attempt / append_event / mark_gate_wait /
     set_meta）；只读旁路（枚举 dispatching 行）走 _dispatch（读盘观察落盘真相，契约 §7）。
+
+R-T2 · C（升级去重，审计 §二 C）：
+  旧实现每轮从日志全量重数 defect / 事件总数，无"已升级"记录 → approve→resume 后同一
+  gate 立即复触发，人类**无法越过**该门禁（违反 §10"裁决后续走 / 无损继续"）。
+  Lead §17 裁决：把升级水位持久化到 thread_meta（§16.9 禁内存态；水位是可从盘上读回的
+  真相，非可推导计数——它记录的是"上次在哪个计数升级过"这一决策事实，落盘不违反 §5.3
+  "环路/轮数每次从日志现数"，因为**环路/轮数本身仍从日志现数**，落盘的只有升级门限）：
+    · level2：升级时记 wd_l2:{sender}:{tgt} = 当时计数；此后仅当 当前计数 >= 已记水位 +
+      loop_limit 才再次升级（升级窗口整体前移一个 loop_limit）。
+    · level3：升级时记 wd_l3_total = 当时事件总数；此后仅当 当前总数 >= 已记水位 +
+      max_rounds 才再次升级。
+  首次升级（无水位记录）沿用原判据（cnt >= loop_limit / total >= max_rounds）。护栏不是
+  永久豁免：灌入新一窗口的 defect / 事件、到达新水位后仍会再次升级。
 """
 
 from __future__ import annotations
@@ -66,6 +79,29 @@ def _max_rounds(config: dict) -> int:
         return _DEFAULT_MAX_ROUNDS
 
 
+# ——————————————————————————————————————————————————————————————
+# R-T2 · C：升级水位（thread_meta 持久化）读写。键名固定，恢复/续跑一致。
+# ——————————————————————————————————————————————————————————————
+
+def _l2_watermark_key(sender: str, tgt: str) -> str:
+    """level2 每有序对一个水位键：wd_l2:{sender}:{tgt}。"""
+    return f"wd_l2:{sender}:{tgt}"
+
+
+_L3_WATERMARK_KEY = "wd_l3_total"
+
+
+def _read_watermark(store, key: str) -> int | None:
+    """读升级水位（thread_meta 存字符串）；缺失/非整数 → None（视为未升级过）。"""
+    v = store.get_meta(key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _defect_pair_counts(events: list[dict]) -> dict[tuple[str, str], int]:
     """从日志现数：同一有序对 (from→to) 的 **defect** 事件数（§5.3 互@环路）。
 
@@ -83,22 +119,45 @@ def _defect_pair_counts(events: list[dict]) -> dict[tuple[str, str], int]:
     return counts
 
 
+def _next_event_id(store) -> int:
+    """预测下一条 append_event 将分配的事件号 = 当前 max(id)+1（§7 读盘观察持久真相）。
+
+    §10 规定看门狗 gate_request 的 corr 缺省为 `gate-{事件号}`——corr 语义上等于事件号的
+    派生，须在**落盘该事件的同一步**写入 corr 列（否则 apply_gate_decision 按 corr 找不到
+    该 gate，人类无法越过，违反 §10）。单线程核心环内 append 之间无并发插入，故 max(id)+1
+    即下一号；这是从落盘序列**读**出的确定值、非猜测（§16.10：只查表数日志）。append 后
+    另有断言校验预测与实际一致，杜绝任何偏差。
+    """
+    return max((int(e["id"]) for e in store.events()), default=0) + 1
+
+
 def _raise_gate(store, *, body: str) -> int:
     """追加一条看门狗 gate_request(to=[human]) 并复用 M0 门禁机制挂起线程（§5.3/§10）。
 
     步骤（系统字段编排器权威赋值，§16.11）：
       ① append_event(sender='system', type='gate_request', to=['human'],
-         corr='gate-{事件号}')——落盘时为 human 生成一行 pending 派发；
+         corr='gate-{事件号}')——corr 在**落盘该事件时即写入 corr 列**（§10：corr 缺省由
+         编排器生成 `gate-{事件号}`），使 `orch approve <corr>` / apply_gate_decision 能按
+         corr 定位并越过该看门狗门禁（R-T2 · C：§10 无损续走的前提——旧实现只把 corr 记进
+         thread_meta、事件 corr 列为空 → 标准 approve 路径找不到，人类无法越过）；落盘时为
+         human 生成一行 pending 派发；
       ② 把该 human 派发行标 gate_wait（§10：target=human 的 pending → gate_wait）；
       ③ thread status → 'suspended'（挂起可整体停机，不消耗资源）。
-    corr 缺省由编排器生成 `gate-{事件号}`（§10）；先落盘取得事件号再回填 corr。
     返回 gate_request 事件 id。
     """
+    # §10：corr = gate-{事件号}，在落盘同一步写入 corr 列（预测号 = 落盘序列 max+1）。
+    predicted_id = _next_event_id(store)
+    corr = f"gate-{predicted_id}"
     gate_id = store.append_event(
-        sender="system", type="gate_request", body=body, to=["human"],
+        sender="system", type="gate_request", body=body, to=["human"], corr=corr,
     )
-    # §10：corr 缺省 → 编排器生成 gate-{事件号}。落盘后回填（不影响派发行）。
-    store.set_meta(f"gate_corr:{gate_id}", f"gate-{gate_id}")
+    # 防御：预测号必须与实际分配一致（单线程核心环内恒成立）；不一致即编排前提被破坏。
+    assert gate_id == predicted_id, (
+        f"看门狗 gate 事件号预测({predicted_id})与实际({gate_id})不符——"
+        f"核心环单线程前提被破坏"
+    )
+    # 兼容保留 thread_meta 映射（历史读取方；与事件 corr 列一致）。
+    store.set_meta(f"gate_corr:{gate_id}", corr)
     # ② human 派发行标 gate_wait；③ 线程挂起（§10）。
     store.mark_gate_wait(gate_id, "human")
     store.set_meta("status", "suspended")
@@ -149,33 +208,48 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
 
     events = store.events()
 
-    # —— 级别2：互@环路（同一有序对 defect 数 ≥ loop_limit）→ gate_request + suspend ——
+    # —— 级别2：互@环路（同一有序对 defect 数 ≥ 升级门限）→ gate_request + suspend ——
+    # R-T2 · C：门限随水位前移——无水位记录时门限=loop_limit（首次）；已记水位 wm 时
+    # 门限=wm+loop_limit（须再累积一整窗 defect 才再次升级）。升级时把当时计数落盘为新水位。
     loop_limit = _loop_limit(config)
     for (sender, tgt), cnt in _defect_pair_counts(events).items():
-        if cnt >= loop_limit:
+        wm = _read_watermark(store, _l2_watermark_key(sender, tgt))
+        threshold = loop_limit if wm is None else wm + loop_limit
+        if cnt >= threshold:
+            # 先记新水位（= 当时计数），再升级：即便升级后立即 approve→resume，下一轮
+            # check 读到 wm=cnt → 门限=cnt+loop_limit，同一 gate 不再复触发（§10 无损续走）。
+            store.set_meta(_l2_watermark_key(sender, tgt), str(cnt))
             gate_id = _raise_gate(
                 store,
                 body=(f"看门狗·互@环路：有序对 ({sender}→{tgt}) 的 defect 数达 {cnt}"
-                      f"（≥ loop_limit={loop_limit}），自动升级人类门禁（§5.3）"),
+                      f"（≥ 升级门限={threshold}，loop_limit={loop_limit}），"
+                      f"自动升级人类门禁（§5.3）"),
             )
             actions.append({
                 "level": 2, "pair": [sender, tgt], "count": cnt,
-                "loop_limit": loop_limit, "gate_id": gate_id,
+                "loop_limit": loop_limit, "threshold": threshold, "gate_id": gate_id,
             })
             return actions  # 挂起后停机，本轮不再检测其它级别（§10）。
 
-    # —— 级别3：全局轮数（事件总数 ≥ max_rounds）→ gate_request + suspend ——
+    # —— 级别3：全局轮数（事件总数 ≥ 升级门限）→ gate_request + suspend ——
+    # R-T2 · C：门限随水位前移——无水位记录时门限=max_rounds（首次）；已记水位 wm 时
+    # 门限=wm+max_rounds。升级时把当时事件总数落盘为新水位。approve→resume 后同一 gate
+    # 不复触发（下一轮 check 读回水位使门限前移，§10 无损续走）。
     max_rounds = _max_rounds(config)
     total = len(events)
-    if total >= max_rounds:
+    wm3 = _read_watermark(store, _L3_WATERMARK_KEY)
+    threshold3 = max_rounds if wm3 is None else wm3 + max_rounds
+    if total >= threshold3:
+        store.set_meta(_L3_WATERMARK_KEY, str(total))
         gate_id = _raise_gate(
             store,
-            body=(f"看门狗·全局轮数：线程事件总数达 {total}（≥ max_rounds={max_rounds}），"
+            body=(f"看门狗·全局轮数：线程事件总数达 {total}"
+                  f"（≥ 升级门限={threshold3}，max_rounds={max_rounds}），"
                   f"自动升级人类门禁（§5.3）"),
         )
         actions.append({
             "level": 3, "total": total, "max_rounds": max_rounds,
-            "gate_id": gate_id,
+            "threshold": threshold3, "gate_id": gate_id,
         })
         return actions
 

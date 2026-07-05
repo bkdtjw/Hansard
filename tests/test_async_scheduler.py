@@ -369,3 +369,74 @@ def test_register_async_job_does_not_block_run_thread_async(thread_dir):
         assert elapsed < 0.4, f"§5.2：register_async_job 应不阻塞主流，实测 {elapsed:.2f}s"
 
     asyncio.run(_run())
+
+
+# ==================================================================
+# R-T2 · D：async 路径 §5.1 原地重调**携带错误说明**（与 sync 同源同修）
+# ==================================================================
+
+class _AsyncRecordingScriptedAdapter:
+    """异步脚本化 adapter：按 call_no（从 1 起）回预置作者字段信封，逐次记录收到的 view 文本。"""
+
+    def __init__(self, role: str, replies: dict[int, dict]) -> None:
+        self.role = role
+        self.replies = dict(replies)
+        self.call_no = 0
+        self.view_texts: list[str] = []
+        self.caps = {"max_concurrent": 1}
+
+    async def ainvoke(self, view, sess):
+        self.call_no += 1
+        self.view_texts.append(str(view.get("text", "")))
+        raw = self.replies[self.call_no]
+        env = {k: raw[k] for k in
+               ("to", "type", "body", "artifacts", "corr", "blackboard_ops")
+               if k in raw}
+        return env, sess
+
+
+def test_async_schema_retry_view_carries_error_note_and_retries_once(thread_dir):
+    """R-T2 · D（async 同源同修）：async 路径 schema 校验失败也**携带错误说明**原地重调一次。
+
+    断言第二次 ainvoke 收到的视图含首次校验错误说明、且仅重调一次（call_no==2）。
+    """
+    import orch.protocol
+    from orch.scheduler.core import _RETRY_NOTE_HEADER
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    role = "backend"
+    st.append_event(sender="human", type="assign", body="kaigong", to=[role])
+
+    illegal_env = {"type": "assign", "body": "que to"}  # que required 'to'
+    expected_errors = orch.protocol.validate_author_fields(illegal_env)
+    assert expected_errors, "gou zao qian ti: illegal_env bi xu fei fa"
+
+    adapter = _AsyncRecordingScriptedAdapter(role, {
+        1: illegal_env,
+        2: {"to": ["human"], "type": "report", "body": "yi xiu zheng"},
+    })
+    cfg = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "roles": {role: {"can_decide": False, "write_scope": []}},
+    }
+
+    async def _run():
+        await orch.scheduler.run_thread_async(st, cfg, {role: adapter})
+
+    asyncio.run(_run())
+
+    assert adapter.call_no == 2, (
+        f"section 5.1 async retry once -> ainvoke should be called 2, got {adapter.call_no}"
+    )
+    first_view, second_view = adapter.view_texts[0], adapter.view_texts[1]
+    assert _RETRY_NOTE_HEADER not in first_view, "first view no retry note"
+    assert _RETRY_NOTE_HEADER in second_view, (
+        "section 5.1 async: retry view must append system retry note (with errors)"
+    )
+    assert expected_errors[0] in second_view, (
+        "section 5.1 async: retry view must carry concrete validation error text"
+    )
+    replies = [e for e in st.events() if e["from"] == role]
+    assert replies and replies[-1]["type"] == "report", "second legal reply should persist"

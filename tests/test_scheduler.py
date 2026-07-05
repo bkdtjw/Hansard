@@ -344,3 +344,125 @@ def test_sender_constraint_allows_legit_decision_from_can_decide_role(thread_dir
     # 合法路径不追加 §3.2 违规审计事件。
     assert not [e for e in evs if e["from"] == "system"], \
         "合法 decision 不应触发 §3.2 违规 system 审计事件"
+
+
+# ——————————————————————————————————————————————————————————————
+# R-T2 · D：§5.1 原地重调**携带错误说明**——schema 校验失败后，重调那一次的视图
+#   必须在指令尾追加系统重调说明段（含首次校验错误文本），且仍只重调一次（§5.1）。
+# ——————————————————————————————————————————————————————————————
+
+class _RecordingScriptedAdapter:
+    """脚本化 adapter：按 call_no（从 1 起）返回预置作者字段信封，并逐次记录收到的视图文本。
+
+    仅测试用（不入 src）：
+      - replies: {call_no: 作者字段信封}；缺项 → KeyError（暴露编排错误）。
+      - view_texts: 每次 invoke 收到的 view['text']（供断言"第二次视图含错误说明"）。
+    caps 属性供 async 路径限流读取；sync 路径不读。
+    """
+
+    caps = {"max_concurrent": 1}
+
+    def __init__(self, role: str, replies: dict[int, dict]) -> None:
+        self.role = role
+        self.replies = dict(replies)
+        self.call_no = 0
+        self.view_texts: list[str] = []
+
+    def invoke(self, view, sess):
+        self.call_no += 1
+        self.view_texts.append(str(view.get("text", "")))
+        raw = self.replies[self.call_no]
+        env = {k: raw[k] for k in
+               ("to", "type", "body", "artifacts", "corr", "blackboard_ops")
+               if k in raw}
+        return env, sess
+
+
+def _d_config(role: str) -> dict:
+    return {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "gate_ops": {},
+        "roles": {role: {"can_decide": False, "write_scope": [], "tools": []}},
+    }
+
+
+def test_schema_retry_view_carries_error_note_and_retries_once(thread_dir):
+    """R-T2 · D（§5.1，审计 §二 D）：第一次回非法信封 → 编排器**携带校验错误说明**原地
+    重调一次；第二次回合法信封通过。断言：
+
+      1) 第二次 invoke 收到的视图文本**包含**第一次的 schema 校验错误说明（含 header +
+         具体错误文本），而第一次视图不含（错误列表不再被弃置）；
+      2) 全程只重调一次（adapter 恰被调用两次，§5.1"对同一批次原地重调一次"）；
+      3) 最终合法回复正常落盘（type=report）。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    role = "backend"
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=[role])
+
+    # 计算第一次非法信封的确切校验错误文本，用于断言重调视图确实携带它。
+    illegal_env = {"type": "assign", "body": "缺少必填 to 字段"}  # 缺 required 'to'
+    expected_errors = orch.protocol.validate_author_fields(illegal_env)
+    assert expected_errors, "构造用例前提：illegal_env 必须真的非法（缺 to）"
+
+    adapter = _RecordingScriptedAdapter(role, {
+        1: illegal_env,
+        # 第二次合法：to=[human] 使回复落盘后主循环遇 human 即 suspend 干净停机。
+        2: {"to": ["human"], "type": "report", "body": "已修正并重发"},
+    })
+
+    orch.scheduler.run_thread(st, _d_config(role), {role: adapter})
+
+    # (2) 只重调一次：adapter 恰被调用两次。
+    assert adapter.call_no == 2, (
+        f"§5.1 只重调一次 → adapter 应恰被 invoke 两次，实际 {adapter.call_no}"
+    )
+    assert len(adapter.view_texts) == 2
+
+    first_view, second_view = adapter.view_texts[0], adapter.view_texts[1]
+
+    # (1) 第一次视图不含重调说明；第二次视图含说明 header + 具体错误文本。
+    from orch.scheduler.core import _RETRY_NOTE_HEADER
+    assert _RETRY_NOTE_HEADER not in first_view, "首次视图不应含重调说明段"
+    assert _RETRY_NOTE_HEADER in second_view, (
+        "§5.1：重调那一次的视图必须在指令尾追加系统重调说明段（含错误说明）"
+    )
+    # 具体校验错误文本被携带（取第一条错误的可辨识子串，避免措辞脆性）。
+    assert expected_errors[0] in second_view, (
+        f"§5.1：重调视图须携带**具体**校验错误文本；缺 {expected_errors[0]!r}。"
+        f"审计否定的旧行为是 last_errors 捕获后被弃置。"
+    )
+
+    # (3) 最终合法回复落盘（type=report），线程干净挂起。
+    replies = [e for e in st.events() if e["from"] == role]
+    assert replies and replies[-1]["type"] == "report", "第二次合法回复应正常落盘"
+
+
+def test_schema_retry_note_updates_token_estimate(thread_dir):
+    """R-T2 · D 附加：重调视图的 token 估算随说明段同步更新（§6.3 全系统一致口径）。
+
+    直接对 _view_with_retry_note 断言：新视图 token_est 严格大于原视图（追加了非空说明段），
+    且用 render.estimate_tokens 复算一致——证明"token 估算同步更新"，非仅拼文本。
+    """
+    from orch.scheduler.core import _view_with_retry_note
+    import orch.render
+
+    base_text = "=== 系统层 ===\n你是 backend。"
+    # 故意放一个**陈旧**的 token_est（999），证明修复后取的是对新文本的复算值、非陈旧值。
+    base_view = {"text": base_text, "meta": {"token_est": 999}}
+    errors = ["'to' is a required property"]
+    new_view = _view_with_retry_note(base_view, errors)
+
+    assert new_view["text"] != base_view["text"], "重调视图文本应已追加说明段"
+    assert errors[0] in new_view["text"], "重调视图须含具体错误文本"
+    recomputed = orch.render.estimate_tokens(new_view["text"])
+    assert new_view["meta"]["token_est"] == recomputed, (
+        "token 估算须与 render.estimate_tokens 对新文本复算一致（同步更新，非陈旧 999）"
+    )
+    # 同步更新的证据：新值 = 复算值，且严格大于对**原文本**的复算值（追加了非空说明段）。
+    assert new_view["meta"]["token_est"] > orch.render.estimate_tokens(base_text), (
+        "追加非空说明段后 token 估算（对新文本复算）应大于对原文本的复算值"
+    )
+    assert new_view["meta"]["token_est"] != 999, "不得沿用陈旧 token_est（须同步复算）"
+    # 原视图不被就地改动（浅拷贝隔离）。
+    assert base_view["meta"]["token_est"] == 999, "原视图 meta 不应被就地改动"

@@ -272,3 +272,140 @@ def test_watchdog_rounds_counted_from_log_not_persisted_counter(thread_dir):
     orch.scheduler.check_watchdogs(st, m1_config(max_rounds=6))
 
     assert _gate_requests_to_human(st), "仅凭日志事件条数即应触发级别3（轮数不落盘，§5.3）"
+
+
+# ==================================================================
+# R-T2 · C：升级去重（水位持久化 thread_meta）—— approve→resume 不复触发；
+#           灌入新一窗口后到达新水位仍会再次升级（护栏非永久豁免）。
+# ==================================================================
+
+def _latest_watchdog_gate(store) -> dict | None:
+    """取最后一条看门狗升级的 gate_request（sender='system', to=[human]）。"""
+    gate = None
+    for e in sorted(store.events(), key=lambda e: e["id"]):
+        if (e["type"] == "gate_request" and e.get("from") == "system"
+                and "human" in (e.get("to") or [])):
+            gate = e
+    return gate
+
+
+def _approve_watchdog_gate(store, config, gate) -> None:
+    """模拟人工 approve：走冻结的 apply_gate_decision（§10 `orch approve`）。
+
+    看门狗 gate 的 corr 记在 thread_meta（gate_corr:{id}，§10 corr 缺省 `gate-{事件号}`），
+    事件 corr 列为空——apply_gate_decision 经 _find_gate_request 的 meta 回填路径按此 corr
+    定位并越过（R-T2 · C 前提）。approve 后线程 resume（status='running'）。
+    """
+    corr = store.get_meta(f"gate_corr:{gate['id']}")
+    assert corr is not None, "看门狗 gate 应把 corr 记入 thread_meta（§10）"
+    orch.scheduler.apply_gate_decision(
+        store, config, {}, corr=corr, approve=True, sender="human",
+    )
+
+
+def test_watchdog_level2_no_retrigger_after_approve_resume(thread_dir):
+    """R-T2 · C：level2 升级 → approve → resume → 再跑 check_watchdogs **不复触发**同一 gate。
+
+    审计否定旧行为：approve→resume 后同一 gate 立即复触发，人类无法越过（违反 §10 续走）。
+    修复后：升级时把当时计数落盘为水位；下一轮门限前移一个 loop_limit → 同计数不再升级。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    cfg = m1_config(loop_limit=3)
+    seed_events(st, [
+        {"sender": "tester", "type": "defect", "to": ["backend"], "body": f"缺陷{i}"}
+        for i in range(3)
+    ])
+
+    # 首次升级：产生 gate + suspended。
+    orch.scheduler.check_watchdogs(st, cfg)
+    gate = _latest_watchdog_gate(st)
+    assert gate is not None, "level2 达阈值应升级 gate_request"
+    assert st.get_meta("status") == "suspended"
+    gate_count_before = len(_gate_requests_to_human(st))
+
+    # 人工 approve → resume（§10）。
+    _approve_watchdog_gate(st, cfg, gate)
+    assert st.get_meta("status") == "running", "approve 后线程应 resume（§10）"
+
+    # 再跑看门狗：defect 计数未变（仍 3）→ 门限已前移到 3+3=6 → **不复触发**。
+    orch.scheduler.check_watchdogs(st, cfg)
+    gate_count_after = len(_gate_requests_to_human(st))
+    assert gate_count_after == gate_count_before, (
+        "approve→resume 后同一 gate 不得复触发（R-T2 · C 升级去重；§10 无损续走）"
+    )
+    assert st.get_meta("status") == "running", "无损续走：不复触发时线程保持 running"
+
+
+def test_watchdog_level2_retriggers_at_new_watermark(thread_dir):
+    """R-T2 · C：护栏**非永久豁免**——灌入新一窗口 defect、到达新水位后仍再次升级。
+
+    首次升级水位=3；再累积到 6（>= 3+loop_limit=6）应再次升级。
+    """
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    cfg = m1_config(loop_limit=3)
+    seed_events(st, [
+        {"sender": "tester", "type": "defect", "to": ["backend"], "body": f"d{i}"}
+        for i in range(3)
+    ])
+
+    orch.scheduler.check_watchdogs(st, cfg)          # 首升，水位=3
+    gate1 = _latest_watchdog_gate(st)
+    _approve_watchdog_gate(st, cfg, gate1)           # resume
+    orch.scheduler.check_watchdogs(st, cfg)          # 计数仍3，不触发
+    assert st.get_meta("status") == "running"
+    n_after_first = len(_gate_requests_to_human(st))
+
+    # 灌入新一窗口 defect：同对再 +3 → 计数达 6 >= 水位3 + loop_limit3。
+    seed_events(st, [
+        {"sender": "tester", "type": "defect", "to": ["backend"], "body": f"d2-{i}"}
+        for i in range(3)
+    ])
+    orch.scheduler.check_watchdogs(st, cfg)
+    n_after_new_window = len(_gate_requests_to_human(st))
+    assert n_after_new_window == n_after_first + 1, (
+        "到达新水位（计数 6 ≥ 3+loop_limit）后护栏须再次升级（非永久豁免，R-T2 · C）"
+    )
+    assert st.get_meta("status") == "suspended", "再次升级后线程应重新 suspended"
+
+
+def test_watchdog_level3_no_retrigger_after_approve_resume(thread_dir):
+    """R-T2 · C：level3 升级 → approve → resume → 不复触发；到达新水位后仍再升级。"""
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    cfg = m1_config(max_rounds=5)
+    seed_events(st, [
+        {"sender": "backend", "type": "report", "to": ["moderator"], "body": f"r{i}"}
+        for i in range(5)
+    ])
+
+    orch.scheduler.check_watchdogs(st, cfg)   # total>=5 首升，水位=当时总数
+    gate = _latest_watchdog_gate(st)
+    assert gate is not None, "level3 达 max_rounds 应升级"
+    assert st.get_meta("status") == "suspended"
+    total_at_first = len(st.events())          # 含升级产生的 gate_request 事件
+    n_before = len(_gate_requests_to_human(st))
+
+    _approve_watchdog_gate(st, cfg, gate)      # resume（会追加 gate_decision 事件）
+    assert st.get_meta("status") == "running"
+
+    # 再跑：总数虽因 gate_request/gate_decision 略增，但门限已前移到 水位+max_rounds
+    # （水位≈total_at_first），当前总数远未达 → 不复触发。
+    orch.scheduler.check_watchdogs(st, cfg)
+    assert len(_gate_requests_to_human(st)) == n_before, (
+        "approve→resume 后 level3 同一 gate 不得复触发（R-T2 · C；§10 无损续走）"
+    )
+
+    # 灌入新一窗口事件，令总数达到 水位 + max_rounds → 再次升级（护栏非永久豁免）。
+    wm = int(st.get_meta("wd_l3_total"))
+    need = wm + 5 - len(st.events())
+    if need > 0:
+        seed_events(st, [
+            {"sender": "backend", "type": "report", "to": ["moderator"], "body": f"n{i}"}
+            for i in range(need)
+        ])
+    orch.scheduler.check_watchdogs(st, cfg)
+    assert len(_gate_requests_to_human(st)) == n_before + 1, (
+        "到达新水位（总数 ≥ 水位+max_rounds）后 level3 须再次升级（非永久豁免，R-T2 · C）"
+    )

@@ -24,6 +24,7 @@ from orch.scheduler._dispatch import session_rows
 from orch.scheduler.permissions import (
     audit_write_scope,
     autocommit,
+    head_sha,
     reset_hard,
 )
 from orch.scheduler.systemexec import (
@@ -38,6 +39,38 @@ _DEFAULT_TIMEOUT_S = 600.0
 
 # §5.1：schema 校验失败原地重调上限（两次仍败 → failed + 转 moderator）。
 _MAX_SCHEMA_RETRY = 1
+
+# R-T2 · D：schema 校验失败原地重调时，视图指令尾追加的"系统重调说明段"标题（§5.1
+# "携带错误说明对同一批次原地重调一次"）。放在视图文本最末（指令尾之后），保持 §6 五段
+# 结构不破坏——它是编排器在重调这一次追加的系统侧提示，非新的一层。
+_RETRY_NOTE_HEADER = "=== 系统重调说明（schema 校验失败，请修正后重发本次信封）==="
+
+
+def _view_with_retry_note(view: dict, errors: list[str]) -> dict:
+    """R-T2 · D：为"原地重调那一次"生成携带具体校验错误说明的视图（§5.1）。
+
+    在原视图 text 尾部追加一段系统重调说明（含第一次的 schema 校验错误文本），并同步更新
+    meta.token_est（§6.3 token 估算方法全系统一致，复用 render.estimate_tokens）。**不改**
+    event_ids（同一批次原地重调，mock 仍按触发号查表 → 仍只重调一次，§5.1）。返回浅拷贝，
+    不改动原 view（首次 invoke 用的是原 view，重调用带说明的新 view）。
+    """
+    new_view = dict(view)
+    base_text = str(view.get("text", ""))
+    err_lines = "\n".join(f"- {e}" for e in (errors or [])) or "- （无具体错误文本）"
+    note = (
+        f"{_RETRY_NOTE_HEADER}\n"
+        f"上一次回复未通过信封 schema 校验，错误如下：\n{err_lines}\n"
+        f"请据此修正，仅重发本次信封（字段 to / type / body / artifacts / corr / "
+        f"blackboard_ops），其余系统字段由编排器赋值。"
+    )
+    new_text = f"{base_text}\n\n{note}" if base_text else note
+    new_view["text"] = new_text
+    # token 估算同步更新（§6.3 全系统一致口径）。
+    meta = dict(view.get("meta") or {})
+    meta["token_est"] = orch.render.estimate_tokens(new_text)
+    meta["retry_note"] = True  # 观测点：本视图为携带错误说明的重调视图。
+    new_view["meta"] = meta
+    return new_view
 
 
 def _role_conf(config: dict, role: str) -> dict:
@@ -81,6 +114,27 @@ def _last_ok_commit(store, config: dict, role: str) -> str | None:
             return str(v)
     v = (config or {}).get("last_ok_commit")
     return str(v) if v else None
+
+
+def _ensure_audit_baseline(store, config: dict, role: str) -> None:
+    """R-T2 · E（§8.2 首轮审计兜底）：确保该角色审计恒有对齐点，消除首轮 fail-open。
+
+    仅当该角色**有 worktree**（CLI 型）且 store/config **均无** last_ok_commit 时生效：
+    在本轮 invoke 之前，取该 worktree 当前 HEAD sha（只查 git，§16.10 不猜测）落盘为
+    thread_meta 键 last_ok_commit:{role}。此后 _dispatch_group 的审计分支 `if last_ok_commit:`
+    恒为真、恒执行 → 首轮越权写入也被 diff 拦截（审计报告指出此前会漏网的场景）。
+
+    无 worktree（mock/API 型）→ no-op（保持 M0/M1 mock 绿）。HEAD 取不到（异常仓库）→
+    不落盘（审计仍 skip，但不引入错误对齐点）。已有 last_ok_commit → no-op（不覆盖既有对齐点）。
+    """
+    worktree_path = _role_worktree(config, role)
+    if worktree_path is None:
+        return
+    if _last_ok_commit(store, config, role):
+        return
+    sha = head_sha(worktree_path)
+    if sha:
+        store.set_meta(f"last_ok_commit:{role}", sha)
 
 
 def _timeout_for(config: dict, role: str) -> float:
@@ -270,6 +324,14 @@ def _handle_terminate(store, config: dict, term_event: dict) -> None:
     system 事件后立即把其派发行标 done（"建后即 done"），保持派发表整洁；不残留任何指向
     总结事件的 pending 行。
 
+    R-T2 · H（§5.4 忠实语义修复，审计 §二 H）：spec §5.4 只说终止"此后**拒绝新派发**"，
+    并未说要作废终止**前**既有的 pending 待办。旧实现把终止前所有 pending 一并 mark_done
+    （静默作废既有待办）超出字面语义（审计否定）。本函数据此改为：**只处理终止清算自身**——
+    落盘/复用总结事件、把总结事件**其自身**的派发行标 done、置 status=terminated；**不触碰**
+    终止前既有的其它 pending 派发行。terminated 线程凭 run_thread 顶部/组间的 status 判定
+    拒绝新派发（既有行为）；恢复算法（§9.1）对 terminated 线程不处理其 pending 的既有行为
+    亦保持不变。
+
     R-T1 崩溃安全 + 幂等（§4.4 间隙(1)/§9.1）：本函数的三步（append 总结 / mark_done /
     set status=terminated）不是单事务。若在 append 总结事件（其 append_event_post 钩子）
     与后续两步之间崩溃，盘上会留下：总结事件已落盘、其 moderator 派发行仍 pending、status
@@ -277,8 +339,9 @@ def _handle_terminate(store, config: dict, term_event: dict) -> None:
     → KeyError。修复：
       1) 总结事件带 re=[term_event.id] 标识血缘，可被 _find_terminate_summary 只查表定位；
       2) 本函数进入先查是否已存在总结事件——已存在则**复用**（不重复 append），只补做
-         mark_done + 清扫 pending + set status（幂等重入）。
+         其自身派发行 mark_done + set status（幂等重入）。
     这是通用规则（任何在此边界崩溃的轮都靠"查表复用总结事件"闭合），非对特定 seed 特判。
+    幂等重入只重标总结事件自身的派发行 done，仍不触碰终止前既有 pending（H 语义）。
     """
     term_id = int(term_event.get("id")) if term_event.get("id") is not None else None
 
@@ -328,16 +391,15 @@ def _handle_terminate(store, config: dict, term_event: dict) -> None:
     else:
         summary_id = int(existing["id"])
 
-    # 总结事件不留待办：其派发行立即标 done（"建后即 done"，契约 §3；幂等重复 SET 无副作用）。
+    # 总结事件不留待办：其**自身**派发行立即标 done（"建后即 done"，契约 §3；幂等重复
+    # SET 无副作用）。总结事件 to=[moderator] → 其派发行 (summary_id, 'moderator')。
     store.mark_done(summary_id, "moderator")
 
-    # §5.4 拒绝新派发 + 终态整洁：线程终止后不再消费任何 pending，把残留的 pending 派发行
-    # 一并标 done（终止前尚未被派发的待办作废——线程已终止，不会再处理它们）。总结事件的
-    # pending 上面已 done；此处清扫其余（如终止前未及处理的 handoff/report 等，含崩溃恢复后
-    # 残留的总结事件 pending 行）。
-    for row in store.pending_dispatches():
-        store.mark_done(int(row["event_id"]), row["target"])
-
+    # R-T2 · H（§5.4 忠实语义）：终止**只**清算自身（总结事件其自身派发行 done + 状态置
+    # terminated），**不触碰**终止前既有的其它 pending 派发行（旧实现一并 mark_done 是审计
+    # 否定的"静默作废既有待办"，超出 spec"此后拒绝新派发"字面语义）。terminated 线程凭
+    # run_thread 的 status 判定拒绝消费任何 pending（既有行为）；§9.1 恢复对 terminated
+    # 线程亦不处理其 pending。故此处不再遍历清扫其余 pending。
     store.set_meta("status", "terminated")
 
 
@@ -453,21 +515,33 @@ def _dispatch_group(
     for eid in event_ids:
         store.mark_dispatching(eid, target, deadline_ts)
 
+    # R-T2 · E（§8.2 首轮审计兜底，审计 §二 E）：worktree 存在但 store/config 均无
+    # last_ok_commit（该角色首轮、config 无兜底）时，旧实现 `if last_ok_commit:` 整段审计
+    # 跳过 → 首轮越权写入漏网（fail-open）。修复：在**本轮 invoke 之前**（agent 尚未写入）
+    # 取该 worktree 当前 HEAD sha 落盘为 last_ok_commit:{role}——只查 git、不猜测（§16.10）。
+    # 必须在 invoke 前捕获：invoke/autocommit 之后 HEAD 会含 agent 写入，届时再取会把越权
+    # 提交当成对齐点自 diff 自身（永远合规）。捕获后审计分支恒有对齐点、恒执行。
+    _ensure_audit_baseline(store, config, target)
+
     view = _assemble_view(store, config, target, event_ids)
     # 落 invoke log 用完整渲染视图文本（§14 / 契约 §4）；mock 仍按 view['event_ids'] 查表。
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
     # invoke + schema 校验（失败原地重调一次；两次败 → failed + 转 moderator，§5.1）。
+    # R-T2 · D：重调那一次**携带错误说明**——用 _view_with_retry_note 在指令尾追加系统
+    # 重调说明段（含首次校验错误文本），token 估算同步更新；event_ids 不变（仍只重调一次）。
     attempt = 0
     env: dict | None = None
     sess = None
     last_errors: list[str] = []
+    cur_view = view          # 首次用原视图；失败后切换为携带错误说明的重调视图。
+    cur_view_text = view_text
     while attempt <= _MAX_SCHEMA_RETRY:
-        raw_env, sess = adapter.invoke(view, sess)
-        # 审计原文（§14 一等公民）：view['text'] 完整渲染 + 输出原文。
+        raw_env, sess = adapter.invoke(cur_view, sess)
+        # 审计原文（§14 一等公民）：本次实际送出的视图文本 + 输出原文。
         store.write_invoke_log(
             event_ids=event_ids, role=target,
-            view_text=view_text, output_text=str(raw_env),
+            view_text=cur_view_text, output_text=str(raw_env),
         )
         errors = orch.protocol.validate_author_fields(raw_env)
         if not errors:
@@ -475,6 +549,9 @@ def _dispatch_group(
             break
         last_errors = errors
         attempt += 1
+        # §5.1：下一次（原地重调）视图携带本次校验错误说明。
+        cur_view = _view_with_retry_note(view, last_errors)
+        cur_view_text = str(cur_view.get("text", ""))
 
     if env is None:
         # 两次仍非法 → failed + system 事件转 moderator（§5.1）。

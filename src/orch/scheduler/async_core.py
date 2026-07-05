@@ -46,6 +46,7 @@ from orch.scheduler.core import (
     _apply_bb_if_eligible,
     _assemble_view,
     _enforce_sender_constraint,
+    _ensure_audit_baseline,
     _finalize_envelope,
     _group_pending,
     _handle_terminate,
@@ -54,6 +55,7 @@ from orch.scheduler.core import (
     _role_conf,
     _role_worktree,
     _timeout_for,
+    _view_with_retry_note,
     _write_scope,
 )
 from orch.scheduler.permissions import (
@@ -218,18 +220,25 @@ async def _dispatch_group_async(
             event_ids = merged_ids
         for eid in event_ids:
             store.mark_dispatching(eid, target, deadline_ts)
+        # R-T2 · E（§8.2 首轮审计兜底，与 core._dispatch_group 同源同修）：worktree 存在但
+        # 无 last_ok_commit 时，本轮 invoke 前取 HEAD 落盘为对齐点，使审计恒执行、拦首轮越权。
+        _ensure_audit_baseline(store, config, target)
         view = _assemble_view(store, config, target, event_ids)
 
     view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
     # invoke + schema 校验（原地重调一次；两次败 → failed + 转 moderator）
+    # R-T2 · D：与 core._dispatch_group 同源同修——重调那一次携带错误说明（_view_with_retry_note
+    # 在指令尾追加系统重调说明段，含首次校验错误文本，token 估算同步更新），event_ids 不变。
     attempt = 0
     env: dict | None = None
     sess = None
     last_errors: list[str] = []
+    cur_view = view          # 首次原视图；失败后切换为携带错误说明的重调视图。
+    cur_view_text = view_text
     while attempt <= _MAX_SCHEMA_RETRY:
         try:
-            raw_env, sess = await _invoke_adapter(adapter, view, sess)
+            raw_env, sess = await _invoke_adapter(adapter, cur_view, sess)
         except Exception as exc:
             # invoke 异常视为一次失败（不抛出，落盘）
             async with lock:
@@ -241,11 +250,11 @@ async def _dispatch_group_async(
                     to=["moderator"],
                 )
             return
-        # 审计原文
+        # 审计原文（本次实际送出的视图文本）
         async with lock:
             store.write_invoke_log(
                 event_ids=event_ids, role=target,
-                view_text=view_text, output_text=str(raw_env),
+                view_text=cur_view_text, output_text=str(raw_env),
             )
         errors = orch.protocol.validate_author_fields(raw_env)
         if not errors:
@@ -253,6 +262,9 @@ async def _dispatch_group_async(
             break
         last_errors = errors
         attempt += 1
+        # §5.1：下一次（原地重调）视图携带本次校验错误说明。
+        cur_view = _view_with_retry_note(view, last_errors)
+        cur_view_text = str(cur_view.get("text", ""))
 
     if env is None:
         async with lock:

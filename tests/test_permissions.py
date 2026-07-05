@@ -524,3 +524,135 @@ def test_last_ok_commit_read_prefers_store_over_config(tmp_dir):
         ev.get("from") == "backend" and ev.get("type") == "report"
         for ev in events
     ), "C-4：优先读 store 的对齐点 → 越权信封应被拒收，不入 events"
+
+
+# ==============================================================
+# (E) §8.2 首轮审计 fail-open 兜底（R-T2 · E，审计 §二 E）
+#     全新 worktree、store/config 均无 last_ok_commit 时，首轮越权写入此前会漏网
+#     （`if last_ok_commit:` 整段审计跳过）。修复后：调度层在首轮 invoke 前取 worktree
+#     HEAD 落盘为对齐点 → 审计恒执行 → 首轮越权也被拦截拒收 + reset + system 审计事件。
+# ==============================================================
+
+
+def test_scheduler_first_round_cross_scope_write_is_rejected_no_baseline(tmp_dir):
+    """R-T2 · E：**全新 worktree 首轮**就注入越权写入——审计恒执行、拦截拒收。
+
+    与既有 (d) 用例的关键区别：cfg **不塞** last_ok_commit，store 也无
+    last_ok_commit:{role}（模拟角色首轮、config 无兜底）。这正是审计报告指出此前会
+    **漏网**的场景（旧实现 `if last_ok_commit:` 为 None → 整段审计 skip）。修复后：
+    调度层在首轮 invoke 前取该 worktree HEAD 落盘为对齐点，使审计恒有对齐点、恒执行。
+
+    断言：
+      (i)  越权信封被整体拒收，不入 events；
+      (ii) worktree 已 git reset --hard（HEAD 回到首轮前的对齐点，越权文件消失）；
+      (iii) 追加了一条 system 审计事件转 moderator；
+      (iv) 兜底对齐点已落盘（last_ok_commit:backend 存在，= 首轮前 HEAD）。
+    """
+    target = _init_target_repo(tmp_dir / "target")
+    thread_dir = tmp_dir / "t-e1"
+    store = _init_thread(thread_dir)
+
+    wt = _make_worktree(target, "te1-backend")
+    base = _git(wt, "rev-parse", "HEAD").strip()
+
+    def _cross_scope_side_effect(worktree: Path):
+        (worktree / "web").mkdir(exist_ok=True)
+        (worktree / "web" / "index.html").write_text("<pwn/>", encoding="utf-8")
+
+    cfg = _m2_config(target)
+    # 关键：不塞 last_ok_commit（生产首轮无对齐点）。
+    assert "last_ok_commit" not in cfg
+    cfg.setdefault("worktrees", {})["backend"] = str(wt)
+    # store 也无 last_ok_commit:backend（首轮）。
+    assert store.get_meta("last_ok_commit:backend") is None
+
+    ad = FakeCliAdapter(
+        role="backend",
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
+        worktree=wt,
+        scripted_replies={1: {"to": ["pm"], "type": "report", "body": "done"}},
+        inject_side_effect=_cross_scope_side_effect,
+    )
+    moderator = FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_replies={1: {"to": [], "type": "terminate", "body": "audit done"}},
+    )
+
+    orch.scheduler.run_thread(store, cfg, {"backend": ad, "moderator": moderator})
+
+    events = store.events()
+    # (i) 越权信封不落盘。
+    assert not any(
+        ev.get("from") == "backend" and ev.get("type") == "report"
+        for ev in events
+    ), "R-T2 · E：首轮越权信封应被整体拒收，不入 events（此前 fail-open 会漏网）"
+
+    # (ii) worktree 已 reset 回首轮前对齐点（= base HEAD），越权文件消失。
+    head_now = _git(wt, "rev-parse", "HEAD").strip()
+    assert head_now == base, (
+        "R-T2 · E：首轮越权后必须 git reset --hard 回本轮前对齐点（HEAD）"
+    )
+    assert not (wt / "web" / "index.html").exists(), (
+        "R-T2 · E：reset --hard 后越权注入的 web/index.html 应被清除"
+    )
+
+    # (iii) 追加 system 审计事件转 moderator。
+    audit_events = [
+        ev for ev in events
+        if ev.get("from") == "system" and "moderator" in (ev.get("to") or [])
+        and ("越权" in ev.get("body", "") or "write_scope" in ev.get("body", ""))
+    ]
+    assert audit_events, "R-T2 · E：首轮越权也应追加 system 审计事件转 moderator"
+
+    # (iv) 兜底对齐点已落盘（= 首轮前 HEAD）。
+    stored = store.get_meta("last_ok_commit:backend")
+    assert stored == base, (
+        "R-T2 · E：调度层应在首轮 invoke 前把 worktree HEAD 落盘为对齐点；"
+        f"实际 store 记 {stored!r}，期望 {base!r}"
+    )
+
+
+def test_scheduler_first_round_in_scope_write_accepted_no_baseline(tmp_dir):
+    """R-T2 · E 反向对照：全新 worktree 首轮**合规**写入不得被误拒。
+
+    证明兜底对齐点不会把合规首轮也当越权：backend 首轮只写 server/（write_scope 内）→
+    审计通过、report 正常落盘。
+    """
+    target = _init_target_repo(tmp_dir / "target")
+    thread_dir = tmp_dir / "t-e2"
+    store = _init_thread(thread_dir)
+
+    wt = _make_worktree(target, "te2-backend")
+
+    def _in_scope(worktree: Path):
+        (worktree / "server" / "impl.py").write_text("ok=1\n", encoding="utf-8")
+
+    cfg = _m2_config(target)
+    assert "last_ok_commit" not in cfg
+    cfg.setdefault("worktrees", {})["backend"] = str(wt)
+
+    ad = FakeCliAdapter(
+        role="backend",
+        config={"kind": "cli", "start_cmd": "fake", "timeout_s": 10},
+        worktree=wt,
+        scripted_replies={1: {"to": ["pm"], "type": "report", "body": "done"}},
+        inject_side_effect=_in_scope,
+    )
+    pm = FakeApiAdapter(
+        role="pm", config={"kind": "api"},
+        scripted_replies={1: {"to": [], "type": "chat", "body": "acked"}},
+    )
+    moderator = FakeApiAdapter(
+        role="moderator", config={"kind": "api"},
+        scripted_replies={1: {"to": [], "type": "terminate", "body": "done"}},
+    )
+
+    orch.scheduler.run_thread(
+        store, cfg, {"backend": ad, "moderator": moderator, "pm": pm}
+    )
+
+    events = store.events()
+    assert any(
+        ev.get("from") == "backend" and ev.get("type") == "report"
+        for ev in events
+    ), "R-T2 · E 反向：首轮合规写入下 backend 的 report 应正常落盘（兜底不误拒）"
