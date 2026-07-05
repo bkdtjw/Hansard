@@ -19,6 +19,62 @@ import time
 from pathlib import Path
 
 # ——————————————————————————————————————————————————————————————
+# 故障注入（M4 契约 §1；生产路径零开销：仅当 _CURRENT_FAULT 非 None 时激活）
+# ——————————————————————————————————————————————————————————————
+
+class FaultInjector:
+    """在指定 site 的第 N 次调用时抛 SystemExit(137)（模拟 SIGKILL）。
+
+    fault_map: {site_name: count}
+      - site_name 与 store 关键落盘点的检查点参数对应。
+      - count=N 表示"第 N 次 check(site) 命中即抛"；前 N-1 次静默通过。
+      - count=0 视为立即触发（首次 check(site) 命中即抛）。
+    未在 fault_map 中出现的 site 一律直接返回，不影响正常路径。
+    """
+
+    def __init__(self, fault_map: dict[str, int]) -> None:
+        # 保存目标次数（拷贝防止外部改动）。
+        self._targets: dict[str, int] = dict(fault_map or {})
+        # 每个 site 独立计数（当前已 check 的次数）。
+        self._counters: dict[str, int] = {}
+
+    def check(self, site: str) -> None:
+        if site not in self._targets:
+            return
+        # 命中语义：
+        #   target=0 → 首次 check 即抛（"立即触发"）
+        #   target=N (N>=1) → 第 N 次 check 抛
+        target = self._targets[site]
+        cur = self._counters.get(site, 0) + 1
+        self._counters[site] = cur
+        if target == 0 or cur == target:
+            raise SystemExit(137)
+
+
+# 全局单例：None 表示未装载注入器；生产路径 _fault_check 直接短路返回。
+_CURRENT_FAULT: FaultInjector | None = None
+
+
+def set_fault_injector(fj: FaultInjector | None) -> None:
+    """装载 / 清除全局故障注入器。fj=None 清除。"""
+    global _CURRENT_FAULT
+    _CURRENT_FAULT = fj
+
+
+def clear_fault_injector() -> None:
+    """显式清除（等价 set_fault_injector(None)）。"""
+    global _CURRENT_FAULT
+    _CURRENT_FAULT = None
+
+
+def _fault_check(site: str) -> None:
+    """关键落盘点内嵌调用；未注入时零开销直接返回。"""
+    if _CURRENT_FAULT is None:
+        return
+    _CURRENT_FAULT.check(site)
+
+
+# ——————————————————————————————————————————————————————————————
 # 常量：DDL 与门槛
 # ——————————————————————————————————————————————————————————————
 
@@ -172,6 +228,8 @@ class Store:
         except BaseException:
             self._con.rollback()
             raise
+        # §4.4 事务(1) 提交后：故障注入点（模拟 kill -9）。
+        _fault_check("append_event_post")
         return event_id
 
     def pending_dispatches(self) -> list[dict]:
@@ -196,6 +254,8 @@ class Store:
         except BaseException:
             self._con.rollback()
             raise
+        # §4.4 事务(2) 提交后：故障注入点。
+        _fault_check("mark_dispatching_post")
 
     # ——————————————————————————————————————————————————————
     # §4.4 事务(5)：回复落盘 + 标 done + 会话表（单事务）
@@ -290,6 +350,8 @@ class Store:
         except BaseException:
             self._con.rollback()
             raise
+        # §4.4 事务(5) 提交后：故障注入点。
+        _fault_check("reply_and_done_post")
         return reply_id
 
     # ——————————————————————————————————————————————————————

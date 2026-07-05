@@ -1,0 +1,178 @@
+"""M4-T1 · 混沌 harness 测试（先行见红）。
+
+覆盖任务卡条目 (b)：
+  - `orch.chaos.ChaosHarness`（或 `orch.chaos.run_chaos`）：
+      · 输入 = 附录B mock fixture（tests/fixtures/like_feature.yaml）；
+      · 注入点覆盖 §4.4 五个间隙 + 纯随机；
+      · 每轮 kill 后重启（新 Store 实例）走 `orch.scheduler.recover` 续跑至 terminate；
+      · 返回 `ChaosReport{rounds, passed, failed_seeds, ledger_ok, terminal_ok}`。
+  - 硬门槛（M4 契约 §5）：≥50 轮的严格验收由 T5 跑；本卡快跑 `rounds=3`。
+
+约束（CLAUDE.md）：
+  - 顶层只 `import orch.chaos`；符号在函数体内引用（未实现 → AttributeError）。
+  - 断言"通过率 100% 于当前 rounds"（3 轮）；不弱化：与 spec §9.4 "mock 层 100%"一致。
+  - 不真跑子进程；harness 使用 fixture 里已冻结的 MockAdapter 脚本，注入点靠 §4.4 钩子。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+# 顶层只 import 包/模块；具体符号在函数体内引用（AttributeError → 红）。
+import orch
+
+
+# ==================================================================
+# (b-1) orch.chaos 模块存在且导出 ChaosHarness
+# ==================================================================
+
+def test_chaos_module_exports_harness():
+    """`orch.chaos` 应存在且导出 ChaosHarness 类（M4 契约 §2）。"""
+    import orch.chaos  # noqa: F401
+    assert hasattr(orch.chaos, "ChaosHarness"), (
+        "M4 契约 §2：orch.chaos 应导出 ChaosHarness"
+    )
+
+
+# ==================================================================
+# (b-2) ChaosReport 具备五个必需字段（rounds/passed/failed_seeds/ledger_ok/terminal_ok）
+# ==================================================================
+
+def test_chaos_report_has_required_fields(tmp_dir, like_feature_script):
+    """M4 契约 §2：ChaosReport 必须含 rounds / passed / failed_seeds /
+    ledger_ok / terminal_ok 五字段。快跑 rounds=3。"""
+    import orch.chaos
+
+    ws = tmp_dir / "chaos-ws"
+    ws.mkdir()
+
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws,
+        script=like_feature_script,
+        seed=1,
+    )
+    report = harness.run(rounds=3)
+
+    # 允许 dataclass / dict / TypedDict 三形之一；用 getattr 兼容。
+    def _f(obj, name):
+        if isinstance(obj, dict):
+            assert name in obj, f"ChaosReport 缺字段 {name!r}: {obj!r}"
+            return obj[name]
+        assert hasattr(obj, name), f"ChaosReport 缺字段 {name!r}: {obj!r}"
+        return getattr(obj, name)
+
+    assert _f(report, "rounds") == 3
+    # passed 至少存在（数值型）；本卡不硬性锁死 == 3 —— 门槛判定见 (b-4)。
+    _ = _f(report, "passed")
+    _ = _f(report, "failed_seeds")
+    _ = _f(report, "ledger_ok")
+    _ = _f(report, "terminal_ok")
+
+
+# ==================================================================
+# (b-3) 注入点覆盖 §4.4 五个间隙 + 纯随机（共 6 种模式，harness 内部轮转）
+# ==================================================================
+
+def test_chaos_harness_covers_five_gaps_plus_random(tmp_dir, like_feature_script):
+    """M4 契约 §2：注入点必须覆盖 §4.4 五间隙 + 纯随机（共 6 种模式）。
+
+    harness 应对外暴露 `INJECTION_SITES`（或等价常量）—— 长度必须 ≥ 6，
+    且包含五个 §4.4 site 与 "random" 关键字。
+    """
+    import orch.chaos
+
+    sites = getattr(orch.chaos, "INJECTION_SITES", None)
+    if sites is None:
+        # 允许在 ChaosHarness 类上暴露。
+        sites = getattr(orch.chaos.ChaosHarness, "INJECTION_SITES", None)
+    assert sites is not None, (
+        "orch.chaos 应对外暴露 INJECTION_SITES（覆盖 §4.4 五间隙 + random）"
+    )
+    site_set = {str(s) for s in sites}
+    expected_gap_sites = {
+        "append_event_post",
+        "mark_dispatching_post",
+        "invoke_post",
+        "autocommit_post",
+        "reply_and_done_post",
+    }
+    missing = expected_gap_sites - site_set
+    assert not missing, f"缺 §4.4 注入点：{missing}"
+    assert any("random" in s for s in site_set), "应含纯随机注入模式"
+
+
+# ==================================================================
+# (b-4) rounds=3 快跑：ledger 无重复事件号 + 终态与不中断基准一致
+# ==================================================================
+
+def test_chaos_harness_rounds3_passes(tmp_dir, like_feature_script):
+    """rounds=3 快跑：mock 层 100% 通过（passed == rounds）；
+    ledger_ok / terminal_ok 均 True（§9.4 mock 层校验）。"""
+    import orch.chaos
+
+    ws = tmp_dir / "chaos-ws"
+    ws.mkdir()
+
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws,
+        script=like_feature_script,
+        seed=42,
+    )
+    report = harness.run(rounds=3)
+
+    def _f(obj, name):
+        return obj[name] if isinstance(obj, dict) else getattr(obj, name)
+
+    assert _f(report, "rounds") == 3
+    assert _f(report, "passed") == 3, (
+        f"快跑 3 轮应 100% 通过；failed_seeds={_f(report, 'failed_seeds')}"
+    )
+    assert _f(report, "failed_seeds") == [] or _f(report, "failed_seeds") == (), (
+        f"快跑 3 轮不应有失败种子：{_f(report, 'failed_seeds')}"
+    )
+    assert _f(report, "ledger_ok") is True, "mock ledger 应无重复事件号（§9.4）"
+    assert _f(report, "terminal_ok") is True, "终态应与不中断基准一致（§9.4）"
+
+
+# ==================================================================
+# (b-5) 每轮 kill 后必须"新 Store 实例走 recover"续跑至 terminate
+# ==================================================================
+
+def test_chaos_harness_each_round_reaches_terminate(tmp_dir, like_feature_script):
+    """每轮不论从哪个注入点崩溃，最终线程 status 必须到达 'terminated'。
+
+    这是 §9.4 mock 层"kill 后重启续跑至终止"的直接可观察证据：
+    harness 在完成某轮后，workspace 下该轮线程目录的 thread_meta.status
+    应为 'terminated'（否则该轮判 failed）。
+    """
+    import orch.chaos
+    import orch.store
+
+    ws = tmp_dir / "chaos-ws"
+    ws.mkdir()
+
+    harness = orch.chaos.ChaosHarness(
+        workspace=ws,
+        script=like_feature_script,
+        seed=7,
+    )
+    report = harness.run(rounds=3)
+
+    def _f(obj, name):
+        return obj[name] if isinstance(obj, dict) else getattr(obj, name)
+
+    assert _f(report, "passed") == 3
+
+    # 每轮应有一个独立线程目录；逐个校验 status='terminated'。
+    thread_dirs = sorted(p for p in ws.iterdir() if p.is_dir() and p.name.startswith("t-"))
+    assert len(thread_dirs) >= 3, (
+        f"应至少产生 3 个线程目录（每轮一个）：实际 {len(thread_dirs)}"
+    )
+    for tdir in thread_dirs[:3]:
+        st = orch.store.Store(tdir)
+        status = st.get_meta("status")
+        assert status == "terminated", (
+            f"{tdir.name}: 混沌恢复后线程必须到达 terminated；实测 status={status!r}"
+        )
