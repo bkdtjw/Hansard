@@ -21,6 +21,11 @@ import orch.render
 import orch.store
 
 from orch.scheduler._dispatch import session_rows
+from orch.scheduler.permissions import (
+    audit_write_scope,
+    autocommit,
+    reset_hard,
+)
 from orch.scheduler.systemexec import (
     append_system_event,
     run_privileged_and_callbacks,
@@ -37,6 +42,45 @@ _MAX_SCHEMA_RETRY = 1
 
 def _role_conf(config: dict, role: str) -> dict:
     return (config.get("roles") or {}).get(role, {}) or {}
+
+
+def _role_worktree(config: dict, role: str):
+    """M2：从 config['worktrees'][role] 读该角色的 worktree 路径（M2 契约 §3）。
+
+    M0/M1 mock 语境不设 worktrees → 返回 None → 三件套整体 skip（保 127 绿）。
+    """
+    from pathlib import Path
+    wts = (config or {}).get("worktrees") or {}
+    p = wts.get(role)
+    if not p:
+        return None
+    return Path(p)
+
+
+def _write_scope(config: dict, role: str) -> list[str]:
+    """§8.2 审计所需的写域申报（M2 契约 §5，roles[role].write_scope）。"""
+    return list(_role_conf(config, role).get("write_scope") or [])
+
+
+def _last_ok_commit(store, config: dict, role: str) -> str | None:
+    """§8.2 审计所需的对齐点：上个合法 commit（生产回路，C-4 修复）。
+
+    读取顺序：
+      1) store.get_meta(f"last_ok_commit:{role}") —— 前一轮 autocommit 成功后回写的 sha
+         （见 _dispatch_group 中的 `store.set_meta`；避免生产路径依赖外部补丁 config[…]）；
+      2) config['last_ok_commit'] —— 兜底，供测试/首轮无 store 记录时使用。
+
+    未提供则返回 None → 审计跳过（无对齐点无法执行 diff）；autocommit 仍会执行。
+    """
+    if store is not None:
+        try:
+            v = store.get_meta(f"last_ok_commit:{role}")
+        except Exception:
+            v = None
+        if v:
+            return str(v)
+    v = (config or {}).get("last_ok_commit")
+    return str(v) if v else None
 
 
 def _timeout_for(config: dict, role: str) -> float:
@@ -355,6 +399,49 @@ def _dispatch_group(
             to=["moderator"],
         )
         return False
+
+    # ————————————————————————————————————————————————————————
+    # §4.5 + §8.2 权限三件套接入：仅当该角色有 worktree 时启用（M0/M1 mock skip）。
+    # 顺序（spec §5.1 伪代码 (4)）：autocommit → audit_write_scope → 违规拒收+reset+审计。
+    # ————————————————————————————————————————————————————————
+    worktree_path = _role_worktree(config, target)
+    if worktree_path is not None:
+        # 生产回路（C-4）：先读 store 里的 last_ok_commit:{role}（前一轮 autocommit 回写），
+        # 再兜底 config。审计与 reset 都用同一对齐点（读→审计→reset 前不重取，避免刚
+        # 落盘的新 sha 被当成对齐点自 diff 自身，永远合规）。
+        last_ok_commit = _last_ok_commit(store, config, target)
+        # 用本批最大 event_id 命名 commit（同批一次 invoke，一次 wip 提交，§4.5）。
+        commit_evt = max(event_ids)
+        new_sha = autocommit(worktree_path, role=target, event_id=commit_evt)
+
+        if last_ok_commit:
+            ok, violations = audit_write_scope(
+                worktree_path, _write_scope(config, target), last_ok_commit,
+            )
+            if not ok:
+                # §8.2 违规处理：整体拒收该信封 + git reset --hard {last_ok_commit} +
+                # 追加 system 审计事件转 moderator（简化决策，不做部分裁剪）。
+                # last_ok_commit 是 store/config 里已经确定合法的对齐点，与刚才 autocommit
+                # 的 new_sha 无关；不把 new_sha 回写 store（越权提交作废）。
+                reset_hard(worktree_path, last_ok_commit)
+                for eid in event_ids:
+                    store.mark_failed(eid, target)
+                append_system_event(
+                    store,
+                    body=(
+                        f"§8.2 write_scope 越权：role={target} "
+                        f"E{event_ids} audit rejected，越权路径={violations}；"
+                        f"已 git reset --hard 到 {last_ok_commit}。"
+                    ),
+                    to=["moderator"],
+                )
+                return False
+
+        # C-4 生产回路：越权拒收路径已 return False；能走到这里 = 审计合规（或对齐点缺失
+        # 跳过审计的骨架状态）。若本轮 autocommit 产出了新 sha，把它回写 store，作为下一轮
+        # audit 的对齐点（不改 spec DDL，用现有 thread_meta 表，键名 last_ok_commit:{role}）。
+        if new_sha:
+            store.set_meta(f"last_ok_commit:{target}", new_sha)
 
     # 定稿信封：系统字段 from + §8.3 verify 钩子（含 acceptance 降级）。
     reply = _finalize_envelope(store, config, target, env)
