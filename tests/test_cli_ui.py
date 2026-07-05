@@ -356,3 +356,103 @@ def test_cli_chat_renders_events_as_chat(tmp_dir):
     assert ("human" in r.output.lower() or "[human" in r.output.lower())
     assert "pm" in r.output.lower()
     assert "启动一下" in r.output
+
+
+# ——————————————————————————————————————————————————————————————
+# (C-2) orch run：常驻调度进程（spec §12 明列）
+# ——————————————————————————————————————————————————————————————
+#
+# 三维评审 C-2：spec §12 + M2 契约 §5 明列 `orch run` 常驻命令；`orch stop`
+# 写 orch.stop 标志文件但**无人读**（无 run 进程消费）。修复：新增 `orch run
+# --workspace <ws> [--once]` 命令，装配默认 Fake adapters 跑一轮 run_thread；
+# 若 orch.stop 标志存在则立即 return，且**消费**掉该标志（避免下次启动误触发）。
+# ——————————————————————————————————————————————————————————————
+
+
+def _seed_thread_with_pending(workspace: Path) -> tuple[str, "orch.store.Store"]:
+    """辅助：workspace 下建一条线程 + 一条 pending 事件供 orch run 消费。"""
+    app = _get_app()
+    _runner().invoke(app, [
+        "new", "run-once test", "--roles", "pm,moderator",
+        "--workspace", str(workspace),
+    ])
+    tid = next(p.name for p in workspace.iterdir()
+               if p.is_dir() and p.name.startswith("t-"))
+    store = orch.store.Store(workspace / tid)
+    return tid, store
+
+
+def test_cli_run_once_processes_pending_and_updates_status(tmp_dir):
+    """§12 orch run：`orch run --workspace <ws> --once` 应装配默认 Fake adapters
+    跑一轮 run_thread → 消费 pending 派发行 → 线程 status 从 running 变化
+    （或至少 pending 数量下降，或线程被显式挂起/终止）。
+
+    骨架允许两种落地方式：
+      · 默认 fake：`orch new` 后 pending 会被处理（Fake* 恒回 chat 型信封），
+        因此断言：exit 0 + 有至少一次 pending 消费的可观察副作用（events 数增加
+        或 pending 数下降或状态变更）。
+    """
+    app = _get_app()
+    tid, store_before = _seed_thread_with_pending(tmp_dir)
+    events_before = len(store_before.events())
+    pending_before = len(store_before.pending_dispatches())
+    assert pending_before >= 1, "预置：应至少有 1 条 pending 供 run 消费"
+
+    r = _runner().invoke(app, [
+        "run", "--workspace", str(tmp_dir), "--once",
+    ])
+    assert r.exit_code == 0, r.output
+
+    # run --once 应至少：跑一轮 run_thread → 有可观察副作用（events 增或 pending 减
+    # 或 status 已流转到 suspended/terminated）。
+    store_after = orch.store.Store(tmp_dir / tid)
+    events_after = len(store_after.events())
+    pending_after = len(store_after.pending_dispatches())
+    status_after = store_after.get_meta("status")
+    assert (
+        events_after > events_before
+        or pending_after < pending_before
+        or status_after in ("suspended", "terminated")
+    ), (
+        f"orch run --once 应消费至少一条 pending：events {events_before}→{events_after}, "
+        f"pending {pending_before}→{pending_after}, status={status_after}"
+    )
+
+
+def test_cli_run_respects_stop_flag_and_consumes_it(tmp_dir):
+    """§12 orch stop + orch run：orch.stop 标志存在时 `orch run` 立即退出，
+    且**消费**该标志（删除/移动/带时间戳后缀等）——避免下次启动被历史标志误停。
+
+    契约：
+      · run 检测到 orch.stop 存在 → 立即 return 0，不做任何 pending 消费。
+      · 退出后 orch.stop 标志应被清理（不再存在于原路径），保证 stop 语义为
+        "一次性触发"，而非"永久停机"。
+    """
+    app = _get_app()
+    tid, store_before = _seed_thread_with_pending(tmp_dir)
+    pending_before = len(store_before.pending_dispatches())
+    assert pending_before >= 1
+
+    # 先 orch stop 写标志。
+    r_stop = _runner().invoke(app, ["stop", "--workspace", str(tmp_dir)])
+    assert r_stop.exit_code == 0, r_stop.output
+    marker = tmp_dir / "orch.stop"
+    assert marker.exists(), "orch stop 应先写 orch.stop 标志"
+
+    # 再 orch run：应立即退出，不消费 pending。
+    r_run = _runner().invoke(app, [
+        "run", "--workspace", str(tmp_dir), "--once",
+    ])
+    assert r_run.exit_code == 0, r_run.output
+
+    store_after = orch.store.Store(tmp_dir / tid)
+    pending_after = len(store_after.pending_dispatches())
+    assert pending_after == pending_before, (
+        f"orch.stop 标志存在时 orch run 应立即退出，不消费 pending；"
+        f"实际 pending {pending_before}→{pending_after}"
+    )
+    # 标志已被消费（不再存在），下次 run 不会被历史 stop 误触发。
+    assert not marker.exists(), (
+        "orch run 检测到 orch.stop 后应消费该标志（删除），"
+        "避免下次 run 被历史 stop 误触发。"
+    )

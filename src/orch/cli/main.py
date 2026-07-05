@@ -1,6 +1,7 @@
 """用户界面 CLI（spec §12 子集，M2-T4）。
 
 typer 单文件实现，命令与 spec §12 表一致：
+  orch run [--once]                     启动调度进程（常驻；--once 一次循环退出）
   orch new "任务" --roles r1,r2,...     建线程：目录 / db + E1 入队
   orch send t-xxx "..." [--to role]     人类发言入队
   orch chat t-xxx [--follow]            事件日志渲染成群聊
@@ -14,6 +15,8 @@ typer 单文件实现，命令与 spec §12 表一致：
 【M2 骨架边界】
   - worktrees / 权限 三件套由 T3 落地；本层新建 workspace/t-xxx/{events.db, blackboard, logs}。
   - --follow 用轮询而非 tail -f（本层为 M2 骨架，M3 完善）。
+  - `orch run` 骨架：默认装配 Fake adapters（陪跑接入真实 CLI/API 属 §17 开放决策），
+    只做常驻循环骨架 + orch.stop 消费。真实 CLI/API 由 config 覆盖（M3 完善）。
   - 各命令的具体 flag 措辞取自 spec §12 表 + M2 契约 §5；与真实 CLI 的 flag 联跑差异属 §17
     开放决策（升级 QUESTIONS.md）。
 """
@@ -86,6 +89,145 @@ def _find_thread_dirs(workspace: Path) -> list[Path]:
 
 def _echo(msg: str) -> None:
     typer.echo(msg)
+
+
+# ——————————————————————————————————————————————————————————————
+# orch run（spec §12：启动调度进程；C-2 修复）
+# ——————————————————————————————————————————————————————————————
+
+def _thread_roles(store: "orch.store.Store") -> list[str]:
+    """从 thread_meta.roles（JSON 字符串，由 orch new 写入）读回角色列表。"""
+    raw = store.get_meta("roles")
+    if not raw:
+        return []
+    try:
+        rs = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return [str(r) for r in rs if isinstance(r, str)]
+
+
+def _build_default_adapters(roles: list[str]) -> dict:
+    """M2 骨架默认适配器装配（陪跑事项属 §17；此处为 orch run 命令的默认 Fake 骨架）。
+
+    策略（有意保守，仅用于 --once 与冒烟）：
+      · 非 moderator 角色 → FakeApiAdapter 回一条 chat/report/handoff 型，目的地 moderator，
+        让编排环有推进但不循环无限；
+      · moderator → FakeApiAdapter 首次回 terminate（moderator 允许 terminate，§3.2），
+        使 run_thread 在一轮内自然结束。
+
+    真实 CLI/API 装配（read start_cmd/api_key/tools 等）属 M3 完善 + 陪跑联跑，
+    本函数只提供最小可运行骨架，测试与冒烟走 Fake（M2 契约 §6 明列）。
+    """
+    from orch.adapters import FakeApiAdapter
+
+    adapters: dict = {}
+    for role in roles:
+        if role == "moderator":
+            adapters[role] = FakeApiAdapter(
+                role=role,
+                config={"kind": "api"},
+                scripted_reply={
+                    "type": "terminate", "to": [], "body": "run --once done",
+                },
+            )
+        else:
+            adapters[role] = FakeApiAdapter(
+                role=role,
+                config={"kind": "api"},
+                scripted_reply={
+                    "type": "chat", "to": ["moderator"],
+                    "body": f"run-once ack from {role}",
+                },
+            )
+    # 兜底：moderator 若不在角色列表里，也补一个（append_event to 为空默认落 moderator）。
+    if "moderator" not in adapters:
+        adapters["moderator"] = FakeApiAdapter(
+            role="moderator",
+            config={"kind": "api"},
+            scripted_reply={
+                "type": "terminate", "to": [], "body": "run --once done",
+            },
+        )
+    return adapters
+
+
+def _stop_marker_path(workspace: Path) -> Path:
+    return workspace / "orch.stop"
+
+
+def _consume_stop_marker(workspace: Path) -> bool:
+    """若 workspace/orch.stop 存在则删除并返回 True；否则返回 False。
+
+    §12 语义："优雅停机" —— stop 是一次性信号，run 见到即退，并**消费**该标志
+    避免下次 run 被历史标志误触发（C-2 修复：现在有人读了）。
+    """
+    marker = _stop_marker_path(workspace)
+    if marker.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            # 极端并发下若删不掉：也算成功检测到 stop 信号，run 仍立即退出。
+            pass
+        return True
+    return False
+
+
+@app.command("run")
+def cmd_run(
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    ),
+    once: bool = typer.Option(
+        False, "--once", help="只跑一轮（用于测试/冒烟），不进入常驻循环。",
+    ),
+    interval: float = typer.Option(
+        1.0, "--interval",
+        help="常驻模式下每轮之间的休眠秒数（--once 时忽略）。",
+    ),
+) -> None:
+    """§12 orch run：启动调度进程（常驻，可随时 kill）。
+
+    骨架循环（--once 只跑一轮）：
+      1) 检测 workspace/orch.stop 标志：存在则**消费**（删除）并立即退出（C-2）。
+      2) 遍历 workspace 下所有 `t-*` 线程：
+         · status ∈ {suspended, terminated} → 跳过；
+         · 其余：装配默认 Fake adapters（M2 骨架）→ run_thread 一次。
+      3) --once：一轮结束返回；否则休眠 interval 秒后回步骤 1。
+    """
+    ws = _resolve_workspace(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        # 步骤 1：orch.stop 标志优先 —— 消费并立即退出（C-2）。
+        if _consume_stop_marker(ws):
+            _echo(f"[run] detected orch.stop, exiting (consumed marker)")
+            return
+
+        # 步骤 2：遍历线程逐一推进一次 run_thread。
+        thread_dirs = _find_thread_dirs(ws)
+        for tdir in thread_dirs:
+            store = orch.store.Store(tdir)
+            status = store.get_meta("status")
+            if status in ("suspended", "terminated"):
+                continue
+            roles = _thread_roles(store)
+            if not roles:
+                # 无角色配置 → 无从装配 adapters；跳过（run 骨架不臆造角色）。
+                continue
+            adapters = _build_default_adapters(roles)
+            try:
+                orch.scheduler.run_thread(store, _load_config(ws), adapters)
+            except Exception as exc:  # noqa: BLE001 骨架层兜底：不因单个线程崩溃拖垮 run
+                _echo(f"[run] thread {tdir.name} error: {exc!r}")
+
+        # 步骤 3：--once 结束；常驻模式睡一觉再回步骤 1（同时检查 stop 标志）。
+        if once:
+            return
+        try:  # pragma: no cover - 常驻模式手动 Ctrl-C 走出，测试不覆盖
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return
 
 
 # ——————————————————————————————————————————————————————————————
