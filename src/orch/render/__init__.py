@@ -565,3 +565,183 @@ def render_view(
         "sections": sections,
         "meta": meta,
     }
+
+
+# ——————————————————————————————————————————————————————————————
+# §6.5 热续增量：render_delta
+# ——————————————————————————————————————————————————————————————
+
+def _render_a_event_diff(event: dict) -> str:
+    """把单个 A 类事件（decision/acceptance/gate_decision）渲染为黑板 diff 单行。
+
+    保持第三人称标签 + 事件号，便于会话端定位；正文摘要嵌入。此为"黑板 diff"
+    专用（§6.5 规则1），不同于焦点窗全文——它是"决策覆盖"的紧凑增量。
+    """
+    eid = event.get("id")
+    sender = event.get("from")
+    etype = event.get("type")
+    summary = _summarize(event.get("body", ""), limit=200)
+    return f"#{eid} [{sender}->{_to_labels(event)}] ({etype}): {summary}"
+
+
+def _contract_versions_from_events(events: list[dict]) -> dict:
+    """扫描给定事件列表的 blackboard_ops，返回 {contract_name: latest_version}。
+
+    只识别 op == "freeze_contract"（§3.3）且 type 属于 A 类 bb_op 集合（decision /
+    acceptance / gate_decision）——与 store._BB_OP_TYPES 同域，确保只统计"已获权限
+    并投影"过的契约版本。同名后到者覆盖，取最新 version。
+    """
+    _bb_op_types = frozenset({"decision", "acceptance", "gate_decision"})
+    versions: dict = {}
+    for ev in events:
+        if ev.get("type") not in _bb_op_types:
+            continue
+        ops = ev.get("blackboard_ops") or []
+        for op in ops:
+            if op.get("op") == "freeze_contract":
+                name = op.get("name")
+                ver = op.get("version")
+                if name is not None and ver is not None:
+                    versions[name] = ver
+    return versions
+
+
+def _needs_cold_start_by_version(
+    events: list[dict], last_evt: int
+) -> bool:
+    """§6.5 规则2：契约 version 变更 ≥ 1 → needs_cold_start = True。
+
+    比较 last_evt 前后（含 last_evt 前的全部 vs 全部事件）中每个契约名的最新
+    version：任一名的差值 ≥ 1 即触发。新增契约（旧无）视为差值 = new_version，
+    只要 ≥ 1 也算变更（与"新冻结重量级契约"语义一致）。
+    """
+    before = [ev for ev in events if int(ev.get("id", 0)) <= int(last_evt)]
+    after_all = events  # 全流（含 before + last_evt 之后新事件）。
+    v_before = _contract_versions_from_events(before)
+    v_after = _contract_versions_from_events(after_all)
+    for name, new_ver in v_after.items():
+        old_ver = v_before.get(name, 0)
+        try:
+            if int(new_ver) - int(old_ver) >= 1:
+                return True
+        except (TypeError, ValueError):
+            # 非数值 version：任何变化都视为需要冷启动（保守）。
+            if new_ver != old_ver:
+                return True
+    return False
+
+
+def _build_blackboard_diff(events: list[dict], last_evt: int, role: str) -> str:
+    """§6.5 规则1：黑板 diff = last_evt 之后的 A 类事件，前缀"以下决策覆盖旧结论："。
+
+    只含 A 类（§3.2：decision / acceptance / gate_decision——保留策略 A）；
+    无新 A 类 → 返回空串（避免误报"覆盖"）。
+    """
+    a_events_after = [
+        ev for ev in events
+        if int(ev.get("id", 0)) > int(last_evt)
+        and _retention_of(ev.get("type", "")) == "A"
+    ]
+    if not a_events_after:
+        return ""
+    lines = [_render_a_event_diff(ev) for ev in a_events_after]
+    return "=== 黑板层 ===\n以下决策覆盖旧结论：\n" + "\n".join(lines)
+
+
+def _build_focus_delta(events: list[dict], last_evt: int, role: str) -> str:
+    """§6.5 规则3：新事件全文 = event_id > last_evt 的 B 类事件（相关，第三人称、带 # 号）。
+
+    A 类（黑板 diff 段处理）与 C/D 类（背景/丢弃）不进焦点。相关性判定同 §6.2：
+    (to∋role) ∨ (from==role) ∨ (re∩role的事件≠∅)——注意 authored 判定用全流，
+    确保"role 早期发过的事件被后续 re"仍能命中焦点。
+    """
+    authored = _role_authored_ids(events, role)
+    picks: list[dict] = []
+    for ev in events:
+        if int(ev.get("id", 0)) <= int(last_evt):
+            continue
+        pol = _retention_of(ev.get("type", ""))
+        if pol != "B":
+            continue
+        if not _is_focus_relevant(ev, role, authored):
+            continue
+        picks.append(ev)
+    if not picks:
+        return ""
+    rendered = [_render_event_full(ev, role) for ev in picks]
+    return "=== 焦点窗 ===\n" + "\n\n".join(rendered)
+
+
+def _build_system_delta(role: str) -> str:
+    """§6.5 规则4：热续 system 段最小签名——不重新灌 prompt 原文。
+
+    只保留身份声明与幂等指令的最小骨架，避免热续把冷启动全文再刷一遍浪费 token。
+    保留段头以便 sections 键值一致（sections['system'] 非空/无空则拼入 text）。
+    """
+    identity_decl = f"以下历史中标注 [{role}] 的发言是你自己说过的话"
+    idempotent = (
+        "输入事件均带 # 编号；若某编号你已处理过，直接重发当次信封，"
+        "不要重复执行任何操作。"
+    )
+    return "\n\n".join(["=== 系统层 ===", identity_decl, idempotent])
+
+
+def render_delta(
+    store,
+    config,
+    *,
+    role: str,
+    event_ids: list[int],
+    last_evt: int,
+    instruction: str = "",
+) -> RenderedView:
+    """§6.5 热续增量视图：
+
+      - system：最小签名（不重灌 prompt 原文）
+      - blackboard：只 diff（last_evt 之后 A 类，前缀"以下决策覆盖旧结论："）
+      - background：空（热续不重发已消化历史）
+      - focus：新事件（id > last_evt 的相关 B 类，第三人称）
+      - instruction：指令尾（§6.2 必发，含角色声明 + 事件号 + instruction 原文）
+
+    meta.needs_cold_start：§6.5 规则2——契约 version 变更 ≥ 1 → True（调度层据此作废
+    sid 回冷启动）；否则 False（继续热续）。
+
+    本函数**不接入调度**（属 T3 责任）；仅提供签名与语义。签名与 docs/m3-contract.md §2 一致。
+    """
+    ids = sorted(int(e) for e in (event_ids or []))
+    events = store.events()
+    last_evt_i = int(last_evt)
+
+    system_text = _build_system_delta(role)
+    blackboard_text = _build_blackboard_diff(events, last_evt_i, role)
+    background_text = ""  # §6.5：热续不再灌背景层。
+    focus_text = _build_focus_delta(events, last_evt_i, role)
+    instruction_text = _build_instruction(role, ids, instruction)
+
+    sections = {
+        "system": system_text,
+        "blackboard": blackboard_text,
+        "background": background_text,
+        "focus": focus_text,
+        "instruction": instruction_text,
+    }
+
+    parts = [sections[name] for name in _SECTION_ORDER if sections[name].strip()]
+    text = "\n\n".join(parts)
+
+    needs_cold_start = _needs_cold_start_by_version(events, last_evt_i)
+
+    meta = {
+        "token_est": estimate_tokens(text),
+        "cold_start": False,
+        "needs_cold_start": needs_cold_start,
+        "last_evt": last_evt_i,
+    }
+
+    return {
+        "role": role,
+        "event_ids": ids,
+        "text": text,
+        "sections": sections,
+        "meta": meta,
+    }
