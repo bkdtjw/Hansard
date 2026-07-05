@@ -17,12 +17,15 @@ import time
 from itertools import groupby
 
 import orch.protocol
+import orch.render
 import orch.store
 
+from orch.scheduler._dispatch import session_rows
 from orch.scheduler.systemexec import (
     append_system_event,
     run_privileged_and_callbacks,
 )
+from orch.scheduler.watchdog import check_watchdogs
 
 # 单次调用超时预算（秒）。M0 mock 同步返回，deadline 只用于崩溃后看门狗对账（§9.1 b）。
 # spec §5.3 的"单次调用超时"级别在 M0 恢复算法中生效；主动触发是 M1（契约 §6.4）。
@@ -60,24 +63,32 @@ def _group_pending(pending: list[dict]) -> list[tuple[str, list[int]]]:
     return [(tgt, sorted(ids)) for tgt, ids in ordered]
 
 
-def _assemble_view(store, role: str, event_ids: list[int]) -> dict:
-    """M0 最小占位 view（契约 §3）：{role, event_ids, events, board}。
+def _is_cold_start(store, role: str) -> bool:
+    """§6.2/契约 §4：该 role 是否冷启动（sessions.gen==0 或无 sid，即尚未热续）。
 
-    四层结构/第三人称渲染/尾部重锚定是 M1（契约 §6.1）；mock 只用 role+event_ids。
+    读 sessions 台账；无该角色行 → 冷启动。M1 mock 不 upsert 会话 → 恒冷启动
+    （render 恒走冷启动全量，热续增量 §6.5 是 M3）。
     """
-    board = ""
-    board_path = store.thread_dir / "blackboard" / "board.md"
-    try:
-        if board_path.exists():
-            board = board_path.read_text(encoding="utf-8")
-    except OSError:
-        board = ""
-    return {
-        "role": role,
-        "event_ids": list(event_ids),
-        "events": store.events(),
-        "board": board,
-    }
+    for s in session_rows(store):
+        if s.get("role") == role:
+            return int(s.get("gen") or 0) == 0 or not s.get("sid")
+    return True
+
+
+def _assemble_view(store, config: dict, role: str, event_ids: list[int]) -> dict:
+    """M1：调用 render.render_view 组装完整不对称四层视图（契约 §4 / §6）。
+
+    替换 M0 最小占位 view：五段（system/blackboard/background/focus/instruction）完整渲染、
+    第三人称焦点窗、预算裁剪。mock 仍按 view['event_ids'] 查表（不依赖 text），但落 invoke
+    log 时用 view['text'] 完整渲染原文（§14）。cold_start 依 sessions 台账推导（契约 §4）。
+    视图组装属调度层职责、与厂商无关（§2）。
+    """
+    return orch.render.render_view(
+        store, config,
+        role=role,
+        event_ids=list(event_ids),
+        cold_start=_is_cold_start(store, role),
+    )
 
 
 def _run_verify(config: dict, role: str) -> dict | None:
@@ -171,31 +182,79 @@ def _apply_bb_if_eligible(store, config: dict, reply: dict, reply_id: int) -> No
         )
 
 
+def _collect_branches(store, config: dict) -> list[str]:
+    """§5.4 终止清单"分支列表"段（M1 mock 退化为空）。
+
+    真实 CLI（M2）每角色一个 worktree/分支（../wt-*, m{n}-*），此处从 config.roles 的
+    worktree/branch 申报汇总。M1 mock 角色无 worktree → 返回空列表；但终止清单仍列"分支"
+    段目（体现四项俱全，§5.4）。此函数保留分支、对 mock no-op（无凭空构造分支名）。
+    """
+    branches: list[str] = []
+    roles = (config.get("roles") or {}) if config else {}
+    for _role, rc in roles.items():
+        if not isinstance(rc, dict):
+            continue
+        br = rc.get("branch")
+        if br and br not in branches:
+            branches.append(br)
+    return branches
+
+
 def _handle_terminate(store, config: dict, term_event: dict) -> None:
     """§5.4 终止清单：汇总产物 → system 总结事件 → status=terminated → 拒绝新派发。
 
     terminate 信封落盘时不生成派发行（store.append_event 已保证，§5.4）；本函数在其后触发。
-    汇总产物：黑板契约 + 全部 artifacts + 会话台账（M0 mock 无分支，分支列表退化为空）。
+    汇总产物四项（§5.4）：黑板契约 + 全部 artifacts + 分支列表 + 会话台账（mock 无分支/无
+    会话时退化为空列表，但四段段目俱全）。
+
+    评审建议②（契约 §3）：终止**总结 system 事件不生成 pending 派发行**——本函数落盘该
+    system 事件后立即把其派发行标 done（"建后即 done"），保持派发表整洁；不残留任何指向
+    总结事件的 pending 行。
     """
     state = orch.store.board_state(store)
     contracts = state.get("contracts") or {}
     tasks = state.get("tasks") or {}
+
+    # 全部 artifacts（去重、保序，§5.4）。
     artifacts: list[str] = []
     for ev in store.events():
         for a in ev.get("artifacts") or []:
             if a not in artifacts:
                 artifacts.append(a)
+
+    # 分支列表（§5.4；mock 退化为空）。
+    branches = _collect_branches(store, config)
+
+    # 会话台账（§5.4；读 sessions 表，mock 常为空）。
+    sessions = session_rows(store)
+    session_lines = [
+        f"{s.get('role')}@{s.get('backend')}"
+        f"(sid={s.get('sid')}, gen={s.get('gen')}, last_evt={s.get('last_evt')})"
+        for s in sessions
+    ]
+
     summary = (
         "线程终止清单：\n"
         f"- 冻结契约：{ {k: v.get('version') for k, v in contracts.items()} }\n"
         f"- 任务状态：{tasks}\n"
-        f"- 产物：{artifacts}\n"
+        f"- 产物 artifacts：{artifacts}\n"
+        f"- 分支列表：{branches}\n"
+        f"- 会话台账：{session_lines}\n"
         f"- 触发终止事件：E{term_event.get('id')}"
     )
-    # system 总结事件（§5.4）。to=[] → 兜底 moderator 落派发行；但线程即将 terminated，
-    # 主循环随后不再派发（拒绝新派发）。为不制造悬挂待办，总结事件直接指向 moderator
-    # 并在下一步终止后由"拒绝新派发"吞掉（terminated 线程 run_thread 不消费 pending）。
-    append_system_event(store, body=summary, to=["moderator"])
+
+    # system 总结事件（§5.4）。to=[] → 兜底 moderator 落一行 pending 派发（§4.4(1)）；
+    # 评审建议②要求它不留待办：落盘后立即把该派发行标 done（"建后即 done"，契约 §3）。
+    # 系统字段编排器权威赋值（sender='system'，§16.11）。
+    summary_id = append_system_event(store, body=summary, to=["moderator"])
+    store.mark_done(summary_id, "moderator")
+
+    # §5.4 拒绝新派发 + 终态整洁：线程终止后不再消费任何 pending，把残留的 pending 派发行
+    # 一并标 done（终止前尚未被派发的待办作废——线程已终止，不会再处理它们）。总结事件的
+    # pending 上面已 done；此处清扫其余（如终止前未及处理的 handoff/report 等）。
+    for row in store.pending_dispatches():
+        store.mark_done(int(row["event_id"]), row["target"])
+
     store.set_meta("status", "terminated")
 
 
@@ -208,6 +267,13 @@ def run_thread(
     while True:
         status = store.get_meta("status")
         if status in ("suspended", "terminated"):
+            return
+
+        # §5.3 看门狗三级：核心环**每轮**主动调用（契约 §2/§4）。触发 level2/level3 会产生
+        # gate_request(to=[human]) 并复用 M0 门禁机制置 suspended；level1 计 attempt。
+        # 触发挂起后由下一步状态判定接手返回（§10）。时间取样一次注入，禁内存倒计时（§16.2）。
+        check_watchdogs(store, config)
+        if store.get_meta("status") in ("suspended", "terminated"):
             return
 
         pending = store.pending_dispatches()
@@ -256,7 +322,9 @@ def _dispatch_group(
     for eid in event_ids:
         store.mark_dispatching(eid, target, deadline_ts)
 
-    view = _assemble_view(store, target, event_ids)
+    view = _assemble_view(store, config, target, event_ids)
+    # 落 invoke log 用完整渲染视图文本（§14 / 契约 §4）；mock 仍按 view['event_ids'] 查表。
+    view_text = view.get("text", "") if isinstance(view, dict) else str(view)
 
     # invoke + schema 校验（失败原地重调一次；两次败 → failed + 转 moderator，§5.1）。
     attempt = 0
@@ -265,10 +333,10 @@ def _dispatch_group(
     last_errors: list[str] = []
     while attempt <= _MAX_SCHEMA_RETRY:
         raw_env, sess = adapter.invoke(view, sess)
-        # 审计原文（§14 一等公民）。
+        # 审计原文（§14 一等公民）：view['text'] 完整渲染 + 输出原文。
         store.write_invoke_log(
             event_ids=event_ids, role=target,
-            view_text=str(view), output_text=str(raw_env),
+            view_text=view_text, output_text=str(raw_env),
         )
         errors = orch.protocol.validate_author_fields(raw_env)
         if not errors:

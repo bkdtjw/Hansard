@@ -55,6 +55,24 @@ def dispatch_row(store, event_id: int, target: str) -> dict | None:
         con.close()
 
 
+def session_rows(store) -> list[dict]:
+    """全部会话台账行（sessions 表），按 role 升序（§5.4 终止清单"会话台账"段所需）。
+
+    读盘观察落盘真相（契约 §7），短生命周期只读连接，读完即弃。每行含
+    role/backend/sid/last_evt/gen。M0 mock 不 upsert 会话 → 常为空列表（终止清单
+    仍列"会话"段目，体现四项俱全，§5.4）。
+    """
+    con = sqlite3.connect(_db_path(store))
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT role, backend, sid, last_evt, gen FROM sessions ORDER BY role ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
 def has_matching_reply(events: list[dict], event_id: int, target: str) -> bool:
     """§9.1 a)：events 中是否存在 sender==target 且 event_id ∈ re 的回复（纵深防御）。
 
