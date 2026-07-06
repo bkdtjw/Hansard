@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 import orch.store
@@ -102,6 +103,30 @@ def run_privileged_and_callbacks(store, config: dict, gate: dict, callback_to: s
             )
 
 
+# §10 corr 缺省生成形：`gate-{事件号}`（编排器生成，事件号即门禁挂起信封的 id）。
+_GENERATED_CORR_RE = re.compile(r"^gate-(\d+)$")
+
+
+def _find_informal_gate(store, corr: str) -> dict | None:
+    """§10 corr 缺省生成条款：按生成形 corr 反解"非正式门禁"信封。
+
+    spec §10 的挂起机制覆盖**一切** target=human 的 pending 行（§5.1 同判据），
+    不限 type=gate_request；信封自身无 corr 时由编排器生成 `gate-{事件号}`。
+    本函数只查表反解（§16.10 禁猜测）：corr 匹配生成形、事件存在、且其 to 含
+    human 才构成门禁；任一不满足返回 None（调用方按"未找到"抛错）。
+    —— 真实联跑发现的实现缺口：calc 线程 moderator 以 handoff→human 收尾，
+    线程挂起后 approve/reject 因找不到 gate_request 而 KeyError，线程不可恢复。
+    """
+    m = _GENERATED_CORR_RE.match(str(corr))
+    if not m:
+        return None
+    eid = int(m.group(1))
+    for ev in store.events():
+        if ev.get("id") == eid:
+            return ev if "human" in (ev.get("to") or []) else None
+    return None
+
+
 def _find_gate_decision(store, corr: str) -> dict | None:
     """按 corr 定位已存在的 gate_decision 事件（§9.1 恢复算法所需：只查表，禁猜测）。"""
     match = None
@@ -154,9 +179,13 @@ def apply_gate_decision(
     """
     gate = _find_gate_request(store, corr)
     if gate is None:
-        raise KeyError(f"未找到 corr={corr} 的 gate_request 事件")
+        # §10 corr 缺省生成：非 gate_request 信封发往 human 同样构成门禁，
+        # corr 为编排器生成形 gate-{事件号}（测试：test_e2e informal gate 三连）。
+        gate = _find_informal_gate(store, corr)
+    if gate is None:
+        raise KeyError(f"未找到 corr={corr} 的门禁信封（gate_request 或 to=human 挂起信封）")
 
-    requester = gate.get("from")  # 原申请者（gate_request 的 sender）。
+    requester = gate.get("from")  # 原申请者（门禁挂起信封的 sender）。
 
     # §9.1 幂等：先查同 corr 是否已有 gate_decision（前一次崩溃前已 append）。
     existing = _find_gate_decision(store, corr)

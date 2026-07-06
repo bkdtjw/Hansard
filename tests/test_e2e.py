@@ -216,3 +216,78 @@ def test_e2e_ledger_no_duplicate_event_ids(thread_dir, like_feature_script, tmp_
 
     lines = [ln for ln in Path(ledger).read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == len(set(lines)), f"ledger 出现重复事件号: {lines}"
+
+
+# ——————————————————————————————————————————————————————————————
+# §10 corr 缺省生成（"非正式门禁"）：任意 to=[human] 信封挂起后也可 approve 恢复
+# —— 真实联跑发现（calc 线程：moderator 发 handoff→human 后线程无法恢复）。
+# spec §10："调度器遇到 target=human 的 pending 行时置 gate_wait…corr 缺省时
+# 由编排器生成 `gate-{事件号}`"；§5.1 把**所有** target=human 行送入该机制，
+# 故 approve 的可恢复性不得只限 type=gate_request。
+# ——————————————————————————————————————————————————————————————
+
+import pytest
+import sqlite3
+
+
+def _informal_gate_setup(thread_dir, tmp_dir):
+    """E1 human assign→[pm]；pm(mock) 回 handoff→[human]（无 corr）→ 线程挂起。"""
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="做完通知我", to=["pm"])
+    adapters = {
+        "pm": orch.adapters.MockAdapter(
+            role="pm",
+            script={1: {"to": ["human"], "type": "handoff",
+                        "body": "已完成，请人工确认收尾。"}},
+            ledger_path=tmp_dir / "ledger.txt",
+        ),
+    }
+    cfg = {**_config(), "gate_ops": {}}   # 无特权操作：只验恢复语义
+    orch.scheduler.run_thread(st, cfg, adapters)
+    return st, cfg
+
+
+def _dispatch_status(thread_dir, event_id, target):
+    con = sqlite3.connect(str(Path(thread_dir) / "events.db"))
+    row = con.execute(
+        "select status from dispatches where event_id=? and target=?",
+        (event_id, target),
+    ).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def test_informal_gate_generated_corr_approve_resumes(thread_dir, tmp_dir):
+    """§10 corr 缺省生成：approve gate-{事件号} 应恢复非正式门禁挂起的线程。"""
+    st, cfg = _informal_gate_setup(thread_dir, tmp_dir)
+    assert st.get_meta("status") == "suspended", "handoff→human 应挂起（§5.1）"
+    assert _dispatch_status(thread_dir, 2, "human") == "gate_wait"
+
+    orch.scheduler.apply_gate_decision(st, cfg, {}, corr="gate-2", approve=True)
+
+    assert st.get_meta("status") == "running", "§10：approve 后线程应 resume"
+    assert _dispatch_status(thread_dir, 2, "human") == "done"
+    gd = [e for e in st.events() if e.get("type") == "gate_decision"]
+    assert len(gd) == 1
+    assert gd[0].get("corr") == "gate-2"
+    assert gd[0].get("to") == ["pm"], "gate_decision 应回给原申请者（§10）"
+
+
+def test_informal_gate_approve_idempotent(thread_dir, tmp_dir):
+    """§9.1 幂等：同 corr 重复 approve 不得追加第二条 gate_decision。"""
+    st, cfg = _informal_gate_setup(thread_dir, tmp_dir)
+    orch.scheduler.apply_gate_decision(st, cfg, {}, corr="gate-2", approve=True)
+    orch.scheduler.apply_gate_decision(st, cfg, {}, corr="gate-2", approve=True)
+    gd = [e for e in st.events() if e.get("type") == "gate_decision"]
+    assert len(gd) == 1
+
+
+def test_informal_gate_rejects_bogus_generated_corr(thread_dir, tmp_dir):
+    """生成形 corr 只查表反解（§16.10 禁猜测）：事件不存在或 to 不含 human → KeyError。"""
+    st, cfg = _informal_gate_setup(thread_dir, tmp_dir)
+    with pytest.raises(KeyError):
+        orch.scheduler.apply_gate_decision(st, cfg, {}, corr="gate-99", approve=True)
+    with pytest.raises(KeyError):   # E1 to=["pm"]，非发往 human：不构成门禁
+        orch.scheduler.apply_gate_decision(st, cfg, {}, corr="gate-1", approve=True)
+    assert st.get_meta("status") == "suspended", "非法 corr 不得触碰线程状态"

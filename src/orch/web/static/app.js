@@ -1099,6 +1099,19 @@ function refreshGateFromEvents(evs, statusOverride) {
       if (!c || !decidedCorrs.has(c)) { pending = e; break; }
     }
   }
+  // §10 corr 缺省生成："非正式门禁"（任意 to=human 信封挂起，无 gate_request）——
+  // 兜底取最近发往 human 的信封，corr = 其自带 corr 或编排器生成形 gate-{事件号}，
+  // 让批准/拒绝按钮对这类挂起同样可用（后端 apply_gate_decision 已支持反解）。
+  if (!pending) {
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const e = evs[i];
+      if ((e.to || []).includes("human") && e.type !== "gate_decision") {
+        const c = e.corr ? String(e.corr) : `gate-${e.id}`;
+        if (!decidedCorrs.has(c)) pending = { id: e.id, corr: c, body: e.body };
+        break;
+      }
+    }
+  }
   // 权威状态优先用调用方传入（loadStatus 拿到的 status 端点值）；否则回退当前徽章。
   const status = (statusOverride || $("#wk-status").textContent || "").trim();
   updateGateBanner(pending, status);

@@ -229,3 +229,15 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   成品合并 target_repo main：15 测试通过、CLI 实跑可用（add/list）。真实"权限冲突→审计拦截→返工"场景自然涌现。
 - 边界：隔离 worktree 下跨角色依赖（tester 看不到 backend 代码）未解，本次 backend 主力落代码
   （write_scope=[src/,tests/]），pm/moderator 协调层分工；多角色各写+顺序合并 pipeline 留后续。
+
+### §10 corr 缺省生成条款补实现（2026-07-06，真实联跑发现，Lead 亲做）
+- 缺口：apply_gate_decision 只认 gate_request 事件的 corr；任意非 gate_request 信封
+  发往 human（如 moderator handoff→human 收尾）同样按 §5.1 挂起，却无 corr 可批 →
+  线程永久卡死。spec §10 明文 corr 缺省时编排器生成 `gate-{事件号}`，此条款未实现。
+- 修复：systemexec 增 `_find_informal_gate`（生成形 corr 只查表反解：事件存在且 to 含
+  human），apply_gate_decision 找不到 gate_request 时回退反解；后续 gate_decision 回填/
+  mark_done/resume/幂等全部复用原路径（零 DDL/协议改动）。app.js 门禁 banner 对无
+  gate_request 的挂起派生同形 corr，批准/拒绝按钮直接可用。
+- 证据：测试先行 3 连（test_e2e informal gate）红→绿；283 passed 全量零回归；
+  真实卡死线程 t-934119b0 经 `orch approve gate-4` 恢复（suspended→running，
+  E5 gate_decision corr=gate-4 → moderator）。记 QUESTIONS.md Q6（判定=实现缺口非开放决策）。

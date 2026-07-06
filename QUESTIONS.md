@@ -38,6 +38,33 @@ Q2 [M2/T-realE2E] 真实后端小功能全流程 + 停机三小时验收
         提取→终止清单。遗留：≥2 家异构厂商（claude 待认证）、"停机三小时"长时段（控制流已由 M2
         假适配器 停机-重启-approve 端到端验证；真实长时段可即时 Ctrl+C 重启演示，未跑满三小时）。
 
+Q7 [render/§6.2×§10] A 类触发事件对目标角色不可见：gate_decision 后 moderator 收到"只针对 #5 回应"却看不到 #5 内容
+  背景: 真实联跑铁证（calc 线程 E5 invoke 日志）：渲给 moderator 的 prompt 含指令尾
+        "现在只针对 #5 回应"，但全文不含 approve/gate_decision 任何字样——kimi 回
+        "未收到 #5 事件内容，无法处理"是诚实正确的模型行为。根因是 spec 内部张力：
+        §3.2/§6.2 规定 A 类只投影黑板、焦点窗只渲 B 类，而无 bb_ops 的 gate_decision
+        在黑板上无任何投影；§10 却要求 gate_decision 发回申请者"让申请者知道裁决并
+        续走流程"。凡 A 类事件作为触发件（gate_decision/acceptance/decision→某角色）
+        均受此影响。属 spec 内部矛盾，按 CLAUDE.md 停下报告，不擅自修改。
+  选项: A 渲染层通则——本轮触发批次（view.event_ids）内的事件无论保留策略一律全文
+        入焦点窗（"触发件必须可见"原则；最小改动，连带修复 acceptance/decision 触发
+        同类盲区）——推荐；B gate_decision 专项——approve 时把裁决文本并进指令尾或
+        伴随一条 B 类 system 事件；C 修订 spec §6.2 明确 A 类触发件渲染语义。
+  裁决: {人填}
+
+Q6 [gate/§10] "非正式门禁"不可恢复：非 gate_request 信封发往 human 挂起后 approve KeyError
+  背景: 真实联跑（calc 线程 t-934119b0）moderator 以 handoff→[human] 收尾 → §5.1 置
+        gate_wait+suspended；但 apply_gate_decision 只按 corr 查 gate_request 事件，
+        此类信封无 corr → KeyError，线程永久卡死（发言只入队不解挂、run 跳过 suspended）。
+  判定: 非开放决策，属实现缺口——spec §10 明文"调度器遇到 target=human 的 pending 行时
+        置 gate_wait…corr 缺省时由编排器生成 `gate-{事件号}`"，§5.1 将一切 to=human 行
+        送入该机制；"corr 缺省生成"条款未实现。
+  裁决: 按 §10 条款补实现（用户在场指示"收尾吧，这个bug怎么处理"）：apply_gate_decision
+        对生成形 corr `gate-{事件号}` 只查表反解（事件存在且 to 含 human），其余流程
+        （gate_decision 回填/标 done/resume/幂等）复用原路径；UI 门禁 banner 对无
+        gate_request 的挂起派生同形 corr。测试先行 3 连（test_e2e informal gate）红→绿，
+        283 全绿；真实卡死线程经 `orch approve gate-4` 恢复验证。
+
 Q4 [UI/R5] showModalInStream（回放/接入/派发明细注入流内假气泡）与 D6 轮询重渲染冲突
   背景: console-layout-revision.md D6 要求 ≤2s 轮询自动跟新；现实现 renderStream() 每次全量重建
         #chat-stream，会把 showModalInStream 注入的非事件气泡吞掉——文档未覆盖此交互冲突。
