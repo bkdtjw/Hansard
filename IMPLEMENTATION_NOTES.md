@@ -212,3 +212,20 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   + 携带错误说明重调（R-T2 的 D）+ 降级 system 审计正确生效。web 端点真驱动真实 kimi 坐实。
 - 边界：真实后端下 run 端点同步跑真实 CLI，HTTP 请求耗时较长（分钟级）；异步化（后台跑 + 轮询）
   属后续优化，未做。test_cli_adapter 补 2 装配单测（cli 型/非 cli 报错，纯逻辑不调 CLI）；280 全绿。
+
+### 真实 CLI 落代码联跑（Q1/Q2 深水区达成，2026-07-05，Lead 亲做）
+- 用户要"用系统完成一个会落代码的项目"。先最小验证、再做完整项目。
+- 关键实测（Lead 亲跑）：kimi `-p` 非交互默认自动执行工具（`-y`/`--auto` 与 `-p` 冲突，无需它们），
+  一次调用既 Write 文件又输出信封（stream-json：assistant tool_calls 行 + tool 结果行 + assistant content 含信封）；
+  CliAdapter._unwrap_agent_output 天然兼容（tool_calls 行无 content 字符串被跳过，只拼信封 content）。
+- 装配接线（cli/main.py _build_adapters_from_config）：config 有 target_repo 时，为 write_scope 非空角色
+  调 ensure_worktrees 建 git worktree，路径写回 config['worktrees'][role] 供 core.py §8.2 审计；
+  CliAdapter cwd=worktree（kimi 在隔离沙箱写代码）。无 target_repo 回退现状（280 绿，既有测试不破坏）。
+- 最小验证（Lead 亲跑）：真实 kimi 在隔离 worktree 写 src/add.py → autocommit wip:backend@E1 → §8.2 审计合规；
+  手动越权 tests/hack.py（超 src/）→ 审计正确判违规。
+- 完整项目（线程 t-b3e3336a，TODO CLI，pm/backend/moderator 真实 kimi）：pm 写规格 blackboard/todo-spec.md →
+  backend 写 src/todo.py(129行)+tests/test_todo.py(15测试)真跑 pytest → moderator 审查找 3 处不符 →
+  §8.2 审计拦截 backend 越权写根 tasks.json（git reset）→ 多角色协商 pm 改 spec 路径 → backend 返工修正。
+  成品合并 target_repo main：15 测试通过、CLI 实跑可用（add/list）。真实"权限冲突→审计拦截→返工"场景自然涌现。
+- 边界：隔离 worktree 下跨角色依赖（tester 看不到 backend 代码）未解，本次 backend 主力落代码
+  （write_scope=[src/,tests/]），pm/moderator 协调层分工；多角色各写+顺序合并 pipeline 留后续。

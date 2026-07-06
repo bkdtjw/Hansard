@@ -193,9 +193,23 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
     暂只支持 kind=cli（真实联跑）；其它 kind 显式报错，不臆造后端（诚实边界）。
     """
     from orch.adapters import CliAdapter
+    from orch.scheduler.permissions import ensure_worktrees
 
     adapters_conf = config.get("adapters", {}) or {}
     roles_conf = config.get("roles", {}) or {}
+    # §8.1 落代码隔离：config 有 target_repo → 为 write_scope 非空的角色建 git worktree。
+    # worktree 路径写回 config['worktrees'][role]，供 core.py §8.2 越权审计（_role_worktree 读它）。
+    # 无 target_repo（纯对话联跑）→ worktrees 为空，CliAdapter cwd 回退 thread_dir（不破坏既有）。
+    worktrees: dict = {}
+    target_repo = config.get("target_repo")
+    if target_repo:
+        wt_root = Path(thread_dir) / "worktrees"
+        worktrees = ensure_worktrees(
+            config, Path(target_repo), wt_root, thread_id=Path(thread_dir).name,
+        )
+        wt_map = config.setdefault("worktrees", {})
+        for r, wt in worktrees.items():
+            wt_map[r] = str(wt)
     out: dict = {}
     for role in roles:
         rc = dict(roles_conf.get(role, {}) or {})
@@ -204,7 +218,9 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
         merged = {**ac, **rc}
         kind = str(merged.get("kind", ac.get("kind", "")))
         if kind == "cli":
-            out[role] = CliAdapter(role=role, config=merged, worktree=thread_dir)
+            # 有 write_scope 的角色 cwd=其 git worktree（kimi 在隔离沙箱写代码）；否则 thread_dir。
+            wt = worktrees.get(role, Path(thread_dir))
+            out[role] = CliAdapter(role=role, config=merged, worktree=wt)
         else:
             raise ValueError(
                 f"真实装配暂只支持 kind=cli（角色 {role!r} 解析到 kind={kind!r}）；"
