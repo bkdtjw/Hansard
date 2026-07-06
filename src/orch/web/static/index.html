@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <!-- 顶栏 -->
+  <!-- 顶栏 48px（全站唯一 backdrop-filter:blur 落点） -->
   <header class="topbar glass">
     <div class="brand">
       <span class="brand-mark">◈</span>
@@ -28,66 +28,53 @@
   </header>
 
   <main class="content">
-    <!-- ========== 线程视图 ========== -->
+    <!-- ========== 线程视图：三区骨架（R5 D1） ========== -->
     <section id="view-threads" class="view active">
-      <div class="threads-layout">
-        <!-- 左列：线程列表 + 新建 -->
-        <aside class="left-col">
-          <div class="panel glass">
-            <div class="panel-head">
-              <h3>线程</h3>
-              <button id="btn-refresh-threads" class="btn-ghost" title="刷新线程列表">⟳</button>
-            </div>
-            <ul id="thread-list" class="thread-list">
-              <li class="empty">暂无线程</li>
-            </ul>
-          </div>
+      <div id="threads-layout" class="threads-layout">
 
-          <div class="panel glass">
-            <div class="panel-head"><h3>新建线程</h3></div>
-            <textarea id="new-task" class="ta" rows="3" placeholder="任务描述（作为 E1 body）…"></textarea>
-            <div class="roles-chips" id="new-roles">
-              <label class="chip chip-locked" title="兜底路由必需（spec §5.2）：无 moderator 的线程在 to 为空时无处派发">
-                <input type="checkbox" value="moderator" checked disabled /> moderator
-                <span class="chip-lock" aria-hidden="true">🔒</span>
-              </label>
-              <label class="chip"><input type="checkbox" value="pm" checked /> pm</label>
-              <label class="chip"><input type="checkbox" value="backend" /> backend</label>
-              <label class="chip"><input type="checkbox" value="frontend" /> frontend</label>
-              <label class="chip"><input type="checkbox" value="tester" /> tester</label>
-            </div>
-            <p class="form-note">moderator 为兜底路由必需，已锁定勾选（spec §5.2）。</p>
-            <button id="btn-create-thread" class="btn-primary">＋ 建线程</button>
+        <!-- 左区：线程 rail 240px ⇄ 48px（D4） -->
+        <aside id="thread-rail" class="thread-rail">
+          <div class="rail-head">
+            <button id="btn-new-thread" class="btn-primary btn-new" title="新建线程">＋ <span class="btn-new-txt">新建线程</span></button>
+            <button id="rail-toggle" class="btn-ghost rail-toggle" title="折叠线程栏">⟨</button>
           </div>
+          <ul id="thread-list" class="thread-list"></ul>
         </aside>
 
-        <!-- 右列：选中线程工作区 -->
-        <div class="right-col">
-          <div id="workspace-empty" class="panel glass empty-workspace">
-            <p>← 从左侧选择或新建一个线程</p>
+        <!-- 中区：工作区（流为主体） -->
+        <div class="center-col">
+          <!-- D10 无线程首页空态 -->
+          <div id="workspace-empty" class="empty-home">
+            <div class="empty-card">
+              <p class="empty-title">新建一个线程开始</p>
+              <p class="empty-sub">任务描述会成为 E1</p>
+              <button id="btn-new-thread-empty" class="btn-primary">＋ 新建线程</button>
+            </div>
           </div>
 
           <div id="workspace" class="workspace hidden">
-            <!-- 控制条 -->
-            <div class="panel glass ctrl-bar">
-              <div class="ctrl-title">
-                <span id="wk-tid" class="wk-tid">t-…</span>
+            <!-- D5 线程头 52px：标题+状态+非零chips ｜ 主按钮+⋯菜单 -->
+            <div class="thread-head">
+              <div class="th-left">
+                <span id="wk-title" class="wk-title" title="">…</span>
                 <span id="wk-status" class="badge">—</span>
-                <!-- D18 派发摘要 chips（pending/dispatching/gate/failed）；点击展开完整派发表，
-                     收编原"状态"按钮内容。由 app.js renderDispatchSummary 生成 #btn-status。 -->
                 <span id="dispatch-summary" class="dispatch-summary"></span>
               </div>
-              <div class="ctrl-actions">
-                <button id="btn-run" class="btn-primary" title="运行一轮调度">▶ 运行一轮</button>
-                <button id="btn-reopen" class="btn-ghost" title="重开线程">↻ 重开</button>
-                <button id="btn-replay" class="btn-ghost" title="回放群聊">⟲ 回放</button>
-                <button id="btn-attach" class="btn-ghost" title="接入命令">⎘ 接入</button>
-                <button id="btn-stop" class="btn-danger" title="优雅停机">■ 停机</button>
+              <div class="th-right">
+                <button id="btn-primary-action" class="btn-primary">▶ 运行一轮</button>
+                <div class="menu-wrap">
+                  <button id="btn-more" class="btn-ghost btn-more" title="更多操作">⋯</button>
+                  <div id="more-menu" class="menu glass-pop hidden">
+                    <button id="btn-replay" class="menu-item">⟲ 回放</button>
+                    <button id="btn-attach" class="menu-item">⎘ 接入命令</button>
+                    <button id="btn-reopen" class="menu-item">↻ 重开</button>
+                    <button id="btn-stop" class="menu-item danger">■ 停机</button>
+                  </div>
+                </div>
               </div>
             </div>
 
-            <!-- D19 门禁琥珀 banner：suspended 时出现，corr 自动从最近未决 gate_request 提取
-                 （不再手填）。#gate-corr 改为隐藏字段承载自动提取的 corr。 -->
+            <!-- 门禁琥珀 banner：suspended 时出现 -->
             <div id="gate-bar" class="gate-banner hidden">
               <span class="gate-icon">⚠</span>
               <span id="gate-label" class="gate-label">门禁等待裁决</span>
@@ -98,73 +85,69 @@
               </div>
             </div>
 
-            <!-- 主区两栏：阅读列（左，定宽居中）+ 黑板栏（右，可折叠 D17） -->
-            <div class="main-split">
-              <div class="main-reading">
-                <!-- D16 过滤工具条（事件流上方；纯前端投影，不发请求） -->
-                <div class="filter-bar reading-col">
-                  <div class="fb-group">
-                    <span class="fb-lbl">角色</span>
+            <!-- D2 工具条 40px：筛选▾ · 只看A类 · #n · 跟新指示 -->
+            <div class="toolbar">
+              <div class="pop-wrap">
+                <button id="btn-filter" class="btn-ghost tb-btn">筛选 <span id="filter-count" class="count-badge hidden">0</span> <span class="caret">▾</span></button>
+                <div id="filter-pop" class="pop glass-pop hidden">
+                  <div class="pop-sec">
+                    <span class="pop-lbl">角色</span>
                     <div id="filter-roles" class="fb-chips"></div>
                   </div>
-                  <div class="fb-group">
-                    <span class="fb-lbl">类型</span>
+                  <div class="pop-sec">
+                    <span class="pop-lbl">类型</span>
                     <div id="filter-types" class="fb-chips"></div>
                   </div>
-                  <div class="fb-group fb-inline">
-                    <label class="f-preset"><input type="checkbox" id="filter-aonly" /> 只看 A 类</label>
-                    <span class="fb-goto">
-                      <input id="filter-goto" class="inp fb-goto-inp" placeholder="#n 跳转" />
-                      <button id="filter-goto-btn" class="btn-ghost">跳转</button>
-                    </span>
-                  </div>
-                </div>
-
-                <!-- 群聊事件流（阅读列：定宽居中，纯 rgba 无 blur，对比优先） -->
-                <div class="chat-panel">
-                  <div class="panel-head reading-col">
-                    <h3>群聊事件流</h3>
-                    <button id="btn-refresh-events" class="btn-ghost" title="刷新事件">⟳</button>
-                  </div>
-                  <div id="chat-stream" class="chat-stream reading-col"></div>
-                </div>
-
-                <!-- 发言框（与阅读列同宽对齐） -->
-                <div class="send-panel reading-col">
-                  <div class="send-row">
-                    <label class="send-field">
-                      <span class="send-lbl">发给</span>
-                      <select id="send-to" class="sel" title="接收方（不指定则由 moderator 兜底路由，spec §5.2）">
-                        <option value="">不指定（由 moderator 路由）</option>
-                      </select>
-                    </label>
-                    <label class="send-field">
-                      <span class="send-lbl">类型</span>
-                      <!-- 选项由 app.js populateSendType 按 §3.2 human 允许类型动态填充 -->
-                      <select id="send-type" class="sel" title="事件类型（仅 human 允许类型，spec §3.2）"></select>
-                    </label>
-                  </div>
-                  <textarea id="send-body" class="ta" rows="2" placeholder="发言正文…"></textarea>
-                  <div class="send-actions">
-                    <span id="send-hint" class="send-hint"></span>
-                    <button id="btn-send" class="btn-primary">发送 ➤</button>
+                  <div class="pop-foot">
+                    <button id="filter-clear" class="btn-ghost">清除全部</button>
                   </div>
                 </div>
               </div>
+              <label class="f-preset"><input type="checkbox" id="filter-aonly" /> 只看 A 类</label>
+              <input id="filter-goto" class="inp tb-goto" placeholder="#n" title="输入事件号，回车跳转" />
+              <span class="tb-spacer"></span>
+              <span id="live-ind" class="live-ind hidden"><span class="li-dot"></span><span id="live-text">实时</span></span>
+            </div>
+            <!-- D2 激活筛选 chips 行（无筛选时不出现） -->
+            <div id="filter-chips" class="filter-chips hidden"></div>
 
-              <!-- D17 黑板栏（事实层投影：契约/决策/任务状态）。占 R2 预留留白，
-                   可折叠 320–360px；纯 rgba + border（禁 blur，E2）。只读。 -->
-              <aside id="board-panel" class="board-panel">
-                <div class="board-head">
-                  <button id="board-toggle" class="btn-ghost board-toggle" title="折叠黑板栏">▶ 黑板</button>
-                  <h3 class="board-title">黑板 · 事实层</h3>
-                </div>
-                <div id="board-content" class="board-content"></div>
-                <p class="board-note">A 类事件（decision/acceptance/gate/terminate）投影，与流内一致（spec §4.6）。</p>
-              </aside>
+            <!-- 事件流：页面主体，flex:1 占满剩余高度（阅读列定宽居中） -->
+            <div id="chat-stream" class="chat-stream reading-col"></div>
+
+            <!-- D6 新消息浮标 + 正在响应胶囊 -->
+            <button id="new-msgs" class="new-msgs hidden">↓ <span id="new-msgs-n">0</span> 条新消息</button>
+            <div id="typing-bar" class="typing-bar hidden"></div>
+
+            <!-- D7 composer 单行式 52–56px -->
+            <div class="composer reading-col">
+              <span id="send-hint" class="send-hint hidden"></span>
+              <div class="composer-row">
+                <select id="send-to" class="sel sel-to" title="接收方（不指定则由 moderator 路由）">
+                  <option value="">由 moderator 路由</option>
+                </select>
+                <select id="send-type" class="sel sel-type" title="事件类型"></select>
+                <textarea id="send-body" class="ta composer-ta" rows="1"
+                  placeholder="发言…（Enter 发送，Shift+Enter 换行）"></textarea>
+                <button id="btn-send" class="btn-primary btn-send" title="发送">➤</button>
+              </div>
             </div>
           </div>
         </div>
+
+        <!-- 右区：黑板 rail 40px ⇄ 280px（D3） -->
+        <aside id="board-panel" class="board-rail">
+          <button id="board-rail-btn" class="rail-strip" title="展开黑板">
+            <span class="rs-icon">📌</span>
+            <span id="board-count" class="count-badge hidden">0</span>
+          </button>
+          <div class="board-expand">
+            <div class="board-head">
+              <h3 class="board-title">黑板</h3>
+              <button id="board-toggle" class="btn-ghost" title="折叠黑板">✕</button>
+            </div>
+            <div id="board-content" class="board-content"></div>
+          </div>
+        </aside>
       </div>
     </section>
 
@@ -183,7 +166,7 @@
             placeholder="# 载入或编辑 config.yaml …"></textarea>
         </div>
         <aside class="panel glass config-notes">
-          <h3>字段说明（spec §11.1）</h3>
+          <h3>字段说明</h3>
           <dl>
             <dt>adapters</dt><dd>供应商适配器：<code>{名字: {kind: cli|api|mock, start_cmd, resume_cmd, timeout_s…}}</code>。同一角色可换 adapter 热替换供应商。</dd>
             <dt>roles</dt><dd>角色=配置：<code>{角色: {adapter, can_decide, write_scope:[], tools:[], prompt}}</code>。禁止把角色逻辑写死进代码。</dd>
@@ -198,17 +181,17 @@
     <section id="view-metrics" class="view">
       <div class="panel glass">
         <div class="panel-head">
-          <h3>指标（spec §13）</h3>
+          <h3>指标</h3>
           <button id="btn-load-metrics" class="btn-ghost">⟳ 刷新</button>
         </div>
         <div id="metrics-grid" class="metrics-grid"></div>
       </div>
     </section>
 
-    <!-- ========== 基准视图（对应 orch bench resume；原"压测"入口改名"基准"，保留不删） ========== -->
+    <!-- ========== 基准视图 ========== -->
     <section id="view-bench" class="view">
       <div class="panel glass">
-        <div class="panel-head"><h3>基准 · bench resume（spec §12/§13）</h3></div>
+        <div class="panel-head"><h3>基准 · bench resume</h3></div>
         <div class="bench-form">
           <label>fixture <input id="bench-fixture" class="inp" value="like" /></label>
           <label>runs <input id="bench-runs" class="inp" type="number" value="3" min="1" /></label>
@@ -218,6 +201,47 @@
       </div>
     </section>
   </main>
+
+  <!-- ========== 浮层体系（backdrop 无 blur，纯 rgba 深底 + 阴影景深） ========== -->
+  <div id="modal-backdrop" class="backdrop hidden"></div>
+
+  <!-- D4 新建线程弹层 -->
+  <div id="new-thread-modal" class="modal glass-pop hidden" role="dialog" aria-label="新建线程">
+    <div class="modal-head">
+      <h3>新建线程</h3>
+      <button id="nt-close" class="btn-ghost" title="关闭">✕</button>
+    </div>
+    <textarea id="new-task" class="ta" rows="3" placeholder="任务描述（作为 E1 body）…"></textarea>
+    <div class="roles-chips" id="new-roles">
+      <label class="chip chip-locked" title="兜底路由必需：无 moderator 的线程在 to 为空时无处派发">
+        <input type="checkbox" value="moderator" checked disabled /> moderator
+        <span class="chip-lock" aria-hidden="true">🔒</span>
+      </label>
+      <label class="chip"><input type="checkbox" value="pm" checked /> pm</label>
+      <label class="chip"><input type="checkbox" value="backend" /> backend</label>
+      <label class="chip"><input type="checkbox" value="frontend" /> frontend</label>
+      <label class="chip"><input type="checkbox" value="tester" /> tester</label>
+    </div>
+    <p class="form-note">moderator 为兜底路由必需，已锁定勾选。</p>
+    <div class="modal-foot">
+      <button id="btn-create-thread" class="btn-primary">＋ 建线程</button>
+    </div>
+  </div>
+
+  <!-- D8 线程切换器（Ctrl/⌘+K） -->
+  <div id="switcher" class="modal glass-pop switcher hidden" role="dialog" aria-label="线程切换">
+    <input id="switcher-input" class="inp sw-input" placeholder="搜索线程…（↑↓ 选择，Enter 切换，Esc 关闭）" />
+    <ul id="switcher-list" class="sw-list"></ul>
+  </div>
+
+  <!-- 回放 / 接入 / 派发明细 通用浮层（Q4：不再注入事件流） -->
+  <div id="overlay-panel" class="modal glass-pop overlay-panel hidden" role="dialog">
+    <div class="modal-head">
+      <h3 id="op-title"></h3>
+      <button id="op-close" class="btn-ghost" title="关闭">✕</button>
+    </div>
+    <div id="op-body" class="op-body"></div>
+  </div>
 
   <!-- toast -->
   <div id="toast" class="toast hidden"></div>

@@ -38,6 +38,20 @@ Q2 [M2/T-realE2E] 真实后端小功能全流程 + 停机三小时验收
         提取→终止清单。遗留：≥2 家异构厂商（claude 待认证）、"停机三小时"长时段（控制流已由 M2
         假适配器 停机-重启-approve 端到端验证；真实长时段可即时 Ctrl+C 重启演示，未跑满三小时）。
 
+Q4 [UI/R5] showModalInStream（回放/接入/派发明细注入流内假气泡）与 D6 轮询重渲染冲突
+  背景: console-layout-revision.md D6 要求 ≤2s 轮询自动跟新；现实现 renderStream() 每次全量重建
+        #chat-stream，会把 showModalInStream 注入的非事件气泡吞掉——文档未覆盖此交互冲突。
+  选项: A 回放/接入/派发明细改为真正浮层 overlay（不再塞进流；D5 溢出菜单的自然配套）——推荐，
+        最小干预且消除"轮询吞弹层"；B 轮询时保留非事件节点做 DOM diff（复杂度高，易碎）。
+  裁决: 采 A（实施 D6 的必要前置，非功能扩展）。
+
+Q5 [UI/R5] 线程列表的手动刷新按钮（#btn-refresh-threads）文档未点名
+  背景: D6/坑3 只点名删除事件流刷新按钮；线程列表刷新按钮同样宣告"这东西不会自己动"，
+        且列表数据（状态/事件数/最后活动）在轮询时代应自动更新。
+  选项: A 删除按钮，列表随轮询周期低频自动刷新（选中线程 2s 节奏内每 5 拍捎带刷一次列表）——推荐；
+        B 保留按钮（与 D6 精神矛盾）。
+  裁决: 采 A（同坑3 判据：为"不会自己动"的宣告付常驻像素即臃肿）。
+
 Q3 [UI/web] web events 端点需扩展返回 re/ts/meta/artifacts（console-ui-revision.md D12/D13/D14 渲染数据必需）
   背景: 文档 §A 限后端只改 D1(b)+D2；但 D12(回复链 re)、D13(时间戳 ts/meta/verify)、D14(artifacts)
         要渲染的字段虽在 events 表 DDL（re_json/ts/meta_json/artifacts_json）内，现有 _ep_thread_events

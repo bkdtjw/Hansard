@@ -21,6 +21,60 @@ const filterState = { roles: null, types: null, aOnly: false };
 let lastStatus = null;
 // 当前线程事件缓存（供过滤重渲染 / 跳转 / 黑板投影，均为库的只读投影）。
 let currentEvents = [];
+// R5：最近一次线程列表缓存（切换器/标题复用，仍是端点数据的只读投影）。
+let lastThreads = [];
+// R5 D3：每线程"首个 A 类自动展开一次"记忆 + A 类计数变化检测（新条目高亮）。
+const boardAutoShown = new Set();
+let lastBoardACount = -1;
+
+// —— R5：UI 偏好（折叠态等视图偏好，可存 localStorage；不持有任何库状态） ——
+const UIPREF = {
+  get(k, d) {
+    try { const v = localStorage.getItem("orch.ui." + k); return v === null ? d : v === "1"; }
+    catch (e) { return d; }
+  },
+  raw(k) { try { return localStorage.getItem("orch.ui." + k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem("orch.ui." + k, v ? "1" : "0"); } catch (e) {} },
+};
+
+// ————————————————————————————————————————————————
+// R5 D1/D3/D4：三区骨架折叠态（类切换，禁布局 transition）
+// ————————————————————————————————————————————————
+function setRailCollapsed(collapsed, persist = true) {
+  $("#threads-layout").classList.toggle("rail-collapsed", collapsed);
+  const t = $("#rail-toggle");
+  if (t) { t.textContent = collapsed ? "⟩" : "⟨"; t.title = collapsed ? "展开线程栏" : "折叠线程栏"; }
+  if (persist) UIPREF.set("railCollapsed", collapsed);
+}
+function setBoardOpen(open, persist = true) {
+  $("#threads-layout").classList.toggle("board-open", open);
+  if (persist) UIPREF.set("boardOpen", open);
+}
+function initLayoutPrefs() {
+  // D9：<1280 线程栏默认折叠；黑板任何宽度默认 rail（D3）。localStorage 覆盖默认。
+  const narrow = window.matchMedia("(max-width: 1279px)").matches;
+  const stored = UIPREF.raw("railCollapsed");
+  setRailCollapsed(stored === null ? narrow : stored === "1", false);
+  setBoardOpen(UIPREF.get("boardOpen", false), false);
+}
+
+// ————————————————————————————————————————————————
+// R5 浮层体系：backdrop + 模态（新建线程 / 回放·接入·明细 / 切换器）
+// ————————————————————————————————————————————————
+function openModal(id) {
+  $("#modal-backdrop").classList.remove("hidden");
+  $(id).classList.remove("hidden");
+}
+function closeModals() {
+  $("#modal-backdrop").classList.add("hidden");
+  $$(".modal").forEach((m) => m.classList.add("hidden"));
+}
+// Q4：回放/接入/派发明细改为真正浮层，不再注入事件流（轮询重渲染会吞流内假气泡）。
+function showOverlay(title, html) {
+  $("#op-title").textContent = title;
+  $("#op-body").innerHTML = html;
+  openModal("#overlay-panel");
+}
 
 // ————————————————————————————————————————————————
 // 通用 fetch 封装：统一 JSON + 错误 toast（用后端真实 error 文案）。
@@ -143,6 +197,7 @@ async function loadThreads() {
   const list = $("#thread-list");
   try {
     const threads = await api("/api/threads");
+    lastThreads = threads;
     if (!threads.length) {
       list.innerHTML = '<li class="empty">暂无线程</li>';
       return;
@@ -161,7 +216,10 @@ async function loadThreads() {
       // 基础行即时渲染（id/状态文字/角色数占位）；摘要/事件数/最后活动由
       // enrichThreadRow 从 events 端点（本卡唯一放开的只读投影）异步补全——
       // 不改 /api/threads 端点（本卡 server 白名单只放开 events 端点）。
+      // R5 D4：折叠 rail 态显示状态色圆徽 + 首字（展开态由 CSS 隐藏）。
+      const stColor = status === "running" ? "#4ade80" : (status === "suspended" ? "#fbbf24" : "#94a3b8");
       li.innerHTML =
+        `<span class="ti-mini" style="color:${stColor};border-color:${stColor}66;background:${stColor}1f" title="${escapeHtml(title)}">${escapeHtml(title[0] || "?")}</span>` +
         `<div class="ti-title">` +
           (suspended ? `<span class="ti-gate" title="门禁待审批">⚠ 待审批</span>` : "") +
           `<span class="ti-summary">${escapeHtml(title)}</span>` +
@@ -198,7 +256,10 @@ async function enrichThreadRow(li, tid) {
       const clean = stripSelfViewPrefix(e1.body || "", {
         id: e1.id, sender: e1.sender, type: e1.type, to: e1.to || [],
       });
-      sumEl.textContent = summarize(clean, 20);
+      const s = summarize(clean, 20);
+      sumEl.textContent = s;
+      const mini = li.querySelector(".ti-mini");
+      if (mini) { mini.textContent = s[0] || "?"; mini.title = s; }
     }
     if (cntEl) cntEl.textContent = `${evs.length} 事件`;
     if (timeEl && evs.length) timeEl.textContent = fmtLastActivity(evs[evs.length - 1].ts);
@@ -218,6 +279,7 @@ async function createThread() {
     const r = await api("/api/threads", { method: "POST", body: { task, roles } });
     toast("已建线程 " + r.id + "（E1 入队）");
     $("#new-task").value = "";
+    closeModals();
     await loadThreads();
     await selectThread(r.id);
   } catch (e) {
@@ -232,13 +294,18 @@ async function createThread() {
 // ————————————————————————————————————————————————
 async function selectThread(tid) {
   selectedThread = tid;
+  lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
   $("#workspace-empty").classList.add("hidden");
   $("#workspace").classList.remove("hidden");
-  $("#wk-tid").textContent = tid;
+  $("#wk-title").textContent = tid;   // 占位；loadEvents 后由 E1 摘要替换
+  $("#wk-title").title = tid;
   $$("#thread-list li").forEach((li) => {
     li.classList.toggle("selected", li.querySelector(".ti-id")?.textContent === tid);
   });
+  unseenCount = 0;
+  updateNewMsgsFloat();
   await Promise.all([loadEvents(), loadStatus(), populateSendTo()]);
+  startPolling();   // R5 D6：选中即进入实时跟新（terminated 会自动停轮）
 }
 
 // D3：目标下拉——首项语义 = to=[]（走 moderator 兜底路由，spec §5.2）；
@@ -249,7 +316,7 @@ async function populateSendTo() {
     const threads = await api("/api/threads");
     const t = threads.find((x) => x.id === selectedThread);
     const roles = (t && t.roles) ? t.roles : [];
-    sel.innerHTML = '<option value="">不指定（由 moderator 路由）</option>';
+    sel.innerHTML = '<option value="">由 moderator 路由</option>';
     for (const r of roles) {
       if (r === "human") continue; // human 是自己，不作为发送目标项
       const o = document.createElement("option");
@@ -467,7 +534,7 @@ function buildVerifyBadge(ev) {
     return `<span class="verify-badge ok" title="系统侧 verify 通过（exit 0）">verify ✓ exit 0</span>`;
   }
   const code = (v && v.exit_code !== undefined && v.exit_code !== null) ? ` (exit ${escapeHtml(String(v.exit_code))})` : "";
-  return `<span class="verify-badge bad" title="缺 meta.verify 或退出码非 0：spec §8.3 将降级为 report">⚠ 无系统侧验证${code}</span>`;
+  return `<span class="verify-badge bad" title="缺系统侧验证证据（meta.verify）或退出码非 0，验收会被降级为 report">⚠ 无系统侧验证${code}</span>`;
 }
 
 // D13 meta hover 浮层：tokens_in/out、duration_s（来自 ev.meta）。
@@ -507,7 +574,7 @@ function buildEventHead(ev) {
   const isA = A_CLASS_TYPES.has(type);
   // D11：type 徽章语义类 tb-{type}；A 类附"已入黑板"图钉。
   const typeBadge = `<span class="ev-type tb-${escapeHtml(type)}">${escapeHtml(type)}</span>`;
-  const pin = isA ? `<span class="bb-pin" title="A 类事件：已投影进黑板（spec §3.2/§4.6）">📌 已入黑板</span>` : "";
+  const pin = isA ? `<span class="bb-pin" title="A 类事件：已投影进黑板">📌 已入黑板</span>` : "";
   const clock = fmtClock(ev.ts);
   const clockEl = clock ? `<span class="ev-time" title="ts">${clock}</span>` : "";
   return (
@@ -565,33 +632,72 @@ function applyFilters(evs) {
   });
 }
 
-async function loadEvents() {
+// R5 D6：滚动锚定——视口贴底判定（±40px 容差）。
+function isAtBottom(stream) {
+  return stream.scrollTop + stream.clientHeight >= stream.scrollHeight - 40;
+}
+
+// R5 D6：事件摄取——变化检测（长度 + 末事件号），无变化不重渲染（性能红线）；
+// 有变化时按锚定规则滚动：贴底自动跟入；上翻则冻结位置并累计"↓ n 条新消息"。
+function ingestEvents(evs, force = false) {
+  const stream = $("#chat-stream");
+  const prevLen = currentEvents.length;
+  const changed = force
+    || evs.length !== prevLen
+    || (evs.length > 0 && prevLen > 0
+        && evs[evs.length - 1].id !== currentEvents[prevLen - 1].id);
+  currentEvents = evs;
+  if (!changed) return;
+  const stick = force || isAtBottom(stream);
+  updateThreadTitle();
+  populateSendType(evs.length > 0);
+  renderBoard(evs);
+  renderStream(stick);
+  refreshGateFromEvents(evs, lastStatus && lastStatus.status);
+  if (!stick) unseenCount += Math.max(0, evs.length - prevLen);
+  else unseenCount = 0;
+  updateNewMsgsFloat();
+}
+
+async function loadEvents(force = true) {
   if (!selectedThread) return;
+  const tid = selectedThread;
   const stream = $("#chat-stream");
   try {
-    const data = await api(`/api/threads/${selectedThread}/events`);
-    const evs = data.events || [];
-    currentEvents = evs;
-    // D6：据线程是否已有事件决定 type 下拉默认（新线程→assign，进行中→question）。
-    populateSendType(evs.length > 0);
-    // D17：黑板栏据 A 类事件 + bb_ops 投影刷新。
-    renderBoard(evs);
-    renderStream();
-    // 门禁条：从事件中提取最近未决 gate_request（D19）。
-    refreshGateFromEvents(evs);
+    const data = await api(`/api/threads/${tid}/events`);
+    if (tid !== selectedThread) return;   // 线程已切换：丢弃过期响应
+    ingestEvents(data.events || [], force);
   } catch (e) {
     stream.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
 }
 
+// R5 D5：线程头标题 = E1 摘要（id 收进 title 提示）。
+function updateThreadTitle() {
+  const el = $("#wk-title");
+  if (!el || !selectedThread) return;
+  if (currentEvents.length) {
+    const e1 = currentEvents[0];
+    const clean = stripSelfViewPrefix(e1.body || "", {
+      id: e1.id, sender: e1.sender, type: e1.type, to: e1.to || [],
+    });
+    el.textContent = summarize(clean, 32);
+    el.title = `${selectedThread} · ${summarize(clean, 80)}`;
+  } else {
+    el.textContent = selectedThread;
+    el.title = selectedThread;
+  }
+}
+
 // 依据当前过滤状态渲染事件流（D15 连续 system 聚合 + clamp/展开委托）。
-function renderStream() {
+function renderStream(stickBottom = false) {
   const stream = $("#chat-stream");
+  const prevTop = stream.scrollTop;   // R5 D6：非贴底时冻结滚动位置
   const shown = applyFilters(currentEvents);
   if (!shown.length) {
     stream.innerHTML = currentEvents.length
       ? '<div class="chat-empty">（当前过滤无匹配事件）</div>'
-      : '<div class="chat-empty">暂无事件</div>';
+      : '<div class="chat-empty">E1 已入队，运行一轮开始派发</div>';
     return;
   }
   stream.innerHTML = "";
@@ -610,7 +716,8 @@ function renderStream() {
       i++;
     }
   }
-  stream.scrollTop = stream.scrollHeight;
+  if (stickBottom) stream.scrollTop = stream.scrollHeight;
+  else stream.scrollTop = prevTop;
 }
 
 // D15：连续 system 事件分组行（默认折叠，点击展开逐条卡片）。
@@ -703,14 +810,14 @@ function renderBoard(evs) {
           `<span class="bd-path mono">${escapeHtml(String(c.path || ""))}</span>` +
           `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(c.evt))}">#${escapeHtml(String(c.evt))}</button></li>`;
       }).join("")
-    : '<li class="bd-empty">（无冻结契约）</li>';
+    : '<li class="bd-empty">决策冻结后会出现在这里</li>';
 
   const decisionRows = decisions.length
     ? decisions.map((d) =>
         `<li><span class="bd-text">${escapeHtml(String(d.text == null ? "" : d.text))}</span>` +
         `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(d.evt))}">#${escapeHtml(String(d.evt))}</button></li>`
       ).join("")
-    : '<li class="bd-empty">（无决策）</li>';
+    : '<li class="bd-empty">decision 类事件自动沉淀到这里</li>';
 
   const taskRows = taskKeys.length
     ? taskKeys.map((k) => {
@@ -719,12 +826,33 @@ function renderBoard(evs) {
           `<td><span class="task-status ts-${escapeHtml(String(t.status || "").replace(/[^a-z0-9_-]/gi, ""))}">${escapeHtml(String(t.status))}</span></td>` +
           `<td><button class="ln-chip bd-goto" data-goto="${escapeHtml(String(t.evt))}">#${escapeHtml(String(t.evt))}</button></td></tr>`;
       }).join("")
-    : '<tr><td colspan="3" class="bd-empty">（无任务）</td></tr>';
+    : '<tr><td colspan="3" class="bd-empty">PM 建立任务后显示状态</td></tr>';
 
   el.innerHTML =
     `<section class="bd-sec"><h4>契约</h4><ul class="bd-list">${contractRows}</ul></section>` +
     `<section class="bd-sec"><h4>决策</h4><ul class="bd-list">${decisionRows}</ul></section>` +
     `<section class="bd-sec"><h4>任务状态</h4><table class="bd-tasks"><thead><tr><th>任务</th><th>状态</th><th></th></tr></thead><tbody>${taskRows}</tbody></table></section>`;
+
+  // R5 D3：rail 图标条 A 类计数徽标。
+  const aCount = evs.filter((e) => A_CLASS_TYPES.has(e.type)).length;
+  const badge = $("#board-count");
+  if (badge) {
+    badge.textContent = String(aCount);
+    badge.classList.toggle("hidden", aCount === 0);
+  }
+  // 首个 A 类落盘 → 自动展开一次（此后尊重用户折叠选择，不再自动展开）。
+  const layout = $("#threads-layout");
+  if (aCount > 0 && selectedThread && !boardAutoShown.has(selectedThread)) {
+    boardAutoShown.add(selectedThread);
+    if (!layout.classList.contains("board-open")) setBoardOpen(true, false);
+  }
+  // 新条目高亮（仅同线程内计数增长且面板展开时；transform/bg 过渡，无布局动画）。
+  if (lastBoardACount >= 0 && aCount > lastBoardACount && layout.classList.contains("board-open")) {
+    const items = el.querySelectorAll(".bd-list li:not(.bd-empty), .bd-tasks tbody tr");
+    const last = items[items.length - 1];
+    if (last) { last.classList.add("flash"); setTimeout(() => last.classList.remove("flash"), 1200); }
+  }
+  lastBoardACount = aCount;
 }
 
 // ————————————————————————————————————————————————
@@ -757,47 +885,120 @@ function readFilters() {
   filterState.types = typeChecks.length ? new Set(typeChecks) : null;
   filterState.aOnly = $("#filter-aonly")?.checked || false;
   renderStream();
+  updateFilterUI();
+}
+
+// R5 D2：筛选弹出面板开关。
+function toggleFilterPop(force) {
+  const pop = $("#filter-pop");
+  if (!pop) return;
+  const show = force !== undefined ? force : pop.classList.contains("hidden");
+  pop.classList.toggle("hidden", !show);
+}
+
+// R5 D2：按钮计数徽标 + 激活筛选 chips 行（仅有筛选时出现，逐个可移除）。
+function updateFilterUI() {
+  const n = (filterState.roles ? filterState.roles.size : 0)
+    + (filterState.types ? filterState.types.size : 0)
+    + (filterState.aOnly ? 1 : 0);
+  const badge = $("#filter-count");
+  if (badge) {
+    badge.textContent = String(n);
+    badge.classList.toggle("hidden", n === 0);
+  }
+  const row = $("#filter-chips");
+  if (!row) return;
+  const chips = [];
+  for (const r of (filterState.roles || [])) chips.push({ kind: "role", val: r, label: r });
+  for (const t of (filterState.types || [])) chips.push({ kind: "type", val: t, label: t });
+  if (filterState.aOnly) chips.push({ kind: "aonly", val: "1", label: "只看 A 类" });
+  if (!chips.length) { row.classList.add("hidden"); row.innerHTML = ""; return; }
+  row.classList.remove("hidden");
+  row.innerHTML = chips.map((c) =>
+    `<span class="fc-chip">${escapeHtml(c.label)}` +
+    `<button class="fc-x" data-fkind="${c.kind}" data-fval="${escapeHtml(c.val)}" title="移除该筛选">✕</button></span>`
+  ).join("");
+}
+
+function removeFilter(kind, val) {
+  if (kind === "aonly") {
+    const cb = $("#filter-aonly");
+    if (cb) cb.checked = false;
+  } else {
+    const box = kind === "role" ? $("#filter-roles") : $("#filter-types");
+    const cb = box && box.querySelector(`input[value="${CSS.escape(val)}"]`);
+    if (cb) cb.checked = false;
+  }
+  readFilters();
+}
+
+function clearAllFilters() {
+  $$("#filter-roles input:checked").forEach((c) => { c.checked = false; });
+  $$("#filter-types input:checked").forEach((c) => { c.checked = false; });
+  const a = $("#filter-aonly");
+  if (a) a.checked = false;
+  readFilters();
 }
 
 // ————————————————————————————————————————————————
 // 状态 / 派发（D18）
 // ————————————————————————————————————————————————
+// 状态载荷统一应用（loadStatus 与轮询共用）：徽章/矩阵/派发 chips/正在响应/门禁。
+function applyStatusPayload(s) {
+  lastStatus = s;
+  const badge = $("#wk-status");
+  badge.textContent = s.status;
+  badge.className = `badge ${s.status}`;
+  applyStatusMatrix(s.status);
+  renderDispatchSummary(s);
+  updateTypingBar(s);
+  // D19：以 status 端点权威状态重评门禁 banner。
+  refreshGateFromEvents(currentEvents, s.status);
+}
+
 async function loadStatus() {
   if (!selectedThread) return;
+  const tid = selectedThread;
   try {
-    const s = await api(`/api/threads/${selectedThread}/status`);
-    lastStatus = s;
-    const badge = $("#wk-status");
-    badge.textContent = s.status;
-    badge.className = `badge ${s.status}`;
-    applyStatusMatrix(s.status);
-    renderDispatchSummary(s);
-    // D19：以 status 端点权威状态重评门禁 banner（loadEvents 与 loadStatus 并发，
-    // loadEvents 内首次评估时状态徽章可能尚未落定；此处用已缓存事件 + 权威状态兜底）。
-    refreshGateFromEvents(currentEvents, s.status);
+    const s = await api(`/api/threads/${tid}/status`);
+    if (tid !== selectedThread) return;   // 线程已切换：丢弃过期响应
+    applyStatusPayload(s);
     return s;
   } catch (e) {
     toast("状态加载失败: " + e.message, "err");
   }
 }
 
-// D18：线程头常驻派发摘要 chips（pending/dispatching/gate/failed），
-// 数据来自 status 端点 dispatches（event_id×target×status×attempts）。
+// R5 D6："⋯ {role} 正在响应"胶囊——数据来自既有 status 端点的 dispatching 行，
+// 不新增后端功能；多个并行则并列角色名。
+function updateTypingBar(s) {
+  const bar = $("#typing-bar");
+  if (!bar) return;
+  const roles = Array.from(new Set((s.dispatches || [])
+    .filter((d) => d.status === "dispatching").map((d) => String(d.target))));
+  if (!roles.length) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
+  bar.innerHTML =
+    `<span class="typing-pill"><span class="typing-dots"><i></i><i></i><i></i></span>` +
+    `${roles.map(escapeHtml).join("、")} 正在响应</span>`;
+  bar.classList.remove("hidden");
+}
+
+// D18/R5 D5：线程头派发摘要 chips——仅渲染非零项；全零时一枚不渲染（恒零胶囊=噪音）。
 function renderDispatchSummary(s) {
   const el = $("#dispatch-summary");
   if (!el) return;
   const disp = s.dispatches || [];
   const count = (st) => disp.filter((d) => d.status === st).length;
-  const pending = count("pending");
-  const dispatching = count("dispatching");
-  const failed = count("failed");
-  const gate = s.status === "suspended" ? 1 : 0;
+  const items = [
+    ["pending", count("pending")],
+    ["dispatching", count("dispatching")],
+    ["gate", s.status === "suspended" ? 1 : 0],
+    ["failed", count("failed")],
+  ].filter(([, n]) => n > 0);
+  if (!items.length) { el.innerHTML = ""; return; }
   el.innerHTML =
     `<button id="btn-status" class="disp-chips" title="点击展开完整派发表">` +
-      `<span class="dc pending">pending ${pending}</span>` +
-      `<span class="dc dispatching">dispatching ${dispatching}</span>` +
-      `<span class="dc gate">gate ${gate}</span>` +
-      `<span class="dc failed">failed ${failed}</span>` +
+    items.map(([k, n]) => `<span class="dc ${k}">${k} ${n}</span>`).join("") +
     `</button>`;
   // 重新绑定（innerHTML 覆盖了旧节点）。
   $("#btn-status").addEventListener("click", showStatusDetail);
@@ -819,34 +1020,61 @@ function setCtl(id, enabled, reason) {
   }
 }
 
+// R5 D5：单一主按钮（状态→动作）；suspended 主按钮滚动至门禁 banner。
+const PRIMARY_BY_STATUS = {
+  running: { label: "▶ 运行一轮", act: () => runOnce() },
+  suspended: {
+    label: "⚠ 处理门禁",
+    act: () => {
+      const g = $("#gate-bar");
+      if (!g || g.classList.contains("hidden")) { toast("无挂起门禁", "err"); return; }
+      g.scrollIntoView({ behavior: "smooth", block: "center" });
+      g.classList.remove("flash"); void g.offsetWidth; g.classList.add("flash");
+      setTimeout(() => g.classList.remove("flash"), 1200);
+    },
+  },
+  terminated: { label: "↻ 重开", act: () => reopenThread() },
+};
+let primaryAction = null;
+
 function applyStatusMatrix(status) {
   const running = status === "running";
   const suspended = status === "suspended";
   const terminated = status === "terminated";
 
-  setCtl("#btn-run", running, suspended
-    ? "门禁挂起中，待批准/拒绝恢复后方可运行"
-    : (terminated ? "线程已终止，请先重开" : "当前状态不可运行一轮"));
+  // 主按钮：状态决定文案与动作（禁用规则沿用 R1 矩阵）。
+  const p = PRIMARY_BY_STATUS[status] || PRIMARY_BY_STATUS.running;
+  const btn = $("#btn-primary-action");
+  if (btn) {
+    btn.textContent = p.label;
+    btn.disabled = !(running || suspended || terminated);
+  }
+  primaryAction = p.act;
+
+  // ⋯ 溢出菜单项：回放/接入全状态可用；重开仅 terminated；停机 running/suspended。
+  setCtl("#btn-replay", true, "");
+  setCtl("#btn-attach", true, "");
   setCtl("#btn-reopen", terminated, running
     ? "线程运行中，无需重开"
     : (suspended ? "线程挂起中，无需重开" : "仅已终止线程可重开"));
   setCtl("#btn-stop", running || suspended,
     terminated ? "线程已终止，无需停机" : "");
-  // 状态/回放/接入：全状态可用。
-  setCtl("#btn-status", true, "");
-  setCtl("#btn-replay", true, "");
-  setCtl("#btn-attach", true, "");
 
-  // 发言：terminated 禁用；suspended 允许但入队提示；running 正常。
+  // composer：terminated 禁用（placeholder 给原因）；suspended 入队提示；running 正常。
   const canSend = running || suspended;
   setCtl("#btn-send", canSend, terminated ? "线程已终止，不可发言" : "");
   const sendBody = $("#send-body");
-  if (sendBody) sendBody.disabled = !canSend;
+  if (sendBody) {
+    sendBody.disabled = !canSend;
+    sendBody.placeholder = terminated
+      ? "线程已终止：发言已禁用（可重开后继续）"
+      : "发言…（Enter 发送，Shift+Enter 换行）";
+  }
   const hint = $("#send-hint");
   if (hint) {
-    if (suspended) hint.textContent = "线程挂起中：发言将入队，待门禁恢复后派发";
-    else if (terminated) hint.textContent = "线程已终止：发言已禁用（可重开后继续）";
-    else hint.textContent = "";
+    const msg = suspended ? "线程挂起中：发言将入队，待门禁恢复后派发" : "";
+    hint.textContent = msg;
+    hint.classList.toggle("hidden", !msg);
   }
 
   // 门禁批准/拒绝：仅 suspended 可用（gate banner 显隐由 refreshGate 管）。
@@ -895,6 +1123,120 @@ function updateGateBanner(pendingReq, status) {
 }
 
 // ————————————————————————————————————————————————
+// R5 D6：实时跟新引擎——1.5s 轮询（≤2s），失败退避加倍（至 12s），
+// 页面不可见暂停、可见立即拉取；防并发堆积（上次未返回不发下次）；
+// terminated 停轮。手动刷新按钮已删除。
+// ————————————————————————————————————————————————
+const POLL_BASE = 1500;
+const POLL_MAX = 12000;
+let pollTimer = null;
+let pollInterval = POLL_BASE;
+let pollInFlight = false;
+let pollTick = 0;
+let unseenCount = 0;
+
+function updateLiveIndicator(state) {
+  const el = $("#live-ind");
+  const txt = $("#live-text");
+  if (!el) return;
+  if (state === "hidden") { el.classList.add("hidden"); return; }
+  el.classList.remove("hidden");
+  el.classList.toggle("paused", state === "paused");
+  el.classList.toggle("off", state === "off");
+  if (txt) txt.textContent = state === "live" ? "实时" : (state === "paused" ? "重连中" : "静止");
+}
+
+function updateNewMsgsFloat() {
+  const f = $("#new-msgs");
+  if (!f) return;
+  const n = $("#new-msgs-n");
+  if (n) n.textContent = String(unseenCount);
+  f.classList.toggle("hidden", unseenCount === 0);
+}
+
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(pollLoop, pollInterval);
+}
+
+async function pollLoop() {
+  if (!selectedThread) { updateLiveIndicator("hidden"); return; }
+  if (document.hidden) return;                     // 不可见：暂停（visibilitychange 恢复）
+  if (pollInFlight) { schedulePoll(); return; }    // 防堆积：上次未返回不发下次
+  const tid = selectedThread;
+  pollInFlight = true;
+  let ok = true;
+  try {
+    const [evData, s] = await Promise.all([
+      api(`/api/threads/${tid}/events`),
+      api(`/api/threads/${tid}/status`),
+    ]);
+    if (tid !== selectedThread) { pollInFlight = false; return; }  // 已切线程：丢弃
+    ingestEvents(evData.events || [], false);
+    applyStatusPayload(s);
+  } catch (e) {
+    ok = false;
+  } finally {
+    pollInFlight = false;
+  }
+  pollInterval = ok ? POLL_BASE : Math.min(pollInterval * 2, POLL_MAX);  // 退避加倍/复位
+  if (lastStatus && lastStatus.status === "terminated") {
+    updateLiveIndicator("off");                    // 终态流不再变化：停轮
+    return;
+  }
+  updateLiveIndicator(ok ? "live" : "paused");
+  pollTick += 1;
+  if (pollTick % 5 === 0) loadThreads();           // Q5：线程列表低频捎带自刷
+  schedulePoll();
+}
+
+function startPolling() {
+  clearTimeout(pollTimer);
+  pollInterval = POLL_BASE;
+  pollTick = 0;
+  pollLoop();
+}
+
+// ————————————————————————————————————————————————
+// R5 D8：线程切换浮层（Ctrl/⌘+K；↑↓ 选择、Enter 切换、Esc 关闭）。
+// 列表数据复用线程栏缓存（lastThreads + DOM 内摘要），不发额外请求。
+// ————————————————————————————————————————————————
+let swItems = [];
+let swIndex = 0;
+
+function threadSummaryOf(tid) {
+  const li = document.querySelector(`#thread-list li[data-tid="${CSS.escape(tid)}"]`);
+  const s = li && li.querySelector(".ti-summary");
+  return s ? s.textContent : "";
+}
+
+function renderSwitcherList(query) {
+  const list = $("#switcher-list");
+  const qq = String(query || "").trim().toLowerCase();
+  swItems = lastThreads.filter((t) => {
+    if (!qq) return true;
+    return t.id.toLowerCase().includes(qq)
+      || threadSummaryOf(t.id).toLowerCase().includes(qq);
+  });
+  if (swIndex >= swItems.length) swIndex = Math.max(0, swItems.length - 1);
+  if (!swItems.length) { list.innerHTML = '<li class="sw-empty">无匹配线程</li>'; return; }
+  list.innerHTML = swItems.map((t, i) =>
+    `<li class="${i === swIndex ? "active" : ""}" data-tid="${escapeHtml(t.id)}">` +
+      `<span class="sw-sum">${escapeHtml(threadSummaryOf(t.id) || "（无正文）")}</span>` +
+      `<span class="sw-id">${escapeHtml(t.id)}</span></li>`
+  ).join("");
+}
+
+function openSwitcher() {
+  swIndex = 0;
+  const inp = $("#switcher-input");
+  inp.value = "";
+  renderSwitcherList("");
+  openModal("#switcher");
+  inp.focus();
+}
+
+// ————————————————————————————————————————————————
 // 发言 / 控制条动作
 // ————————————————————————————————————————————————
 async function sendMessage() {
@@ -910,8 +1252,11 @@ async function sendMessage() {
     if (to) payload.to = to;
     const r = await api(`/api/threads/${selectedThread}/send`, { method: "POST", body: payload });
     toast("已发送 E" + r.event_id);
-    $("#send-body").value = "";
+    const ta = $("#send-body");
+    ta.value = "";
+    autoGrowComposer();
     await loadEvents();
+    ta.focus();          // D7：发送成功后清空并保持焦点
   } catch (e) {
     toast("发送失败: " + e.message, "err");
   } finally {
@@ -919,9 +1264,17 @@ async function sendMessage() {
   }
 }
 
+// R5 D7：composer 正文随内容自动增高（至 ~5 行，超出内部滚动）。
+function autoGrowComposer() {
+  const ta = $("#send-body");
+  if (!ta) return;
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 132) + "px";
+}
+
 async function runOnce() {
   if (!selectedThread) return;
-  const btn = $("#btn-run");
+  const btn = $("#btn-primary-action");
   btn.disabled = true;
   try {
     const r = await api(`/api/threads/${selectedThread}/run`, { method: "POST", body: { once: true } });
@@ -941,6 +1294,7 @@ async function reopenThread() {
     const r = await api(`/api/threads/${selectedThread}/reopen`, { method: "POST", body: {} });
     toast("已重开，status=" + r.status);
     await Promise.all([loadEvents(), loadStatus(), loadThreads()]);
+    startPolling();   // 重开后恢复实时跟新
   } catch (e) {
     toast("重开失败: " + e.message, "err");
   }
@@ -965,10 +1319,9 @@ async function showStatusDetail() {
     ).join("");
     if (!rows) rows = '<tr><td colspan="4">（无 pending 派发）</td></tr>';
     const html =
-      `<div class="b-head">派发明细 · status = ${escapeHtml(s.status)}</div>` +
       `<table class="tbl"><thead><tr><th>事件</th><th>目标</th><th>状态</th><th>重试</th></tr></thead>` +
       `<tbody>${rows}</tbody></table>`;
-    showModalInStream(html);
+    showOverlay(`派发明细 · ${s.status}`, html);
   } catch (e) {
     toast("状态明细失败: " + e.message, "err");
   }
@@ -978,7 +1331,7 @@ async function showReplay() {
   if (!selectedThread) return;
   try {
     const r = await api(`/api/threads/${selectedThread}/replay`);
-    showModalInStream(`<div class="b-head">回放 (markdown)</div><pre class="b-body mono">${escapeHtml(r.markdown)}</pre>`);
+    showOverlay("回放（markdown）", `<pre>${escapeHtml(r.markdown)}</pre>`);
   } catch (e) {
     toast("回放失败: " + e.message, "err");
   }
@@ -991,11 +1344,11 @@ async function showAttach() {
   const role = sel.value || (sel.options[1] ? sel.options[1].value : "pm");
   try {
     const r = await api(`/api/threads/${selectedThread}/attach/${encodeURIComponent(role)}`);
-    showModalInStream(
-      `<div class="b-head">接入命令 · 角色 ${escapeHtml(role)}（点击复制）</div>` +
-      `<pre class="b-body mono copyable" title="点击复制">${escapeHtml(r.command)}</pre>`
+    showOverlay(
+      `接入命令 · 角色 ${role}（点击复制）`,
+      `<pre class="copyable" title="点击复制">${escapeHtml(r.command)}</pre>`
     );
-    const pre = $("#chat-stream .copyable");
+    const pre = $("#op-body .copyable");
     if (pre) pre.addEventListener("click", () => {
       navigator.clipboard?.writeText(r.command);
       toast("已复制接入命令");
@@ -1005,14 +1358,6 @@ async function showAttach() {
   }
 }
 
-function showModalInStream(html) {
-  const stream = $("#chat-stream");
-  const div = document.createElement("div");
-  div.className = "bubble r-system";
-  div.innerHTML = html;
-  stream.appendChild(div);
-  stream.scrollTop = stream.scrollHeight;
-}
 
 // —— 门禁裁决 ——
 async function gateDecision(decision) {
@@ -1119,16 +1464,33 @@ function escapeHtml(s) {
 // ————————————————————————————————————————————————
 function bind() {
   $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
-  $("#btn-refresh-threads").addEventListener("click", loadThreads);
+
+  // R5 D4：新建线程 = 弹层流程（不再常驻左栏）。
+  $("#btn-new-thread").addEventListener("click", () => { openModal("#new-thread-modal"); $("#new-task").focus(); });
+  $("#btn-new-thread-empty").addEventListener("click", () => { openModal("#new-thread-modal"); $("#new-task").focus(); });
+  $("#nt-close").addEventListener("click", closeModals);
   $("#btn-create-thread").addEventListener("click", createThread);
-  $("#btn-refresh-events").addEventListener("click", loadEvents);
+  $("#modal-backdrop").addEventListener("click", closeModals);
+  $("#op-close").addEventListener("click", closeModals);
+
+  // R5 D1/D3/D4：三区折叠开关。
+  $("#rail-toggle").addEventListener("click", () =>
+    setRailCollapsed(!$("#threads-layout").classList.contains("rail-collapsed")));
+  $("#board-rail-btn").addEventListener("click", () => setBoardOpen(true));
+  $("#board-toggle").addEventListener("click", () => setBoardOpen(false));
+
+  // R5 D5：单一主按钮 + ⋯ 溢出菜单。
+  $("#btn-primary-action").addEventListener("click", () => { if (primaryAction) primaryAction(); });
+  $("#btn-more").addEventListener("click", (e) => {
+    e.stopPropagation();
+    $("#more-menu").classList.toggle("hidden");
+  });
+  $("#btn-replay").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); showReplay(); });
+  $("#btn-attach").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); showAttach(); });
+  $("#btn-reopen").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); reopenThread(); });
+  $("#btn-stop").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); stopWorkspace(); });
+
   $("#btn-send").addEventListener("click", sendMessage);
-  $("#btn-run").addEventListener("click", runOnce);
-  $("#btn-reopen").addEventListener("click", reopenThread);
-  $("#btn-stop").addEventListener("click", stopWorkspace);
-  // #btn-status 由 renderDispatchSummary 动态生成并绑定（D18 收编"状态"入口）。
-  $("#btn-replay").addEventListener("click", showReplay);
-  $("#btn-attach").addEventListener("click", showAttach);
   $("#btn-approve").addEventListener("click", () => gateDecision("approve"));
   $("#btn-reject").addEventListener("click", () => gateDecision("reject"));
   $("#btn-load-config").addEventListener("click", loadConfig);
@@ -1136,8 +1498,11 @@ function bind() {
   $("#btn-load-metrics").addEventListener("click", loadMetrics);
   $("#btn-run-bench").addEventListener("click", runBench);
 
-  // D16 过滤工具条：多选变更 → 重渲染流；#n 跳转。
+  // R5 D2：筛选弹出面板 + #n 回车跳转（无跳转按钮）。
   populateFilterTypes();
+  $("#btn-filter").addEventListener("click", (e) => { e.stopPropagation(); toggleFilterPop(); });
+  $("#filter-pop").addEventListener("click", (e) => e.stopPropagation());
+  $("#filter-clear").addEventListener("click", clearAllFilters);
   const froles = $("#filter-roles");
   const ftypes = $("#filter-types");
   if (froles) froles.addEventListener("change", readFilters);
@@ -1145,26 +1510,90 @@ function bind() {
   const faonly = $("#filter-aonly");
   if (faonly) faonly.addEventListener("change", readFilters);
   const fgoto = $("#filter-goto");
-  const fgotoBtn = $("#filter-goto-btn");
-  const doGoto = () => {
+  if (fgoto) fgoto.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
     const raw = (fgoto.value || "").replace(/[^\d]/g, "");
     if (!raw) { toast("请输入事件号 #n", "err"); return; }
     gotoEvent(raw);
-  };
-  if (fgotoBtn) fgotoBtn.addEventListener("click", doGoto);
-  if (fgoto) fgoto.addEventListener("keydown", (e) => { if (e.key === "Enter") doGoto(); });
-
-  // D17 黑板栏折叠。
-  const boardToggle = $("#board-toggle");
-  if (boardToggle) boardToggle.addEventListener("click", () => {
-    const panel = $("#board-panel");
-    const collapsed = panel.classList.toggle("collapsed");
-    boardToggle.textContent = collapsed ? "◀ 黑板" : "▶ 黑板";
-    boardToggle.title = collapsed ? "展开黑板栏" : "折叠黑板栏";
   });
 
-  // 事件流内委托：re/corr/黑板 #evt 跳转（data-goto）+ 折叠展开 + system 分组展开。
+  // R5 D7：composer 键盘语义 + 自动增高。
+  const sendBody = $("#send-body");
+  sendBody.addEventListener("input", autoGrowComposer);
+  sendBody.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+
+  // 全局：点击空白关闭菜单/弹出；Esc 关闭一切浮层。
   document.addEventListener("click", (e) => {
+    if (!e.target.closest(".menu-wrap")) $("#more-menu").classList.add("hidden");
+    if (!e.target.closest(".pop-wrap")) toggleFilterPop(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    // R5 D8：Ctrl/⌘+K 线程切换器（快捷键仅此一组 + Esc）。
+    if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      openSwitcher();
+      return;
+    }
+    if (e.key === "Escape") {
+      closeModals();
+      toggleFilterPop(false);
+      $("#more-menu").classList.add("hidden");
+    }
+  });
+
+  // R5 D8：切换器输入过滤 + ↑↓/Enter 键盘导航；点击项切换。
+  const swInput = $("#switcher-input");
+  swInput.addEventListener("input", () => { swIndex = 0; renderSwitcherList(swInput.value); });
+  swInput.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (swIndex < swItems.length - 1) { swIndex++; renderSwitcherList(swInput.value); }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (swIndex > 0) { swIndex--; renderSwitcherList(swInput.value); }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const t = swItems[swIndex];
+      if (t) { closeModals(); selectThread(t.id); }
+    }
+  });
+  $("#switcher-list").addEventListener("click", (e) => {
+    const li = e.target.closest("li[data-tid]");
+    if (li) { closeModals(); selectThread(li.dataset.tid); }
+  });
+
+  // R5 D6：新消息浮标点击回底；用户自行滚回贴底时自动清零。
+  $("#new-msgs").addEventListener("click", () => {
+    const stream = $("#chat-stream");
+    stream.scrollTop = stream.scrollHeight;
+    unseenCount = 0;
+    updateNewMsgsFloat();
+  });
+  $("#chat-stream").addEventListener("scroll", () => {
+    if (unseenCount > 0 && isAtBottom($("#chat-stream"))) {
+      unseenCount = 0;
+      updateNewMsgsFloat();
+    }
+  }, { passive: true });
+
+  // R5 D6：页面不可见暂停轮询；可见立即拉取一次。
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(pollTimer);
+      updateLiveIndicator("paused");
+    } else if (selectedThread) {
+      pollInterval = POLL_BASE;
+      pollLoop();
+    }
+  });
+
+  // 事件流内委托：re/corr/黑板 #evt 跳转（data-goto）+ 折叠展开 + system 分组展开
+  // + 筛选 chip 移除（R5 D2）。
+  document.addEventListener("click", (e) => {
+    const fx = e.target.closest(".fc-x");
+    if (fx) { removeFilter(fx.dataset.fkind, fx.dataset.fval); return; }
     const goto = e.target.closest("[data-goto]");
     if (goto) { gotoEvent(goto.dataset.goto); return; }
     const clamp = e.target.closest(".toggle-clamp");
@@ -1200,6 +1629,7 @@ function bind() {
 // —— 启动 ——
 window.addEventListener("DOMContentLoaded", () => {
   bind();
+  initLayoutPrefs();
   loadHealth();
   loadThreads();
 });
