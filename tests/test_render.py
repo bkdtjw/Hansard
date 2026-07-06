@@ -777,11 +777,8 @@ def test_render_view_meta_carries_background_compression_tokens(thread_dir):
     orig = meta["bg_orig_tokens"]
     summ = meta["bg_summarized_tokens"]
     assert isinstance(orig, int) and isinstance(summ, int)
-    # 未触发压缩 → 摘要 token == 原文 token；且 = 最终背景段 estimate_tokens（可复算）。
-    assert summ == orig, f"未压缩时 orig==summarized，实测 orig={orig} summ={summ}"
-    assert summ == orch.render.estimate_tokens(view["sections"]["background"]), (
-        "bg_summarized_tokens 必须 = 最终背景段 estimate_tokens（可复算对照）"
-    )
+    # 短 body（< _summarize limit）→ 摘要不截断 → 摘要 token == 原文 token（纯 body 同口径，可复算）。
+    assert summ == orig, f"短 body 未压缩时 orig==summarized，实测 orig={orig} summ={summ}"
 
 
 def test_render_view_meta_compression_ratio_shrinks_when_over_quota(thread_dir):
@@ -792,7 +789,7 @@ def test_render_view_meta_compression_ratio_shrinks_when_over_quota(thread_dir):
     # 大量背景件撑过 20% 小窗配额，强制压缩。
     for i in range(40):
         st.append_event(sender="frontend", type="report", to=["moderator"],
-                        body=f"BGRATIO{i:02d} background summary padding content line here")
+                        body=f"BGRATIO{i:02d} " + ("背景层需要被摘要压缩的长内容细节。" * 20))
     fid = st.append_event(sender="tester", type="defect", to=["backend"],
                           body="focus anchor")
     cfg = m1_config(context_window=4000)

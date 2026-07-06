@@ -512,10 +512,13 @@ def render_view(
         + estimate_tokens(instruction_text)
     )
 
-    # §13 背景层压缩比采集（R-T4）：原文 = 压缩前背景层全文 token；摘要 = 压缩后最终
-    # 背景层 token。二值随 render 一起产出（meta.bg_orig_tokens / bg_summarized_tokens），
-    # 由**调度层**在派发后 record_metric（render 模块不持有 store，保持现分层，§2）。
-    bg_orig_tokens = estimate_tokens(_join_background(background_items))
+    # §13 背景层压缩比采集（R-T4；采集时机修复）：原文 = 背景事件 **body 全文** token
+    # （_summarize 摘要前）；摘要 = 压缩后最终背景层 token。background_items 是
+    # (原始事件, 摘要串) 元组，item[0] 保留全文 body，故原文取自 item[0]["body"]。
+    # 旧实现用 _join_background(拼摘要串) 作原文 → orig==summarized、压缩比恒 1.0（失真）。
+    bg_orig_tokens = sum(
+        estimate_tokens(str(item[0].get("body", ""))) for item in background_items
+    )
 
     # —— 预算压缩（§6.3）：配比裁剪（地板）+ 超上限总量压缩 ——
     focus_rendered, background_text, dropped = _compress(
@@ -526,7 +529,12 @@ def render_view(
         budget=budget,
         bg_quota=bg_quota,
     )
-    bg_summarized_tokens = estimate_tokens(background_text)
+    # 摘要 = 背景各事件 _summarize 后 body token 之和（与 bg_orig 同口径：纯 body，
+    # 不含第三人称前缀/压缩删减），二者比值 = 背景层摘要压缩比（§13 可复算，反映 _summarize 真实压缩）。
+    bg_summarized_tokens = sum(
+        estimate_tokens(_summarize(str(item[0].get("body", ""))))
+        for item in background_items
+    )
     # dropped 顺序：背景（配比+总量，最旧先丢）→ 黑板尾截 → 焦点截断，保持
     # "背景整体先于焦点"的既有断言，黑板裁剪夹在二者之间（既非 background 亦非 focus）。
     if blackboard_dropped:
