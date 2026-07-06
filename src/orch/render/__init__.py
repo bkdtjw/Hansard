@@ -164,7 +164,8 @@ def _is_focus_relevant(event: dict, role: str, authored: set[int]) -> bool:
     return any(r in authored for r in re_list)
 
 
-def _classify(events: list[dict], role: str, chat_ttl: int):
+def _classify(events: list[dict], role: str, chat_ttl: int,
+              trigger_ids: frozenset | set = frozenset()):
     """把事件流按保留策略 + 相关性分桶（§3.2 A/B/C/D）。
 
     返回 (focus_events, background_items)：
@@ -172,6 +173,13 @@ def _classify(events: list[dict], role: str, chat_ttl: int):
       background_items: 需入背景层的 (event, summary_line) 列表，升序，含
         不相关 B、全部 C、以及在 chat_ttl 窗口内的 D。
     A 类不进事件流（走黑板投影）；D 超 chat_ttl 丢弃。
+
+    Q7 裁决（选项 A，2026-07-06 人类裁决）：本轮**触发批次**（trigger_ids =
+    view.event_ids）内的事件无论保留策略一律全文入焦点窗——指令尾要求"只针对
+    #N 回应"，#N 的内容就必须可见（真实联跑铁证：gate_decision 触发 moderator
+    时 prompt 全文不含 approve，kimi 答"未收到 #5 事件内容"）。批次外语义不变。
+    连带修复同类盲区：to=[] 走兜底路由的触发件对 moderator 原本也不满足
+    §6.2 相关性判定（to 不含我/from 非我/re 不交），此前只进背景层一行摘要。
     """
     authored = _role_authored_ids(events, role)
     total = len(events)
@@ -179,6 +187,10 @@ def _classify(events: list[dict], role: str, chat_ttl: int):
     background: list[tuple[dict, str]] = []
 
     for pos, ev in enumerate(events):
+        # Q7 裁决 A：触发件必须可见——无论 A/B/C/D，一律全文入焦点窗。
+        if ev.get("id") in trigger_ids:
+            focus.append(ev)
+            continue
         pol = _retention_of(ev.get("type", ""))
         if pol == "A":
             # A 类永久投影黑板层，不作为普通事件混入焦点/背景（§3.2）。
@@ -483,8 +495,9 @@ def render_view(
     chat_ttl = int(thread_defaults.get("chat_ttl", _DEFAULT_CHAT_TTL))
     budget = _context_window(config, role)
 
-    # —— 分桶（§3.2）——
-    focus_events, background_items = _classify(events, role, chat_ttl)
+    # —— 分桶（§3.2；Q7 裁决 A：触发批次一律入焦点窗）——
+    focus_events, background_items = _classify(events, role, chat_ttl,
+                                               trigger_ids=set(ids))
 
     # —— 不参与总量压缩的三段（系统层 / 黑板层 / 指令尾）——
     system_text = _build_system(config, role)

@@ -50,7 +50,8 @@ Q7 [render/§6.2×§10] A 类触发事件对目标角色不可见：gate_decisio
         入焦点窗（"触发件必须可见"原则；最小改动，连带修复 acceptance/decision 触发
         同类盲区）——推荐；B gate_decision 专项——approve 时把裁决文本并进指令尾或
         伴随一条 B 类 system 事件；C 修订 spec §6.2 明确 A 类触发件渲染语义。
-  裁决: {人填}
+  裁决: 2026-07-06 用户裁决采 A（"你推荐方法不错可以"）：触发批次（view.event_ids）
+        内的事件无论保留策略一律全文入焦点窗；批次外 A/C/D 语义不变。测试先行实现。
 
 Q6 [gate/§10] "非正式门禁"不可恢复：非 gate_request 信封发往 human 挂起后 approve KeyError
   背景: 真实联跑（calc 线程 t-934119b0）moderator 以 handoff→[human] 收尾 → §5.1 置
