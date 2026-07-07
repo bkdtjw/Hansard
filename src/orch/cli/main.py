@@ -119,6 +119,43 @@ def _find_thread_dirs(workspace: Path) -> list[Path]:
     )
 
 
+def _force_utf8_stdio() -> None:
+    """审视快赢②（P1 乱码根治）：Windows GBK 控制台/管道下中文输出全乱码。
+
+    stdout/stderr 统一重配 UTF-8；不支持 reconfigure 的流（StringIO/测试替身）
+    静默跳过。模块导入即生效，覆盖全部子命令（含 serve 的启动横幅）。
+    """
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_stdio()
+
+
+def _attach_run_log_handler() -> None:
+    """审视快赢①：把核心环 orch.run 过程日志接到 stderr（[run] 前缀）。
+
+    幂等：已挂过则只重绑当前 stderr（CliRunner 每次调用替换 sys.stderr）。
+    """
+    import logging
+    import sys
+    lg = logging.getLogger("orch.run")
+    for h in lg.handlers:
+        if getattr(h, "_orch_run_cli", False):
+            h.stream = sys.stderr
+            lg.setLevel(logging.INFO)
+            return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[run] %(message)s"))
+    handler._orch_run_cli = True
+    lg.addHandler(handler)
+    lg.setLevel(logging.INFO)
+
+
 def _echo(msg: str) -> None:
     typer.echo(msg)
 
@@ -274,6 +311,9 @@ def cmd_run(
     """
     ws = _resolve_workspace(workspace)
     ws.mkdir(parents=True, exist_ok=True)
+    _attach_run_log_handler()   # 快赢①：核心环过程日志 → stderr
+    warned_fake = False
+    announced_resident = False
 
     while True:
         # 步骤 1：orch.stop 标志优先 —— 消费并立即退出（C-2）。
@@ -296,6 +336,12 @@ def cmd_run(
             if cfg.get("adapters") and cfg.get("roles"):
                 adapters = _build_adapters_from_config(roles, cfg, tdir)
             else:
+                # 快赢③（P1 防"假跑"误导）：无 adapters/roles 配置必须显式告知。
+                if not warned_fake:
+                    _echo("⚠ [run] workspace 无 adapters/roles 配置——使用 Fake 演示适配器"
+                          "（仅验证控制流，非真实模型输出）。真实联跑请在 config.yaml "
+                          "配置 adapters + roles（见 docs/USAGE.md）。")
+                    warned_fake = True
                 adapters = _build_default_adapters(roles)
             try:
                 orch.scheduler.run_thread(store, cfg, adapters)
@@ -305,6 +351,9 @@ def cmd_run(
         # 步骤 3：--once 结束；常驻模式睡一觉再回步骤 1（同时检查 stop 标志）。
         if once:
             return
+        if not announced_resident:  # 快赢①：长驻不再无声（一次性横幅）
+            _echo(f"[run] 常驻监听中（每 {interval}s 巡一轮；Ctrl-C 或 orch stop 退出）")
+            announced_resident = True
         try:  # pragma: no cover - 常驻模式手动 Ctrl-C 走出，测试不覆盖
             time.sleep(interval)
         except KeyboardInterrupt:
@@ -507,7 +556,11 @@ def cmd_approve(
 ) -> None:
     """门禁裁决 approve（spec §10）：产生 gate_decision(approve) + resume。"""
     ws = _resolve_workspace(workspace)
-    _apply_gate(ws, thread, corr, approve=True)
+    try:
+        _apply_gate(ws, thread, corr, approve=True)
+    except KeyError as exc:   # 快赢④：一行人话，不向用户喷 Traceback
+        _echo(f"[错误] {exc.args[0] if exc.args else exc}")
+        raise typer.Exit(code=1)
     _echo(f"[approve] thread={thread} corr={corr}")
 
 
@@ -521,7 +574,11 @@ def cmd_reject(
 ) -> None:
     """门禁裁决 reject（spec §10）：产生 gate_decision(reject) + resume（不执行特权）。"""
     ws = _resolve_workspace(workspace)
-    _apply_gate(ws, thread, corr, approve=False)
+    try:
+        _apply_gate(ws, thread, corr, approve=False)
+    except KeyError as exc:   # 快赢④：一行人话，不向用户喷 Traceback
+        _echo(f"[错误] {exc.args[0] if exc.args else exc}")
+        raise typer.Exit(code=1)
     _echo(f"[reject] thread={thread} corr={corr}")
 
 

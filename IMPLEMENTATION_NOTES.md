@@ -241,3 +241,10 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 - 证据：测试先行 3 连（test_e2e informal gate）红→绿；283 passed 全量零回归；
   真实卡死线程 t-934119b0 经 `orch approve gate-4` 恢复（suspended→running，
   E5 gate_decision corr=gate-4 → moderator）。记 QUESTIONS.md Q6（判定=实现缺口非开放决策）。
+
+### 可用性审视快赢五连（2026-07-06，docs/usability-review-20260706.md §五，Lead 亲做）
+- ① run 过程日志：core 经 logging("orch.run") 发派发/回复落盘/挂起事件（零 print 零签名改动），
+  cmd_run 挂 stderr handler（幂等重绑）+ 长驻一次性横幅；② 入口 _force_utf8_stdio 根治 GBK
+  乱码（无 reconfigure 流静默容忍）；③ 无 adapters/roles 的 run 显式警告 Fake 演示适配器；
+  ④ approve/reject 的 KeyError → 一行人话 + exit 1（不喷 Traceback）；⑤ docs/USAGE.md
+  五分钟上手（操作者向）。测试先行 5 连（test_cli_ux_quickwins）红→绿，291 passed 零回归。

@@ -12,6 +12,7 @@ mock 角色无 worktree → 跳过 autocommit 与越权审计（§4.5，契约 �
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from itertools import groupby
@@ -32,6 +33,10 @@ from orch.scheduler.systemexec import (
     run_privileged_and_callbacks,
 )
 from orch.scheduler.watchdog import check_watchdogs
+
+# 审视快赢①（docs/usability-review-20260706.md P1）：核心环过程日志。
+# 库层只发 logging 事件（零 print、零签名改动）；CLI 在 cmd_run 挂 stderr handler。
+_RUN_LOG = logging.getLogger("orch.run")
 
 # 单次调用超时预算（秒）。M0 mock 同步返回，deadline 只用于崩溃后看门狗对账（§9.1 b）。
 # spec §5.3 的"单次调用超时"级别在 M0 恢复算法中生效；主动触发是 M1（契约 §6.4）。
@@ -741,6 +746,10 @@ def run_thread(
                 for eid in event_ids:
                     store.mark_gate_wait(eid, target)
                 store.set_meta("status", "suspended")
+                _RUN_LOG.info(
+                    "%s E%s → human 挂起等待人工裁决（orch approve gate-{事件号} 可恢复）",
+                    store.thread_dir.name, event_ids,
+                )
                 return  # §10：整体停机，挂起不消耗资源。
 
             if not _dispatch_group(store, config, adapters, target, event_ids):
@@ -786,6 +795,8 @@ def _dispatch_group(
     merged_ids = sorted(set(event_ids) | fresh_ids)
     if merged_ids != list(event_ids):
         event_ids = merged_ids
+
+    _RUN_LOG.info("%s E%s → %s 派发…", store.thread_dir.name, event_ids, target)
 
     # 标 dispatching + 落盘绝对截止时间戳（§4.4 事务(2)、§16.2）。
     deadline_ts = time.time() + _timeout_for(config, target)
@@ -935,6 +946,10 @@ def _dispatch_group(
     )
     for eid in event_ids[1:]:
         store.mark_done(eid, target)
+
+    _RUN_LOG.info("%s E%d %s 回复落盘（type=%s，re=E%s）",
+                  store.thread_dir.name, reply_id, target,
+                  reply.get("type"), event_ids)
 
     # R-T3（§16.9）：会话 upsert 后持久化本轮热续判据基线（last_evt / bb_version / gen）到
     # thread_meta，供下轮 _resume_eligible 从盘重建判断。仅当本轮确实产出会话（sess 非空）时
