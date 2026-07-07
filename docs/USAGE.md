@@ -17,7 +17,7 @@ orch --help
 mkdir demo-ws
 orch new "试一下" --roles pm,moderator --workspace demo-ws
 orch run --once --workspace demo-ws
-orch replay --workspace demo-ws --thread <上一步输出的 t-xxxx>
+orch replay <上一步输出的 t-xxxx> --workspace demo-ws
 ```
 
 会看到显式警告 `⚠ 使用 Fake 演示适配器`——这是假回声，只验证控制流。
@@ -73,14 +73,16 @@ orch serve --workspace <ws> --port 8801
 
 打开 http://127.0.0.1:8801 ：群聊事件流实时跟新（1.5s 轮询）、黑板（契约/决策/
 任务）、门禁一键批准/拒绝、▶运行一轮、回放、Ctrl+K 切换线程。
-一个 serve 对应一个 workspace；多工作区起多个端口。
+一个 serve 可同时管多个工作区：`orch serve -w A -w B -w C --port 8801`，
+顶栏出现下拉切换（单工作区时自动隐藏）。
 
 ## 5. 门禁：线程"挂起"了怎么办
 
 任何发给 human 的信封都会**挂起线程**等你裁决（安全设计）：
 
 - 控制台：顶部琥珀条 → 点【批准】/【拒绝】。
-- 命令行：`orch approve <corr> --thread t-xxxx --workspace <ws>`
+- 命令行：`orch approve <corr> --workspace <ws>`（按 corr 自动定位线程；
+  多线程撞 corr 时才需加 `--thread t-xxxx` 消歧）
   - 正式门禁的 corr 形如 `gate-01`（gate_request 自带）；
   - 普通请示（agent 直接 @你）corr = `gate-{事件号}`（挂起日志里会直接给出）。
 - 批准后线程恢复，继续 `orch run`（若 run 长驻着则自动续跑）。
@@ -92,9 +94,9 @@ orch serve --workspace <ws> --port 8801
 | `orch new "任务" --roles a,b --workspace ws` | 建线程（任务成为 E1） |
 | `orch run [--once] --workspace ws` | 驱动调度（长驻/单轮） |
 | `orch send t-xx "内容" --workspace ws` | 以 human 身份发言 |
-| `orch approve/reject <corr> --thread t-xx --workspace ws` | 门禁裁决 |
+| `orch approve/reject <corr> --workspace ws` | 门禁裁决（corr 唯一命中自动定位线程） |
 | `orch threads / status t-xx --workspace ws` | 列线程 / 看状态与派发 |
-| `orch replay --thread t-xx --workspace ws` | 全程回放（markdown） |
+| `orch replay t-xx --workspace ws` | 全程回放（markdown；终止后到达的在途回复带 ⏱ 标记） |
 | `orch reopen t-xx --workspace ws` | 重开已终止线程 |
 | `orch attach t-xx <role> --workspace ws` | 拿到某角色会话的接入命令 |
 | `orch metrics --workspace ws` | 聚合节省/首次合法率等指标 |

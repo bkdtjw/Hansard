@@ -535,6 +535,27 @@ def cmd_status(
 # orch approve / reject
 # ——————————————————————————————————————————————————————————————
 
+def _resolve_gate_thread(ws: Path, corr: str) -> str:
+    """spec §12 `orch approve|reject <corr>`：缺省 --thread 时按 corr 扫描唯一定位。
+
+    只查表（§16.10 禁猜测）：逐线程用 systemexec 的门禁定位（正式 gate_request
+    或 §10 生成形 gate-{事件号} 反解）判定命中；0 命中/多命中都拒绝并给人话。
+    """
+    from orch.scheduler.systemexec import _find_gate_request, _find_informal_gate
+    hits: list[str] = []
+    for tdir in _find_thread_dirs(ws):
+        store = orch.store.Store(tdir)
+        if _find_gate_request(store, corr) or _find_informal_gate(store, corr):
+            hits.append(tdir.name)
+    if not hits:
+        raise KeyError(f"未找到 corr={corr} 的门禁信封（已扫描 workspace 全部线程）")
+    if len(hits) > 1:
+        raise KeyError(
+            f"corr={corr} 命中多个线程（{', '.join(sorted(hits))}），请用 --thread 指定"
+        )
+    return hits[0]
+
+
 def _apply_gate(workspace: Path, thread: str, corr: str, approve: bool) -> None:
     """公共门禁裁决路径（走 scheduler.apply_gate_decision）。"""
     store = _open_thread_store(workspace, thread)
@@ -548,38 +569,44 @@ def _apply_gate(workspace: Path, thread: str, corr: str, approve: bool) -> None:
 
 @app.command("approve")
 def cmd_approve(
-    corr: str = typer.Argument(..., help="gate_request 的 corr。"),
-    thread: str = typer.Option(..., "--thread", help="线程 id。"),
+    corr: str = typer.Argument(..., help="门禁 corr（gate-01 或生成形 gate-{事件号}）。"),
+    thread: str | None = typer.Option(
+        None, "--thread", help="线程 id；缺省按 corr 扫描唯一定位（撞车时才必填）。",
+    ),
     workspace: str | None = typer.Option(
         None, "--workspace", help="workspace 根目录。",
     ),
 ) -> None:
-    """门禁裁决 approve（spec §10）：产生 gate_decision(approve) + resume。"""
+    """门禁裁决 approve（spec §10/§12 `orch approve <corr>`）：gate_decision + resume。"""
     ws = _resolve_workspace(workspace)
     try:
-        _apply_gate(ws, thread, corr, approve=True)
+        tid = thread or _resolve_gate_thread(ws, corr)
+        _apply_gate(ws, tid, corr, approve=True)
     except KeyError as exc:   # 快赢④：一行人话，不向用户喷 Traceback
         _echo(f"[错误] {exc.args[0] if exc.args else exc}")
         raise typer.Exit(code=1)
-    _echo(f"[approve] thread={thread} corr={corr}")
+    _echo(f"[approve] thread={tid} corr={corr}")
 
 
 @app.command("reject")
 def cmd_reject(
-    corr: str = typer.Argument(..., help="gate_request 的 corr。"),
-    thread: str = typer.Option(..., "--thread", help="线程 id。"),
+    corr: str = typer.Argument(..., help="门禁 corr（gate-01 或生成形 gate-{事件号}）。"),
+    thread: str | None = typer.Option(
+        None, "--thread", help="线程 id；缺省按 corr 扫描唯一定位（撞车时才必填）。",
+    ),
     workspace: str | None = typer.Option(
         None, "--workspace", help="workspace 根目录。",
     ),
 ) -> None:
-    """门禁裁决 reject（spec §10）：产生 gate_decision(reject) + resume（不执行特权）。"""
+    """门禁裁决 reject（spec §10/§12）：gate_decision(reject) + resume（不执行特权）。"""
     ws = _resolve_workspace(workspace)
     try:
-        _apply_gate(ws, thread, corr, approve=False)
+        tid = thread or _resolve_gate_thread(ws, corr)
+        _apply_gate(ws, tid, corr, approve=False)
     except KeyError as exc:   # 快赢④：一行人话，不向用户喷 Traceback
         _echo(f"[错误] {exc.args[0] if exc.args else exc}")
         raise typer.Exit(code=1)
-    _echo(f"[reject] thread={thread} corr={corr}")
+    _echo(f"[reject] thread={tid} corr={corr}")
 
 
 # ——————————————————————————————————————————————————————————————
@@ -945,8 +972,12 @@ def _fmt_pct(x: float | None) -> str:
 
 @app.command("metrics")
 def cmd_metrics(
-    thread: str | None = typer.Option(
-        None, "--thread", help="只统计单个线程；缺省汇总 workspace 全部线程。",
+    thread_arg: str | None = typer.Argument(
+        None, metavar="[THREAD]",
+        help="只统计单个线程（spec §12 写法：orch metrics t-001）；缺省汇总全部。",
+    ),
+    thread_opt: str | None = typer.Option(
+        None, "--thread", help="同上（旧写法兼容别名）。",
     ),
     workspace: str | None = typer.Option(
         None, "--workspace", help="workspace 根目录；缺省为当前目录。",
@@ -963,6 +994,7 @@ def cmd_metrics(
       6) 混沌轮数与两层结果（mock 100% / 真实 %）
       7) 新增供应商 adapter 行数（cloc，从第 3 家起算）
     """
+    thread = thread_arg or thread_opt
     ws = _resolve_workspace(workspace)
     dirs = _thread_dirs_for_metrics(ws, thread)
 
@@ -1101,9 +1133,38 @@ def _render_replay_line(ev: dict) -> str:
     return f"#{ev_id} [{sender}->{to_part}] ({etype}): {body}"
 
 
+def _late_after_id(events: list[dict]) -> int | None:
+    """③迟到标记（P3，展示层）：最后一条 terminate 的事件号。
+
+    其后落盘的非 system 事件 = 终止前已在飞行中的在途回复（"日志=真相"，
+    §5.4 只拒新派发不拒落账）——如实入账但加标记免读者困惑。
+    """
+    ids = [int(e["id"]) for e in events if e.get("type") == "terminate"]
+    return max(ids) if ids else None
+
+
+def _render_replay_lines(events: list[dict]) -> list[str]:
+    """整流渲染：逐行 _render_replay_line + 终止后到达标记（CLI 与 web 共用）。"""
+    late_after = _late_after_id(events)
+    out: list[str] = []
+    for ev in events:
+        line = _render_replay_line(ev)
+        if (late_after is not None and int(ev.get("id") or 0) > late_after
+                and ev.get("from") != "system"):
+            line += "　⏱（终止后到达：在途回复，如实入账）"
+        out.append(line)
+    return out
+
+
 @app.command("replay")
 def cmd_replay(
-    thread: str = typer.Option(..., "--thread", help="线程 id（如 t-abc123）。"),
+    thread_arg: str | None = typer.Argument(
+        None, metavar="[THREAD]",
+        help="线程 id（spec §12 写法：orch replay t-001）。",
+    ),
+    thread_opt: str | None = typer.Option(
+        None, "--thread", help="线程 id（旧写法兼容别名，等价位置参数）。",
+    ),
     workspace: str | None = typer.Option(
         None, "--workspace", help="workspace 根目录；缺省为当前目录。",
     ),
@@ -1112,7 +1173,12 @@ def cmd_replay(
 
     第三人称标签 `[from->@to1,@to2...]` 只取自事件 to 字段（§16.1 硬约束：
     不从 body 正文解析 @ 提及进入路由标签）。
+    语法统一（spec §12 回归）：thread 为位置参数；--thread 保留兼容。
     """
+    thread = thread_arg or thread_opt
+    if not thread:
+        _echo("[错误] 缺少线程 id：orch replay t-001（或旧写法 --thread t-001）")
+        raise typer.Exit(code=1)
     ws = _resolve_workspace(workspace)
     store = _open_thread_store(ws, thread)
     events = store.events()
@@ -1122,8 +1188,8 @@ def cmd_replay(
         _echo(f"(thread {thread} 暂无事件)")
         return
 
-    for ev in events:
-        _echo(_render_replay_line(ev))
+    for line in _render_replay_lines(events):
+        _echo(line)
 
 
 # ——————————————————————————————————————————————————————————————
@@ -1132,8 +1198,9 @@ def cmd_replay(
 
 @app.command("serve")
 def cmd_serve(
-    workspace: str | None = typer.Option(
-        None, "--workspace", help="workspace 根目录；缺省为当前目录。",
+    workspace: list[str] | None = typer.Option(
+        None, "--workspace", "-w",
+        help="workspace 根目录，可重复传多个（②多工作区单控制台，顶栏下拉切换）；缺省当前目录。",
     ),
     host: str = typer.Option("127.0.0.1", "--host", help="监听地址。"),
     port: int = typer.Option(8787, "--port", help="监听端口。"),
@@ -1145,11 +1212,14 @@ def cmd_serve(
     """
     from orch.web.server import make_server
 
-    ws = _resolve_workspace(workspace)
-    ws.mkdir(parents=True, exist_ok=True)
-    srv = make_server(ws, host, port)
+    ws_list = [_resolve_workspace(w) for w in (workspace or [None])]
+    for w in ws_list:
+        w.mkdir(parents=True, exist_ok=True)
+    srv = make_server(ws_list if len(ws_list) > 1 else ws_list[0], host, port)
     actual_port = srv.server_address[1]
-    _echo(f"[serve] http://{host}:{actual_port}  workspace={ws}")
+    _echo(f"[serve] http://{host}:{actual_port}")
+    for w in ws_list:
+        _echo(f"[serve]   workspace: {w}")
     _echo("[serve] Ctrl-C 停止。")
     try:  # pragma: no cover - 常驻循环，测试走 make_server 直接起停
         srv.serve_forever()

@@ -207,9 +207,8 @@ def _ep_thread_replay(ws: Path, tid: str) -> tuple[int, dict]:
     if not events:
         lines.append(f"(thread {tid} 暂无事件)")
     else:
-        for ev in events:
-            # 复用 CLI 层第三人称行渲染，不拷格式。
-            lines.append(clim._render_replay_line(ev))
+        # 复用 CLI 层整流渲染（第三人称行 + ③终止后到达标记），不拷格式。
+        lines.extend(clim._render_replay_lines(events))
     return 200, {"markdown": "\n".join(lines)}
 
 
@@ -378,8 +377,17 @@ def _ep_bench(ws: Path, body: dict) -> tuple[int, dict]:
 # HTTP handler：路由分发 + 静态资源 + 错误 JSON。
 # ——————————————————————————————————————————————————————————————
 
-def _make_handler(workspace: Path):
-    ws = workspace
+def _make_handler(ws_map: dict, default_name: str):
+    """② 多工作区单控制台：ws_map = {名字: Path}（有序），每请求按 ?ws= 解析。"""
+
+    def _pick_ws(query) -> Path:
+        vals = query.get("ws") or []
+        if not vals or not vals[0]:
+            return ws_map[default_name]   # 缺省 = 第一个（向后兼容零参数请求）
+        name = vals[0]
+        if name not in ws_map:
+            raise _ApiError(404, f"未知工作区: {name}")
+        return ws_map[name]
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "orch-web/1.0"
@@ -453,8 +461,19 @@ def _make_handler(workspace: Path):
             self._send_json(status, payload)
 
         def _route_api(self, method, parts, query, body):
+            # ② 多工作区：每请求解析目标工作区（?ws=名字；缺省第一个）。
+            ws = _pick_ws(query)
+
             # parts[0] == 'api'
             # —— 顶层端点 ——
+            if parts == ["api", "workspaces"]:
+                if method != "GET":
+                    raise _ApiError(405, "workspaces 仅支持 GET")
+                return 200, {
+                    "workspaces": [{"name": n, "path": str(p)} for n, p in ws_map.items()],
+                    "default": default_name,
+                }
+
             if parts == ["api", "health"]:
                 if method != "GET":
                     raise _ApiError(405, "health 仅支持 GET")
@@ -571,10 +590,23 @@ def _make_handler(workspace: Path):
 def make_server(workspace, host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
     """构造并返回一个常驻 HTTP server（调用方负责 serve_forever / shutdown）。
 
-    workspace：进程内固定的 workspace 根（Path 或 str）。port=0 → OS 选空闲端口，
-    实际端口从 server.server_address[1] 取（测试用）。
+    workspace：单个 workspace 根（Path/str，签名向后兼容）或 **list**（② 多工作区
+    单控制台）：每请求经 `?ws=名字` 选择，缺省第一个；名字 = 目录名（同名去重加
+    -2/-3 后缀）。port=0 → OS 选空闲端口，实际端口从 server.server_address[1] 取。
     """
-    ws = Path(workspace).resolve()
-    handler = _make_handler(ws)
+    if isinstance(workspace, (list, tuple)):
+        paths = [Path(w).resolve() for w in workspace]
+    else:
+        paths = [Path(workspace).resolve()]
+    ws_map: dict = {}
+    for p in paths:
+        base = p.name or str(p)
+        name, k = base, 2
+        while name in ws_map:      # 同名目录去重：alpha、alpha-2、alpha-3…
+            name = f"{base}-{k}"
+            k += 1
+        ws_map[name] = p
+    default_name = next(iter(ws_map))
+    handler = _make_handler(ws_map, default_name)
     server = ThreadingHTTPServer((host, port), handler)
     return server

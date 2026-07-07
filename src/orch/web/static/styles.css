@@ -80,6 +80,11 @@ body {
 .brand-name { font-size: 17px; font-weight: 700; letter-spacing: 1px; }
 .brand-sub { font-size: 12px; color: var(--txt-dim); }
 .ws-info { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* ② 多工作区下拉（>1 个工作区才显示） */
+.ws-select {
+  width: auto; max-width: 150px; flex: 0 0 auto;
+  padding: 4px 8px; font-size: 12px;
+}
 .ws-path {
   font-size: 12px; color: var(--txt-meta);
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
@@ -531,6 +536,11 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .bb-pin {
   font-size: 11px; color: #4ade80; padding: 1px 7px; border-radius: var(--radius-chip);
   background: rgba(74, 222, 128, 0.12); border: 1px solid #4ade8066; white-space: nowrap;
+}
+/* ③迟到标记：终止后到达的在途回复（P3 展示层，如实入账） */
+.late-pin {
+  font-size: 11px; color: #cbb27a; padding: 1px 7px; border-radius: var(--radius-chip);
+  background: rgba(203, 178, 122, 0.12); border: 1px solid #cbb27a55; white-space: nowrap;
 }
 
 /* —— D12 回复链 chip（↩ 回复 #n）与 corr chip；点击滚动+高亮 —— */

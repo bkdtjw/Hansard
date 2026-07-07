@@ -26,6 +26,11 @@ let lastThreads = [];
 // R5 D3：每线程"首个 A 类自动展开一次"记忆 + A 类计数变化检测（新条目高亮）。
 const boardAutoShown = new Set();
 let lastBoardACount = -1;
+// ③迟到标记（P3 展示层）：最后一条 terminate 的事件号；其后落盘的非 system 事件
+// = 终止前已在飞行中的在途回复（日志=真相，如实入账但加标记免困惑）。
+let lateAfterId = null;
+// ② 多工作区单控制台：当前工作区名（null=单工作区模式，请求不加 ?ws=）。
+let currentWs = null;
 
 // —— R5：UI 偏好（折叠态等视图偏好，可存 localStorage；不持有任何库状态） ——
 const UIPREF = {
@@ -85,7 +90,11 @@ async function api(path, { method = "GET", body = null } = {}) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const resp = await fetch(path, opts);
+  // ② 多工作区：全部请求自动携带当前工作区（单工作区时 currentWs=null 不加参）。
+  const url = currentWs
+    ? path + (path.includes("?") ? "&" : "?") + "ws=" + encodeURIComponent(currentWs)
+    : path;
+  const resp = await fetch(url, opts);
   let data;
   const text = await resp.text();
   try {
@@ -120,6 +129,53 @@ function isTempWorkspace(p) {
   const s = String(p || "");
   // 兼容正反斜杠 + 大小写：%TEMP% 常见形态 与 AppData\Local\Temp。
   return /(^|[\\/])temp([\\/]|$)/i.test(s) || /appdata[\\/]local[\\/]temp/i.test(s);
+}
+
+// ————————————————————————————————————————————————
+// ② 多工作区单控制台：顶栏下拉切换（>1 个才显示；偏好存 localStorage）。
+// ————————————————————————————————————————————————
+async function loadWorkspaces() {
+  const sel = $("#ws-select");
+  if (!sel) return;
+  try {
+    const w = await api("/api/workspaces");
+    const list = w.workspaces || [];
+    if (list.length <= 1) {
+      sel.classList.add("hidden");
+      currentWs = null;
+      return;
+    }
+    let stored = null;
+    try { stored = localStorage.getItem("orch.ui.ws"); } catch (e) { /* 忽略 */ }
+    currentWs = list.some((x) => x.name === stored) ? stored : (w.default || list[0].name);
+    sel.innerHTML = list.map((x) =>
+      `<option value="${escapeHtml(x.name)}"${x.name === currentWs ? " selected" : ""}>` +
+      `${escapeHtml(x.name)}</option>`
+    ).join("");
+    sel.classList.remove("hidden");
+  } catch (e) {
+    // 旧后端无 workspaces 端点：静默按单工作区模式。
+    sel.classList.add("hidden");
+    currentWs = null;
+  }
+}
+
+function switchWorkspace(name) {
+  if (name === currentWs) return;
+  currentWs = name;
+  try { localStorage.setItem("orch.ui.ws", name); } catch (e) { /* 忽略 */ }
+  // 清干净线程态：停轮询、回空态首页，再拉新工作区数据。
+  selectedThread = null;
+  currentEvents = [];
+  lastStatus = null;
+  unseenCount = 0;
+  clearTimeout(pollTimer);
+  updateLiveIndicator("hidden");
+  updateNewMsgsFloat();
+  $("#workspace").classList.add("hidden");
+  $("#workspace-empty").classList.remove("hidden");
+  loadHealth();
+  loadThreads();
 }
 
 async function loadHealth() {
@@ -575,6 +631,10 @@ function buildEventHead(ev) {
   // D11：type 徽章语义类 tb-{type}；A 类附"已入黑板"图钉。
   const typeBadge = `<span class="ev-type tb-${escapeHtml(type)}">${escapeHtml(type)}</span>`;
   const pin = isA ? `<span class="bb-pin" title="A 类事件：已投影进黑板">📌 已入黑板</span>` : "";
+  // ③迟到标记：终止后到达的在途回复（非 system）。
+  const late = (lateAfterId !== null && ev.id > lateAfterId && sender !== "system")
+    ? `<span class="late-pin" title="该调用在线程终止前已发出，回复在终止后落盘（在途回复，如实入账）">⏱ 终止后到达</span>`
+    : "";
   const clock = fmtClock(ev.ts);
   const clockEl = clock ? `<span class="ev-time" title="ts">${clock}</span>` : "";
   return (
@@ -585,6 +645,7 @@ function buildEventHead(ev) {
       `<span class="to-chips">${chips}</span>` +
       typeBadge +
       pin +
+      late +
       `<span class="head-spacer"></span>` +
       buildMetaTip(ev) +
       `<span class="ev-id">#${escapeHtml(String(ev.id))}</span>` +
@@ -693,6 +754,8 @@ function updateThreadTitle() {
 function renderStream(stickBottom = false) {
   const stream = $("#chat-stream");
   const prevTop = stream.scrollTop;   // R5 D6：非贴底时冻结滚动位置
+  const termIds = currentEvents.filter((e) => e.type === "terminate").map((e) => e.id);
+  lateAfterId = termIds.length ? Math.max(...termIds) : null;   // ③迟到标记基准
   const shown = applyFilters(currentEvents);
   if (!shown.length) {
     stream.innerHTML = currentEvents.length
@@ -1478,6 +1541,9 @@ function escapeHtml(s) {
 function bind() {
   $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
+  // ② 多工作区切换。
+  $("#ws-select").addEventListener("change", (e) => switchWorkspace(e.target.value));
+
   // R5 D4：新建线程 = 弹层流程（不再常驻左栏）。
   $("#btn-new-thread").addEventListener("click", () => { openModal("#new-thread-modal"); $("#new-task").focus(); });
   $("#btn-new-thread-empty").addEventListener("click", () => { openModal("#new-thread-modal"); $("#new-task").focus(); });
@@ -1640,9 +1706,10 @@ function bind() {
 }
 
 // —— 启动 ——
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   bind();
   initLayoutPrefs();
+  await loadWorkspaces();   // ②：先定当前工作区，后续请求自动携带 ?ws=
   loadHealth();
   loadThreads();
 });

@@ -248,3 +248,18 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   乱码（无 reconfigure 流静默容忍）；③ 无 adapters/roles 的 run 显式警告 Fake 演示适配器；
   ④ approve/reject 的 KeyError → 一行人话 + exit 1（不喷 Traceback）；⑤ docs/USAGE.md
   五分钟上手（操作者向）。测试先行 5 连（test_cli_ux_quickwins）红→绿，291 passed 零回归。
+
+### 审视遗留 P2×2 + P3 三连（2026-07-06，用户点名"全部"，Lead 亲做，测试先行）
+- ① CLI 语法统一（实为 spec §12 回归）：replay/metrics 的 thread 改位置参数（spec 原文
+  `orch replay t-001` / `orch metrics [t-001]`），--thread 保留兼容别名；approve/reject
+  按 spec `<corr>` 单参——缺省 --thread 时 _resolve_gate_thread 按 corr 扫描唯一定位
+  （0/多命中一行人话拒绝）。统一语法规则：必需目标=位置参数，可选过滤/消歧=选项。
+- ③ 迟到回复标记（展示层，零协议/DDL 改动）：_late_after_id + _render_replay_lines
+  （CLI 与 web replay 共用），终止号后非 system 事件行加 ⏱ 标记；控制台卡片头同款
+  late-pin 徽章（fluency 线程真实 E10 preview 亲验恰一枚，终止前零误标）。
+- ② 多工作区单控制台：make_server 接受 list（签名向后兼容），每请求 ?ws= 选择
+  （缺省第一个），/api/workspaces 新端点，同名目录去重 -2/-3；serve -w 可重复；
+  前端 api() 自动携带 currentWs + 顶栏下拉（>1 才显示，localStorage 记忆），
+  切换时清线程态/停轮询。
+- 证据：test_cli_grammar 6 连 + test_late_reply_marker 2 连 + test_web_multiws 3 连
+  红→绿；全量 302 passed 零回归；preview 8796 三工作区实切 + 真实 E10 徽章亲验。
