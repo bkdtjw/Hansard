@@ -334,3 +334,26 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   不建共享实例——降级触发显式 KeyError,宁可响亮失败不静默串 worktree（与 M2 期
   "未知 target"健壮性缺口同族）；②api/mock 型 fallback 在真实装配无实例（既有
   "真实装配仅 cli"边界的延伸）；③装载校验只在两处 run 装配触发,只读命令不阻断。
+- T5 控制台按钮 Lead 亲验（8795/todo-ws 真实配置,DOM .click() + HTTP + 磁盘三方
+  对账,浏览器窗格无法合成画面故沿 W1 先例用 DOM/HTTP 证据）：点「⛔ 停用」（填
+  reason）→ /api/adapters 变 disabled/by=human/ts 打点 → adapter_state.json 磁盘
+  同一事实 → `orch adapters` CLI 读到同一行 ⛔；面板警示条/页签红点同步出现；
+  点「✅ 恢复」→ enabled + streak 清零；未知 name POST → 400；console 零报错。
+- T6 ✅ 适配器切换混沌（chaos/__init__.py 单文件 +641 行）：_AdapterProbeStore 在
+  store 公开边界外挂 fault_check（不动调度层）,六个 M5 真实注入点（跳闸/切换审计/
+  换绑重派 各前后）+ random_mix（池并入 M4 §4.4 五间隙,§9.4"任意时刻"字面）;
+  断粮计数=以 ledger 已落行数推导（盘上事实,跨 kill 成立,主备接力）;幂等重发按
+  ledger 标记位置取脚本项;轮内保留状态文件（真相层,跳闸延续正是被验语义）、
+  轮间全重置防串轮;20 轮 100%、seed 入 ChaosReport（加第六字段,M4 五字段未动）。
+  追认四条：六 site 超集兼容 T1 的 in 断言；random_mix 并 M4 池合法；ChaosReport
+  加 seed 字段合法；mock 返回 {sid,gen} 使换绑分支在 mock 语境可达（副作用不在
+  比较产物内）。负对照证实假绿测不出:去幂等→ledger-duplicate,内存计数→
+  primary-not-auto-tripped。
+- **R2（spec 冲突裁决,T6 跨 seed 取证发现）**：契约 §3 初稿"跳闸后本轮 continue
+  下轮接手"与 spec §5.6.3"**立即**按 §5.6.2 重解析"冲突——kill 把双角色跳闸错开
+  时,同批下游组先产出回复,交错偏离基准（≈1.5% 轮次,types-mismatch: report/defect
+  相邻互换）。裁决:spec 字面胜,契约文本已订正（R1 频次口径同步补记）。落地:
+  _dispatch_group(_async) 改薄外层重试循环+_TRIP_RETRY 哨兵,同轮就地重解析→
+  当场换绑重跑本组（组间最小事件号先后不变;异步组内串行重试,不加跨组屏障;
+  终止性=跳闸单向+链长有限,零计数器）。因果取证:monkeypatch 关掉修复,三锚点
+  seed(7/107/20260704) 精确复现同一失败签名;打开后全 20/20。
