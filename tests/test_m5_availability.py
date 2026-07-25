@@ -1321,22 +1321,46 @@ def test_g_fallback_run_matches_baseline_artifacts(tmp_dir, like_feature_script)
     assert all(inst.calls for inst in spare.values()), \
         {k: v.calls for k, v in spare.items()}
 
-    # ② 每个角色恰一条切换审计事件（§5.6.2 首次才记），且都不生成派发行。
+    # ② 每个角色恰一条切换审计**事件**（§5.6.2 "同一（role，生效绑定）连续派发只在
+    #    首次记录"），且都不生成派发行。
     switches = _audit_events(st, "fallback_switch")
     assert {e["meta"]["role"] for e in switches} == set(like_feature_script.keys())
     assert len(switches) == len(like_feature_script)
     for ev in switches:
         assert _dispatch_count_for_event(tdir, ev["id"]) == 0
-    assert len(_metric_rows(tdir, "fallback_switch")) == len(like_feature_script)
 
-    # ③ 剔除审计事件后的事件类型序列 == 附录B 期望序列。
+    # ③ §13 "降级切换次数 | 每次 effective ≠ 主绑定的**派发**记一条"——**逐次口径**，
+    #    与 ② 的"审计事件每角色首次一条"有意不同：spec §13 与 §5.6.2 措辞不同，
+    #    宪法优先，metrics 按 §13 字面逐次派发计数（Lead R1 裁决）。
+    #    附录B 降级跑各角色派发次数 = 该角色备胎实例的 invoke 次数，构成：
+    #      moderator 5 + pm 2 + backend 3 + frontend 3 + tester 3 = 16 次。
+    switch_rows = _metric_rows(tdir, "fallback_switch")
+    per_role_dispatches = {inst.role: len(inst.calls) for inst in spare.values()}
+    assert per_role_dispatches == {
+        "moderator": 5, "pm": 2, "backend": 3, "frontend": 3, "tester": 3,
+    }, per_role_dispatches
+    assert len(switch_rows) == sum(per_role_dispatches.values()) == 16, (
+        f"§13 逐次口径：每次降级派发记一条（期望 16 条），实得 {len(switch_rows)} 条"
+    )
+
+    # 稳健叠加（不锁 extra 具体格式——契约 §4 只要求 extra 含 role/from/to）：
+    # 按 extra 中出现的角色名分组，角色集合须覆盖全部五角色，逐角色条数须 == 派发次数。
+    by_role: dict[str, int] = {}
+    for row in switch_rows:
+        hits = [r for r in like_feature_script if r in str(row["extra"])]
+        assert len(hits) == 1, f"metrics extra 应可唯一定位角色: {row['extra']!r} -> {hits}"
+        by_role[hits[0]] = by_role.get(hits[0], 0) + 1
+    assert set(by_role) == set(like_feature_script.keys()), by_role
+    assert by_role == per_role_dispatches, (by_role, per_role_dispatches)
+
+    # ④ 剔除审计事件后的事件类型序列 == 附录B 期望序列。
     real_types = [
         e["type"] for e in sorted(st.events(), key=lambda x: x["id"])
         if (e.get("meta") or {}).get("kind") not in _M5_AUDIT_KINDS
     ]
     assert real_types == EXPECTED_TYPE_SEQUENCE, real_types
 
-    # ④ ledger 与黑板 state.json 与基准逐字节一致（事件号按名次规范化，见本节抬头）。
+    # ⑤ ledger 与黑板 state.json 与基准逐字节一致（事件号按名次规范化，见本节抬头）。
     base_rank = _rank_map(base_st)
     rank = _rank_map(st)
     assert _normalized_ledger(ledger, rank) == _normalized_ledger(base_ledger, base_rank)

@@ -41,6 +41,21 @@ import orch.render
 import orch.store
 
 from orch.scheduler._dispatch import session_rows
+from orch.scheduler.availability import (
+    TRANSPORT_FAILURE_ERRORS,
+    AdapterAvailability,
+    AdapterUnavailableError,
+    adapter_instance,
+    make_availability,
+    note_blocked,
+    note_fallback_switch,
+    on_invoke_success,
+    on_transport_failure,
+    on_unavailable,
+    primary_adapter_name,
+    rebind_session_if_needed,
+    resolve_binding,
+)
 from orch.scheduler.core import (
     _MAX_SCHEMA_RETRY,
     _apply_bb_if_eligible,
@@ -61,7 +76,9 @@ from orch.scheduler.core import (
     _role_conf,
     _role_worktree,
     _session_for_upsert,
+    _session_row,
     _timeout_for,
+    _transport_failure_fallout,
     _view_with_retry_note,
     _write_scope,
 )
@@ -202,6 +219,9 @@ async def _dispatch_group_async(
     target: str,
     event_ids: list[int],
     lock: asyncio.Lock,
+    *,
+    availability: AdapterAvailability | None = None,
+    effective: str | None = None,
 ) -> None:
     """处理单个 (target, event_ids) 组的异步版本。
 
@@ -211,8 +231,18 @@ async def _dispatch_group_async(
 
     组内单卡失败（schema/audit 越权）不抛出到 TaskGroup（避免拖累其他并行组）：
     异常路径通过 mark_failed + system event 落盘表达。
+
+    M5 §5.6（契约 §3 "两条环对等"）：与 core._dispatch_group **复用同一批辅助函数**
+    （orch.scheduler.availability）——实例按生效绑定名取、切换审计与换绑冷启动、跳闸
+    与 streak 记账全部同源。availability 为 None（config 无 adapter_state_path）时
+    以下全部退化为不存在，异常兜底路径逐字保持既有。
     """
-    adapter = adapters[target]
+    if availability is None:
+        adapter = adapters[target]      # 老路径逐字不变（角色名键）。
+        primary = ""
+    else:
+        primary = primary_adapter_name(config, target)
+        adapter = adapter_instance(adapters, target, str(effective), primary)
 
     # § 4.4 事务(2)：标 dispatching + 落 deadline_ts。
     # §9.1 R-a：崩溃恢复兼容——进入 invoke 前再查一次同 target 的 pending 派发行，
@@ -225,6 +255,16 @@ async def _dispatch_group_async(
         merged_ids = sorted(set(event_ids) | fresh_ids)
         if merged_ids != list(event_ids):
             event_ids = merged_ids
+        # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，与 core._dispatch_group 同源同修）：
+        # 切换审计事件（首次、不生成派发行）+ 会话作废（sid 空/gen+1/backend 更新）+ 本组
+        # attempts 归零。全部在锁内（sqlite 单连接串行化）。
+        if availability is not None:
+            eff = str(effective)
+            if eff != primary:
+                note_fallback_switch(store, availability, target, primary, eff)
+            rebind_session_if_needed(
+                store, _session_row(store, target), target, eff, event_ids,
+            )
         for eid in event_ids:
             store.mark_dispatching(eid, target, deadline_ts)
         # R-T2 · E（§8.2 首轮审计兜底，与 core._dispatch_group 同源同修）：worktree 存在但
@@ -253,7 +293,26 @@ async def _dispatch_group_async(
         try:
             raw_env, sess = await _invoke_adapter(adapter, cur_view, sess)
         except Exception as exc:
-            # invoke 异常视为一次失败（不抛出，落盘）
+            # M5 §5.6.3（仅在启用时）：先按分类结果消费，与同步环同源。
+            if availability is not None and isinstance(exc, AdapterUnavailableError):
+                # 特征命中 → 跳闸 + 审计 + 指标；该次失败不计 attempts，行回 pending，
+                # 本轮跳过（下轮重解析由备胎接手）。
+                async with lock:
+                    on_unavailable(store, availability, str(effective), exc)
+                    for eid in event_ids:
+                        store.set_pending(eid, target)
+                return
+            if availability is not None and isinstance(exc, TRANSPORT_FAILURE_ERRORS):
+                # 其他传输级失败 → 既有 attempts 语义（同源 _transport_failure_fallout）
+                # 叠加 fail_streak 记账（达阈值则跳闸 + 审计 + 指标）。
+                async with lock:
+                    on_transport_failure(
+                        store, config, availability, str(effective), exc,
+                    )
+                    _transport_failure_fallout(store, target, event_ids, exc)
+                return
+            # invoke 异常视为一次失败（不抛出，落盘）——未启用 M5 或非传输级异常时
+            # 走既有兜底路径，逐字不变。
             async with lock:
                 for eid in event_ids:
                     store.mark_failed(eid, target)
@@ -263,6 +322,9 @@ async def _dispatch_group_async(
                     to=["moderator"],
                 )
             return
+        if availability is not None:
+            # §5.6.3：传输层成功 → fail_streak 归零（schema 成败与可用性无关）。
+            on_invoke_success(availability, str(effective))
         # 审计原文（本次实际送出的视图文本）+ §13 采集点1 tokens/cost（与 core 同源同修）。
         async with lock:
             store.write_invoke_log(
@@ -350,7 +412,11 @@ async def _dispatch_group_async(
 
         # R-T3（§6.5 热续接线，与 core._dispatch_group 同源同修）：把 adapter 返回的会话
         # （{sid,gen}）在回复落盘同一事务内 upsert 到 sessions 表；sess=None（mock）→ 不 upsert。
-        session_upsert = _session_for_upsert(store, config, target, event_ids, sess)
+        # M5 §5.6.2：启用时 backend 列记**生效绑定**（与换绑判据自洽）。
+        session_upsert = _session_for_upsert(
+            store, config, target, event_ids, sess,
+            backend=str(effective) if availability is not None else None,
+        )
 
         # 回复落盘 + 标 done
         reply_id = store.reply_and_done(
@@ -411,6 +477,10 @@ async def run_thread_async(
     async with lock:
         _finish_interrupted_terminate(store, config)
 
+    # M5 §5.6：可用性视图（config['adapter_state_path'] 缺失 → None = 整体不启用，
+    # 与同步环同一开关）。只造不读，首读在每轮的 reload()。
+    availability = make_availability(config)
+
     while True:
         async with lock:
             status = store.get_meta("status")
@@ -440,14 +510,40 @@ async def run_thread_async(
 
         groups = _group_pending(pending)
 
+        # §5.6.1：每轮调度前重读状态文件（与同步环同源；禁止只在启动时读一次）。
+        # §5.6.2：解析发生在标 dispatching 之前；聚合与并行判定不变（角色级概念，与绑定无关）。
+        effective_by_target: dict[str, str | None] = {}
+        schedulable: list[tuple[str, list[int]]] = []
+        if availability is not None:
+            availability.reload()
+            for tgt, eids in groups:
+                eff = resolve_binding(config, tgt, availability)
+                if eff is None:
+                    # 全部不可用 → 本组保持 pending、不 invoke、不消耗 attempts；
+                    # 首次进入阻塞态追加通告事件；其余角色照常调度，线程不挂起。
+                    async with lock:
+                        note_blocked(store, tgt, primary_adapter_name(config, tgt))
+                    continue
+                effective_by_target[tgt] = eff
+                schedulable.append((tgt, eids))
+            if not schedulable:
+                # 本轮无可调度组 → 返回（"等待"退化为返回，禁止忙等；与同步环同义）。
+                return
+        else:
+            schedulable = list(groups)
+
         # 按写域相交关系分批：批内并行，批间串行
-        batches = _partition_parallel_groups(config, groups)
+        batches = _partition_parallel_groups(config, schedulable)
 
         for batch in batches:
             if len(batch) == 1:
                 # 单组批：串行调用
                 tgt, eids = batch[0]
-                await _dispatch_group_async(store, config, adapters, tgt, eids, lock)
+                await _dispatch_group_async(
+                    store, config, adapters, tgt, eids, lock,
+                    availability=availability,
+                    effective=effective_by_target.get(tgt),
+                )
             else:
                 # 多组批：TaskGroup 并行调用（每卡异常已在 _dispatch_group_async 内落盘吸收）
                 async with asyncio.TaskGroup() as tg:
@@ -455,6 +551,8 @@ async def run_thread_async(
                         tg.create_task(
                             _dispatch_group_async(
                                 store, config, adapters, tgt, eids, lock,
+                                availability=availability,
+                                effective=effective_by_target.get(tgt),
                             )
                         )
 

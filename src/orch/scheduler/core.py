@@ -22,6 +22,21 @@ import orch.render
 import orch.store
 
 from orch.scheduler._dispatch import session_rows
+from orch.scheduler.availability import (
+    TRANSPORT_FAILURE_ERRORS,
+    AdapterAvailability,
+    AdapterUnavailableError,
+    adapter_instance,
+    make_availability,
+    note_blocked,
+    note_fallback_switch,
+    on_invoke_success,
+    on_transport_failure,
+    on_unavailable,
+    primary_adapter_name,
+    rebind_session_if_needed,
+    resolve_binding,
+)
 from orch.scheduler.permissions import (
     audit_write_scope,
     autocommit,
@@ -381,11 +396,13 @@ def _invalidate_sid(store, config: dict, role: str, srow: dict) -> None:
 
 
 def _session_for_upsert(store, config: dict, role: str, event_ids: list[int],
-                        sess: dict | None) -> dict | None:
+                        sess: dict | None, backend: str | None = None) -> dict | None:
     """把 adapter 返回的会话（{sid,gen}）规范化为 reply_and_done 的 session upsert 入参。
 
     §7.5 sessions 列：role / backend / sid / last_evt / gen。sess 为 None（mock 无会话）→
-    返回 None（不 upsert，与接线前逐字一致）。backend 取角色绑定的 adapter 名（config）。
+    返回 None（不 upsert，与接线前逐字一致）。backend 缺省取角色绑定的 adapter 名（config）；
+    M5 §5.6.2 降级派发时由调用方显式传入**生效绑定名**（否则会话表会被写回主绑定，
+    与"effective ≠ sessions.backend 视为会话死亡"的判据自相矛盾）。
     last_evt = 本批最大事件号（§6.5 下轮增量起点）。
 
     gen 单调不减（spec §7.2"gen += 1"语义：会话代际计数只增）：取 adapter 返回 gen 与盘上
@@ -399,7 +416,7 @@ def _session_for_upsert(store, config: dict, role: str, event_ids: list[int],
     prev_gen = int(prev.get("gen") or 0)
     return {
         "role": role,
-        "backend": _adapter_name(config, role),
+        "backend": backend if backend else _adapter_name(config, role),
         "sid": sess.get("sid"),
         "last_evt": int(max(event_ids)),
         "gen": max(adapter_gen, prev_gen),
@@ -721,6 +738,10 @@ def run_thread(
     # 补完（复用已存在的总结事件、清扫 pending、置 terminated），再进主循环。
     _finish_interrupted_terminate(store, config)
 
+    # M5 §5.6：可用性视图（config['adapter_state_path'] 缺失 → None = 降级路由整体不启用，
+    # 两条环走与 M0–M4 逐字相同的老路径）。此处只造不读，首读在每轮的 reload()。
+    availability = make_availability(config)
+
     while True:
         status = store.get_meta("status")
         if status in ("suspended", "terminated"):
@@ -740,6 +761,14 @@ def run_thread(
 
         groups = _group_pending(pending)
 
+        # §5.6.1：**每轮调度前**重读适配器状态文件（禁止只在启动时读一次）——外部写者
+        # （CLI / 控制台）在两轮之间的 enable/disable 必须立刻对本轮解析生效。
+        if availability is not None:
+            availability.reload()
+
+        # 本轮是否有任何组真正进入派发（§5.6.2 阻塞态判定用）。
+        dispatched_any = False
+
         for target, event_ids in groups:
             # target==human → gate_wait + 挂起（§10）。
             if target == "human":
@@ -752,8 +781,25 @@ def run_thread(
                 )
                 return  # §10：整体停机，挂起不消耗资源。
 
-            if not _dispatch_group(store, config, adapters, target, event_ids):
-                # 组内失败已落盘（failed + system 转 moderator）；继续下一组。
+            # §5.6.2 生效绑定解析：**在标 dispatching 之前**现算（聚合与并行判定不变）。
+            effective: str | None = None
+            if availability is not None:
+                effective = resolve_binding(config, target, availability)
+                if effective is None:
+                    # 全部不可用 → 该组保持 pending、不 invoke、不消耗 attempts；
+                    # 首次进入阻塞态追加一条通告事件；其余角色照常调度，线程不挂起。
+                    note_blocked(store, target, primary_adapter_name(config, target))
+                    _RUN_LOG.info(
+                        "%s E%s → %s 无可用适配器，保持 pending 等待人工 enable（§5.6.2）",
+                        store.thread_dir.name, event_ids, target,
+                    )
+                    continue
+
+            dispatched_any = True
+            if not _dispatch_group(store, config, adapters, target, event_ids,
+                                   availability=availability, effective=effective):
+                # 组内失败已落盘（failed + system 转 moderator，或跳闸后回 pending）；
+                # 继续下一组。
                 continue
 
             # 组处理后若线程状态改变（terminate/suspend），立即回到外层判定。
@@ -761,7 +807,43 @@ def run_thread(
             if st in ("suspended", "terminated"):
                 return
 
+        if availability is not None and not dispatched_any:
+            # §5.6.2：本轮**无可调度组**（全部角色阻塞）→ 立即返回。同步环的"等待"退化为
+            # 返回，与 M0"无待办即返回"同一机制；**禁止**库内 sleep 忙等（轮询归 orch run）。
+            _RUN_LOG.info("%s 本轮无可调度组（全部角色阻塞），返回等待外层轮询",
+                          store.thread_dir.name)
+            return
+
         # 一轮 groups 处理完，回到 while 顶部重取 pending（新回复已入队）。
+
+
+def _transport_failure_fallout(store, target: str, event_ids: list[int],
+                               exc: BaseException) -> bool:
+    """§5.1 传输级失败（超时 / 进程失败 / 无法解析出信封）的既有 attempts 语义。
+
+        attempts += 1；attempts ≤ 1 → 回到 pending 重派发；否则 failed + system 事件
+        to=[moderator] 报告。
+
+    M5 只在其上**叠加** availability.record_failure（见调用点），本函数不碰可用性。
+    组是一次 invoke（§5.1 聚合），故按组统一裁决：任一行预算耗尽 → 整组 failed。
+    恒返回 False（调用方按"本组未产出回复"继续下一组）。
+    """
+    new_attempts = [store.bump_attempt(eid, target) for eid in event_ids]
+    if max(new_attempts) <= 1:
+        for eid in event_ids:
+            store.set_pending(eid, target)
+        _RUN_LOG.info("%s E%s → %s 传输级失败（attempts=%d），回 pending 重派发：%r",
+                      store.thread_dir.name, event_ids, target, max(new_attempts), exc)
+        return False
+    for eid in event_ids:
+        store.mark_failed(eid, target)
+    append_system_event(
+        store,
+        body=(f"角色 {target} 对 E{event_ids} 的调用传输级失败且重试预算耗尽"
+              f"（attempts={max(new_attempts)}）：{exc!r}"),
+        to=["moderator"],
+    )
+    return False
 
 
 def _dispatch_group(
@@ -770,8 +852,21 @@ def _dispatch_group(
     adapters: dict,
     target: str,
     event_ids: list[int],
+    *,
+    availability: AdapterAvailability | None = None,
+    effective: str | None = None,
 ) -> bool:
     """处理单个 (target, event_ids) 组。成功返回 True，失败（两次 schema 败）返回 False。
+
+    M5 §5.6（availability 非 None 时才启用；为 None 时以下全部退化为不存在）：
+      · adapter 实例按**生效绑定名**取（契约 §3）；
+      · effective ≠ 主绑定 → 首次追加切换审计事件 + 指标；
+      · effective ≠ sessions.backend → 会话作废（sid 空 / gen+1 / backend 更新）+ 本组
+        attempts 归零，随后按冷启动路径 invoke；
+      · invoke 抛 AdapterUnavailableError → 跳闸（by=auto）+ 审计 + 指标，行回 pending、
+        attempts 不变，本轮跳过（下轮重解析由备胎接手）；
+      · 其他传输级失败 → 既有 attempts 语义（_transport_failure_fallout）+ record_failure；
+      · 成功 invoke → record_success。schema 校验失败**不触碰**可用性（§5.6.3）。
 
     落盘顺序严格对齐 §5.1：mark_dispatching(+deadline) → invoke → schema 校验（原地重调一次）
     → reply_and_done（系统字段 from/re） → apply bb_ops → verify 钩子已并入定稿 → 终止检查。
@@ -785,7 +880,12 @@ def _dispatch_group(
     (event_ids) 与"若无崩溃则正常聚合"一致，脚本命中恢复正常。合并仅新增 event_ids（不覆盖
     已排入的），也不改变派发行 (event_id, target) 唯一约束。
     """
-    adapter = adapters[target]
+    if availability is None:
+        adapter = adapters[target]      # 老路径逐字不变（角色名键）。
+        primary = ""
+    else:
+        primary = primary_adapter_name(config, target)
+        adapter = adapter_instance(adapters, target, str(effective), primary)
 
     # §9.1 R-a：崩溃恢复后再查一次同 target 的 pending 行，合并入本批。
     # `pending_dispatches()` 只返回 status='pending' 的行；本组在这一步尚未 mark_dispatching。
@@ -797,6 +897,20 @@ def _dispatch_group(
         event_ids = merged_ids
 
     _RUN_LOG.info("%s E%s → %s 派发…", store.thread_dir.name, event_ids, target)
+
+    # ————————————————————————————————————————————————————————
+    # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，聚合与并行判定不变）：
+    #   ① effective ≠ 主绑定 → 首次追加切换审计事件（不生成派发行）+ §13 埋点；
+    #   ② effective ≠ sessions.backend → 视为会话死亡：sid 置空 / gen+1 / backend 更新，
+    #      并对本组各行 attempts 归零，随后自然走冷启动全量组装（§6.1–6.4）。
+    # ————————————————————————————————————————————————————————
+    if availability is not None:
+        eff = str(effective)
+        if eff != primary:
+            note_fallback_switch(store, availability, target, primary, eff)
+        rebind_session_if_needed(
+            store, _session_row(store, target), target, eff, event_ids,
+        )
 
     # 标 dispatching + 落盘绝对截止时间戳（§4.4 事务(2)、§16.2）。
     deadline_ts = time.time() + _timeout_for(config, target)
@@ -832,7 +946,27 @@ def _dispatch_group(
     cur_view = view          # 首次用原视图；失败后切换为携带错误说明的重调视图。
     cur_view_text = view_text
     while attempt <= _MAX_SCHEMA_RETRY:
-        raw_env, sess = adapter.invoke(cur_view, sess)
+        try:
+            raw_env, sess = adapter.invoke(cur_view, sess)
+        except AdapterUnavailableError as exc:
+            if availability is None:
+                raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。
+            # §5.6.3 第 1 条：立即跳闸（记在**自己解析出的**生效绑定名上）+ 审计 + 指标；
+            # 该次失败**不计** attempts，派发行回 pending，本轮跳过 → 下轮重解析接手。
+            on_unavailable(store, availability, str(effective), exc)
+            for eid in event_ids:
+                store.set_pending(eid, target)
+            return False
+        except TRANSPORT_FAILURE_ERRORS as exc:
+            if availability is None:
+                raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。
+            # §5.6.3 第 2 条：既有 attempts / 重试语义不变，**叠加** fail_streak 记账。
+            on_transport_failure(store, config, availability, str(effective), exc)
+            return _transport_failure_fallout(store, target, event_ids, exc)
+        if availability is not None:
+            # §5.6.3：传输层成功（拿到了输出）→ fail_streak 归零。后续 schema 校验的
+            # 成败与可用性无关（输出质量问题不是可用性问题）。
+            on_invoke_success(availability, str(effective))
         # 审计原文（§14 一等公民）：本次实际送出的视图文本 + 输出原文。
         store.write_invoke_log(
             event_ids=event_ids, role=target,
@@ -936,7 +1070,12 @@ def _dispatch_group(
     # upsert 到 sessions 表（§7.5，走 store 既有 reply_and_done 的 session 通道，不新增 store
     # 方法、不改 sessions DDL）。sess 为 None（mock 无会话）或 {sid,gen}（CLI/Fake）——None
     # 时不 upsert，与接线前逐字一致（mock 恒冷启动、混沌零扰动）。
-    session_upsert = _session_for_upsert(store, config, target, event_ids, sess)
+    # M5 §5.6.2：会话表的 backend 列记**生效绑定**（降级期间落主绑定会与"effective ≠
+    # sessions.backend 视为会话死亡"的判据自相矛盾）；未启用时仍取角色绑定名（逐字不变）。
+    session_upsert = _session_for_upsert(
+        store, config, target, event_ids, sess,
+        backend=str(effective) if availability is not None else None,
+    )
 
     # [事务(5)] 回复落盘 + 标 done（对本组每一行都标 done）。
     # reply_and_done 只标一行 done；组内其余行单独标 done（同批聚合，一次回复覆盖全组）。

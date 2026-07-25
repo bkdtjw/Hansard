@@ -194,11 +194,16 @@ class Store:
         blackboard_ops: list[dict] | None = None,
         meta: dict | None = None,
         ts: float | None = None,
+        make_dispatches: bool = True,
     ) -> int:
         """插入 events（id 自增）+ 为每个 to 目标插 dispatches(pending)。
 
         to 为空 → 生成 target='moderator' 的派发行（§4.4(1) 兜底落盘）。
         terminate 型不生成派发行（§5.4）。返回 event_id。
+
+        make_dispatches=False（M5 §5.6.2 通告类事件）：**只落事件、不生成任何派发行**
+        ——"比照 terminate（§5.4）：落盘但不生成派发行"，是通告不是待办。缺省 True 时
+        本方法行为与既有逐字一致（既有全部调用点均不传该参数）。
         """
         ts_val = time.time() if ts is None else ts
         to_list = list(to) if to else []
@@ -229,8 +234,8 @@ class Store:
             )
             event_id = int(cur.lastrowid)
 
-            # 派发行生成（§4.4(1)）。
-            if type not in _NO_DISPATCH_TYPES:
+            # 派发行生成（§4.4(1)）；make_dispatches=False → 整段跳过（§5.6.2 通告类）。
+            if make_dispatches and type not in _NO_DISPATCH_TYPES:
                 targets = to_list if to_list else ["moderator"]
                 for tgt in targets:
                     self._con.execute(
@@ -432,6 +437,24 @@ class Store:
             self._con.execute(
                 "UPDATE dispatches SET status=? WHERE event_id=? AND target=?",
                 (status, event_id, target),
+            )
+            self._con.commit()
+        except BaseException:
+            self._con.rollback()
+            raise
+
+    def reset_attempts(self, event_id: int, target: str) -> None:
+        """§5.6.2 换绑重派：该派发行 attempts 归零（新后端享有完整重试预算）。
+
+        M5 契约 §5 新增原语。既有 bump_attempt 只增不减、set_pending 只改 status，
+        故"归零"无等价原语可复用。单事务直写，不触碰 status/deadline_ts。
+        """
+        self._begin()
+        try:
+            self._con.execute(
+                "UPDATE dispatches SET attempts = 0"
+                " WHERE event_id=? AND target=?",
+                (event_id, target),
             )
             self._con.commit()
         except BaseException:
