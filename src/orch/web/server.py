@@ -170,6 +170,12 @@ def _ep_thread_run(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
     # config 定义了真实 adapters+roles → 装真实 CLI 后端（与 orch run 同一判断，Q1/Q2 陪跑）；
     # 否则回退默认 Fake（mock 冒烟）。真实后端下 run_thread 会同步跑真实 CLI，请求耗时较长。
     if config.get("adapters") and config.get("roles"):
+        # M5 §5.6/§11.1 生产装配接线（与 orch run 同源：clim._prepare_availability_config）：
+        # 先装载期校验，错误清单非空 → 400 一行人话；合法则把状态文件路径写回 config，
+        # 调度层每轮 reload 自然感知控制台/CLI 的 enable/disable，无需任何推送通道。
+        errors = clim._prepare_availability_config(config, clim._workspace_config_path(ws))
+        if errors:
+            raise _ApiError(400, "config.yaml 可用性配置非法（§11.1）：" + "；".join(errors))
         adapters = clim._build_adapters_from_config(roles, config, ws / tid)
     else:
         adapters = clim._build_default_adapters(roles)
@@ -261,6 +267,52 @@ def _ep_config_put(ws: Path, body: dict) -> tuple[int, dict]:
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "config.yaml").write_text(raw, encoding="utf-8")
     return 200, {"ok": True}
+
+
+# ——————————————————————————————————————————————————————————————
+# M5 §5.6/§12：适配器可用性三端点。写路径与 CLI **同一** AdapterAvailability
+# （整文件 JSON 原子替换），控制台开关与 `orch adapter enable|disable` 完全等价。
+# 投影口径（config 声明 ∪ 状态文件记录）复用 clim._adapter_rows，不拷第二份。
+# ——————————————————————————————————————————————————————————————
+
+def _availability_for(ws: Path):
+    """(config 字典, 可用性视图)；状态文件损坏 → 500 一行人话（§5.6.1 禁止猜测）。"""
+    from orch.adapters.state import AdapterStateError
+
+    cfg_path = clim._workspace_config_path(ws)
+    cfg = clim._read_config_file(cfg_path)
+    try:
+        return cfg, clim._open_availability(cfg_path)
+    except AdapterStateError as exc:
+        raise _ApiError(500, str(exc)) from exc
+
+
+def _ep_adapters(ws: Path) -> tuple[int, dict]:
+    """GET /api/adapters → {"adapters":[{name,status,reason,by,ts,fail_streak}…]}。"""
+    cfg, availability = _availability_for(ws)
+    return 200, {"adapters": clim._adapter_rows(cfg, availability)}
+
+
+def _ep_adapter_set(ws: Path, action: str, body: dict) -> tuple[int, dict]:
+    """POST /api/adapters/{enable,disable} → 200 + 新 snapshot；未知 name → 400。
+
+    disable 一律 by="human"（控制台是人工写者，与 §5.6.3 的 by="auto" 跳闸区分开）；
+    enable 顺带清零 fail_streak（§5.6.3 唯一恢复路径）。
+    """
+    name = body.get("name")
+    if not name or not isinstance(name, str):
+        raise _ApiError(400, "name 必填（字符串）")
+    cfg, availability = _availability_for(ws)
+    known = clim._known_adapter_names(cfg, availability)
+    # known 为空 = 该 workspace 既无 config 声明也无历史记录：无从校验，不拒（与 CLI 同规则）。
+    if known and name not in known:
+        raise _ApiError(400, f"未知 adapter 名: {name}")
+    if action == "disable":
+        reason = body.get("reason")
+        availability.disable(name, reason=str(reason or ""), by="human")
+    else:
+        availability.enable(name)
+    return 200, {"adapters": clim._adapter_rows(cfg, availability)}
 
 
 def _ep_metrics(ws: Path, query: dict) -> tuple[int, dict]:
@@ -512,6 +564,20 @@ def _make_handler(ws_map: dict, default_name: str):
                 if method != "POST":
                     raise _ApiError(405, "bench 仅支持 POST")
                 return _ep_bench(ws, body)
+
+            # —— M5 §12：适配器可用性（列表 + 两个开关端点）——
+            if parts == ["api", "adapters"]:
+                if method != "GET":
+                    raise _ApiError(405, "adapters 仅支持 GET")
+                return _ep_adapters(ws)
+
+            if len(parts) == 3 and parts[:2] == ["api", "adapters"]:
+                action = parts[2]
+                if action not in ("enable", "disable"):
+                    raise _ApiError(404, f"未知 adapters 子路径: {action}")
+                if method != "POST":
+                    raise _ApiError(405, f"adapters/{action} 仅支持 POST")
+                return _ep_adapter_set(ws, action, body)
 
             # —— /api/threads/{id}/... ——
             if len(parts) >= 3 and parts[0] == "api" and parts[1] == "threads":

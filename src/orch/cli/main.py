@@ -72,14 +72,24 @@ bench_app = typer.Typer(
 )
 app.add_typer(bench_app, name="bench")
 
+adapter_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="orch adapter —— 人工标记适配器可用性（spec §12/§5.6）。",
+)
+app.add_typer(adapter_app, name="adapter")
+
 
 # ——————————————————————————————————————————————————————————————
 # 内部工具
 # ——————————————————————————————————————————————————————————————
 
-def _load_config(workspace: Path) -> dict:
-    """读取 workspace 下 config.yaml（若无则返回空 dict，M2 骨架宽松）。"""
-    cfg_path = workspace / "config.yaml"
+def _read_config_file(cfg_path: Path) -> dict:
+    """读取任意路径的 config.yaml（不存在/不可解析 → 空 dict，M2 骨架宽松）。
+
+    `orch adapters` / `orch adapter …` / `orch status --config` 与 workspace 级
+    `_load_config` 共用这一份读取实现（M5-T5：不重复造第二份 yaml 装载）。
+    """
     if not cfg_path.exists():
         return {}
     try:
@@ -89,6 +99,16 @@ def _load_config(workspace: Path) -> dict:
         return dict(data) if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _load_config(workspace: Path) -> dict:
+    """读取 workspace 下 config.yaml（若无则返回空 dict，M2 骨架宽松）。"""
+    return _read_config_file(_workspace_config_path(workspace))
+
+
+def _workspace_config_path(workspace: Path) -> Path:
+    """workspace 级 config.yaml 路径（`orch run` 的既有约定，M5 三命令沿用同一约定）。"""
+    return Path(workspace) / "config.yaml"
 
 
 def _resolve_workspace(workspace: str | None) -> Path:
@@ -161,6 +181,80 @@ def _echo(msg: str) -> None:
 
 
 # ——————————————————————————————————————————————————————————————
+# M5 §5.6/§12：适配器可用性——CLI 与 Web 控制台共用的读取 / 投影 / 装配接线。
+# 事实底座一律复用 orch.adapters.state（禁止在本层重写等价物）。
+# ——————————————————————————————————————————————————————————————
+
+def _resolve_config_path(config: str | None) -> Path:
+    """`--config` 缺省值沿 `orch run` 同一约定：当前目录（= 缺省 workspace）/config.yaml。"""
+    if config:
+        return Path(config).resolve()
+    return _workspace_config_path(_resolve_workspace(None))
+
+
+def _declared_adapter_names(config: dict) -> list[str]:
+    """config.adapters 声明的全部 adapter 名（保持声明顺序；无声明 → 空表）。"""
+    raw = (config or {}).get("adapters")
+    return [str(name) for name in raw] if isinstance(raw, dict) else []
+
+
+def _open_availability(cfg_path: Path):
+    """按 config 路径打开可用性状态文件（缺失 → 全 enabled；损坏 → AdapterStateError）。"""
+    from orch.adapters.state import AdapterAvailability, state_path_for
+    return AdapterAvailability.load(state_path_for(cfg_path))
+
+
+def _adapter_rows(config: dict, availability) -> list[dict]:
+    """`orch adapters` 与 GET /api/adapters 的同一份投影：config 声明 ∪ 状态文件记录。
+
+    列（契约 §6/§7 冻结）：name / status / reason / by / ts / fail_streak。
+    config 声明但状态文件未记录者显示 enabled（§5.6.1 冷启动默认）；反之（配置里已
+    删名但状态文件仍有记录）也如实列出，避免"看不见的停用"。
+    """
+    snap = availability.snapshot()
+    names = _declared_adapter_names(config)
+    for name in sorted(snap):
+        if name not in names:
+            names.append(name)
+    default = {"status": "enabled", "reason": "", "by": "", "ts": 0.0, "fail_streak": 0}
+    rows = []
+    for name in names:
+        entry = snap.get(name) or default
+        rows.append({
+            "name": name,
+            "status": entry["status"],
+            "reason": entry["reason"],
+            "by": entry["by"],
+            "ts": entry["ts"],
+            "fail_streak": entry["fail_streak"],
+        })
+    return rows
+
+
+def _known_adapter_names(config: dict, availability) -> set[str]:
+    """可被 enable/disable 的合法名字集合 = config 声明 ∪ 状态文件已记录。"""
+    return {row["name"] for row in _adapter_rows(config, availability)}
+
+
+def _prepare_availability_config(config: dict, cfg_path: Path) -> list[str]:
+    """生产装配接线（§5.6/§11.1）：装载期校验 + 把状态文件路径写回 config。
+
+    返回错误清单（空 = 合法且已接线）：非空时**不**写回任何键，由调用方一行人话
+    报错退出（§11.1"装载时校验，违者启动报错"）。写回的两个键：
+      · config['adapter_state_path'] —— 调度层 make_availability 的唯一开关；
+      · config['config_path']        —— 供实现方按 state_path_for 再派生（便于排障）。
+    `orch run` 与 web `POST /api/threads/{id}/run` 两处装配共用本函数（同源）。
+    """
+    from orch.adapters.state import state_path_for, validate_availability_config
+    errors = validate_availability_config(config)
+    if errors:
+        return errors
+    config["config_path"] = str(cfg_path)
+    config["adapter_state_path"] = str(state_path_for(cfg_path))
+    return []
+
+
+# ——————————————————————————————————————————————————————————————
 # orch run（spec §12：启动调度进程；C-2 修复）
 # ——————————————————————————————————————————————————————————————
 
@@ -228,6 +322,12 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
       - cli → CliAdapter（cwd=thread_dir；write_scope 空的角色无需 git worktree）。
     role 层字段（can_decide/write_scope/tools/supports_resume）覆盖 adapter 层。
     暂只支持 kind=cli（真实联跑）；其它 kind 显式报错，不臆造后端（诚实边界）。
+
+    M5 §5.6.2：返回的映射**同时**含两类键——
+      · 角色名键（既有兼容分支，逐字不变：M0–M4 全部调用方与测试依赖它）；
+      · **adapter 名键**（新增）：调度层按生效绑定名取实例
+        （scheduler.availability.adapter_instance 先查名字键），降级到 fallback 时
+        必须能按名字拿到实例。见 `_add_adapter_name_keys` 的歧义处置。
     """
     from orch.adapters import CliAdapter
     from orch.scheduler.permissions import ensure_worktrees
@@ -257,13 +357,80 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
         if kind == "cli":
             # 有 write_scope 的角色 cwd=其 git worktree（kimi 在隔离沙箱写代码）；否则 thread_dir。
             wt = worktrees.get(role, Path(thread_dir))
-            out[role] = CliAdapter(role=role, config=merged, worktree=wt)
+            out[role] = CliAdapter(
+                role=role, config=merged, worktree=wt,
+                adapter_name=str(aname or role),
+            )
         else:
             raise ValueError(
                 f"真实装配暂只支持 kind=cli（角色 {role!r} 解析到 kind={kind!r}）；"
                 "混合/API 后端属后续陪跑项。"
             )
+    _add_adapter_name_keys(out, roles, config, worktrees, thread_dir)
     return out
+
+
+# 只影响调度/渲染、不影响 CliAdapter.invoke 的角色级字段：判定"同一 adapter 名被多个
+# 角色引用时能否共用一个实例"时忽略它们（其余任何差异都判为不可共用）。
+_ROLE_ONLY_KEYS = ("prompt", "can_decide", "verify", "fallback", "adapter")
+
+
+def _add_adapter_name_keys(
+    out: dict, roles: list[str], config: dict, worktrees: dict, thread_dir: Path,
+) -> None:
+    """§5.6.2 生效绑定按**名字**取实例：为角色引用链上的每个 cli 型 adapter 名建实例。
+
+    引用链 = 每个活跃角色的 [主绑定] + fallback（§5.6.2 的解析域）。逐名处置：
+      · 该名已是某角色的主绑定 → **别名**到已建的角色实例（同一对象，零行为变化）；
+      · 仅作 fallback 出现 → 用引用它的角色的 merged 配置新建一个实例；
+      · 被多个角色引用 → 仅当各角色的 invoke 相关配置（worktree + merged 去掉
+        `_ROLE_ONLY_KEYS`）逐字相同才建一个共享实例；**否则不建**——一个实例无法同时
+        正确承载两套 worktree / tools（§8.1 落代码隔离），宁可让调度层按名取不到实例
+        而显式 KeyError，也不静默拿错 worktree 跑（那是权限缺陷，不是可用性降级）。
+      · 非 cli 型的名字不建实例（与本函数上文"真实装配只支持 kind=cli"同一诚实边界）。
+    """
+    from orch.adapters import CliAdapter
+
+    adapters_conf = config.get("adapters", {}) or {}
+    roles_conf = config.get("roles", {}) or {}
+
+    refs: dict[str, list[str]] = {}
+    for role in roles:
+        rc = dict(roles_conf.get(role, {}) or {})
+        chain = [str(rc.get("adapter") or role)]
+        fallback = rc.get("fallback") or []
+        if isinstance(fallback, (list, tuple)):
+            chain.extend(str(item) for item in fallback)
+        for name in chain:
+            owners = refs.setdefault(name, [])
+            if role not in owners:
+                owners.append(role)
+
+    for name, owners in refs.items():
+        if name in out:
+            continue                      # 与角色名同键：既有角色实例已覆盖，不重复建
+        ac = dict(adapters_conf.get(name, {}) or {})
+        if str(ac.get("kind", "")) != "cli":
+            continue                      # 非 cli 型（或未声明）：不臆造实例
+        built: list[tuple] = []
+        for role in owners:
+            rc = dict(roles_conf.get(role, {}) or {})
+            merged = {**ac, **rc}
+            wt = worktrees.get(role, Path(thread_dir))
+            sig = (str(wt), json.dumps(
+                {k: v for k, v in merged.items() if k not in _ROLE_ONLY_KEYS},
+                sort_keys=True, ensure_ascii=False, default=str,
+            ))
+            built.append((sig, role, merged, wt))
+        if len({sig for sig, _r, _m, _w in built}) != 1:
+            continue                      # 多角色引用且配置不一致：拒绝共用（见 docstring）
+        _sig, role, merged, wt = built[0]
+        if str(roles_conf.get(role, {}).get("adapter") or role) == name and role in out:
+            out[name] = out[role]         # 主绑定：别名到同一对象
+        else:
+            out[name] = CliAdapter(
+                role=role, config=merged, worktree=wt, adapter_name=name,
+            )
 
 
 def _stop_marker_path(workspace: Path) -> Path:
@@ -297,7 +464,7 @@ def cmd_run(
     ),
     interval: float = typer.Option(
         1.0, "--interval",
-        help="常驻模式下每轮之间的休眠秒数（--once 时忽略）。",
+        help="常驻模式下每轮之间的休眠秒数（缺省 1s，§17；--once 时忽略）。",
     ),
 ) -> None:
     """§12 orch run：启动调度进程（常驻，可随时 kill）。
@@ -308,6 +475,11 @@ def cmd_run(
          · status ∈ {suspended, terminated} → 跳过；
          · 其余：装配默认 Fake adapters（M2 骨架）→ run_thread 一次。
       3) --once：一轮结束返回；否则休眠 interval 秒后回步骤 1。
+
+    §5.6.2「禁止忙等」在本层的落点：无进展的一轮（含"全部角色因无可用 adapter 而
+    阻塞、run_thread 立即返回"）之后一律 sleep(interval) 再巡，缺省 1s（§17 开放
+    决策点）——人工 `orch adapter enable` 或控制台开关写状态文件后，最多 1s 内被
+    下一轮的 availability.reload() 自然感知，无需任何推送通道。
     """
     ws = _resolve_workspace(workspace)
     ws.mkdir(parents=True, exist_ok=True)
@@ -334,6 +506,13 @@ def cmd_run(
                 continue
             cfg = _load_config(ws)
             if cfg.get("adapters") and cfg.get("roles"):
+                # M5 §5.6/§11.1 生产装配接线：先校验后接线；错误清单非空 → 一行人话
+                # 报错退出（启动报错，不喷 Traceback），**不**带着非法配置继续跑。
+                errors = _prepare_availability_config(cfg, _workspace_config_path(ws))
+                if errors:
+                    _echo("[错误] config.yaml 可用性配置非法（§11.1），拒绝启动："
+                          + "；".join(errors))
+                    raise typer.Exit(code=1)
                 adapters = _build_adapters_from_config(roles, cfg, tdir)
             else:
                 # 快赢③（P1 防"假跑"误导）：无 adapters/roles 配置必须显式告知。
@@ -511,8 +690,12 @@ def cmd_status(
     workspace: str | None = typer.Option(
         None, "--workspace", help="workspace 根目录。",
     ),
+    config: str | None = typer.Option(
+        None, "--config",
+        help="config.yaml 路径；提供时角色行追加当前生效绑定（§12 可用性呈现）。",
+    ),
 ) -> None:
-    """线程 status + 派发行摘要（spec §12）。"""
+    """线程 status + 派发行摘要（spec §12）；--config 时追加可用性呈现（§5.6/§12）。"""
     ws = _resolve_workspace(workspace)
     store = _open_thread_store(ws, thread)
 
@@ -529,6 +712,59 @@ def cmd_status(
             f"  - E{row['event_id']} -> {row['target']} status={row['status']}"
             f" attempts={row['attempts']}"
         )
+
+    # §12 可用性呈现：--config 与既有 --workspace **并存**，不给 --config 则逐字同旧输出。
+    if config:
+        _echo_role_bindings(store, _resolve_config_path(config))
+
+
+def _echo_role_bindings(store: "orch.store.Store", cfg_path: Path) -> None:
+    """§12 可用性呈现：角色行显示生效绑定；主绑定停用显示 ⛔ + 生效备胎；无可用者显著警示。
+
+    只读投影（不写状态文件、不改配置）：绑定解析复用 state.resolve_effective_adapter，
+    与调度层 §5.6.2 同一判据，避免两处口径漂移。
+    """
+    from orch.adapters.state import AdapterStateError, resolve_effective_adapter
+
+    cfg = _read_config_file(cfg_path)
+    roles_cfg = cfg.get("roles") or {}
+    try:
+        availability = _open_availability(cfg_path)
+    except AdapterStateError as exc:      # 状态文件损坏：一行人话，不喷 Traceback
+        _echo(f"[错误] {exc}")
+        raise typer.Exit(code=1)
+
+    roles = _thread_roles(store) or [str(r) for r in roles_cfg]
+    _echo(f"--- 适配器可用性（config={cfg_path}）---")
+    if not roles:
+        _echo("  (本线程无角色配置)")
+        return
+
+    snap = availability.snapshot()
+    blocked: list[str] = []
+    for role in roles:
+        rc = roles_cfg.get(role) or {}
+        primary = str(rc.get("adapter") or role)
+        effective = resolve_effective_adapter(role, roles_cfg, availability)
+        primary_ok = availability.is_enabled(primary)
+        badge = "✅" if primary_ok else "⛔"
+        reason = str((snap.get(primary) or {}).get("reason") or "")
+        why = f"（{reason}）" if (reason and not primary_ok) else ""
+        if effective is None:
+            blocked.append(role)
+            _echo(f"  {role}: 主绑定 {primary} {badge}{why} → ⚠ 无可用 adapter"
+                  f"（主绑定与全部备胎均已停用）")
+        elif effective == primary:
+            _echo(f"  {role}: 主绑定 {primary} {badge} → 生效 {effective}")
+        else:
+            _echo(f"  {role}: 主绑定 {primary} {badge}{why} → 生效备胎 {effective}")
+
+    if blocked:
+        _echo("=" * 60)
+        _echo(f"⚠⚠ 警示：角色 {', '.join(blocked)} 当前**无可用** adapter —— 其待办保持"
+              f" pending 不消耗重试预算，需人工 `orch adapter enable <name>`"
+              f"（或控制台开关）恢复（§5.6.2）。")
+        _echo("=" * 60)
 
 
 # ——————————————————————————————————————————————————————————————
@@ -935,6 +1171,111 @@ def cmd_threads(
         except (OSError, ValueError):
             status = "?"
         _echo(f"{d.name}\tstatus={status}")
+
+
+# ——————————————————————————————————————————————————————————————
+# orch adapters / orch adapter disable|enable（spec §12 三行，§5.6，M5-T5）
+# ——————————————————————————————————————————————————————————————
+
+_CONFIG_OPT_HELP = "config.yaml 路径；缺省沿 orch run 约定（当前目录/config.yaml）。"
+
+
+def _fmt_ts(ts: float) -> str:
+    """状态变更时间戳（epoch 秒）→ 本地可读；0/缺失 → '-'（不臆造时间）。"""
+    try:
+        value = float(ts or 0.0)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+
+
+def _open_availability_or_exit(cfg_path: Path):
+    """打开状态文件；损坏 → 一行人话报错退出（§5.6.1 禁止猜测，不喷 Traceback）。"""
+    from orch.adapters.state import AdapterStateError
+    try:
+        return _open_availability(cfg_path)
+    except AdapterStateError as exc:
+        _echo(f"[错误] {exc}")
+        raise typer.Exit(code=1)
+
+
+def _require_known_adapter(name: str, config: dict, availability) -> None:
+    """enable/disable 的名字校验：不在"config 声明 ∪ 状态文件记录"内 → 报错退出。
+
+    两处都拿不到任何名字（无 config.yaml 且无状态文件）时**不**校验：此时无从判断
+    合法名单，拒绝会让"先停用后建配置"的运维路径无路可走（诚实边界，不猜测）。
+    """
+    known = _known_adapter_names(config, availability)
+    if not known or name in known:
+        return
+    _echo(f"[错误] 未知 adapter 名 {name!r}；config 已声明/状态文件已记录的是："
+          f"{', '.join(sorted(known))}")
+    raise typer.Exit(code=1)
+
+
+@app.command("adapters")
+def cmd_adapters(
+    config: str | None = typer.Option(None, "--config", help=_CONFIG_OPT_HELP),
+) -> None:
+    """§12：列全部 adapter —— 状态 ✅/⛔、reason、by（手动/自动）、ts、fail_streak（§5.6）。
+
+    行集合 = config.adapters 声明 ∪ 状态文件已记录（声明但未记录者显示 enabled）。
+    """
+    cfg_path = _resolve_config_path(config)
+    cfg = _read_config_file(cfg_path)
+    availability = _open_availability_or_exit(cfg_path)
+    from orch.adapters.state import state_path_for
+
+    rows = _adapter_rows(cfg, availability)
+    _echo(f"适配器可用性（config={cfg_path}；状态文件={state_path_for(cfg_path)}）")
+    if not rows:
+        _echo("(config.adapters 无声明，且状态文件无记录)")
+        return
+
+    width = max([len(r["name"]) for r in rows] + [len("name")])
+    _echo(f"{'name'.ljust(width)}  状态  by      fail_streak  ts                   reason")
+    for row in rows:
+        badge = "✅" if row["status"] == "enabled" else "⛔"
+        by = str(row["by"] or "-")
+        reason = " ".join(str(row["reason"] or "-").split()) or "-"
+        _echo(
+            f"{row['name'].ljust(width)}  {badge}    {by.ljust(6)}  "
+            f"{str(row['fail_streak']).ljust(11)}  {_fmt_ts(row['ts']).ljust(19)}  {reason}"
+        )
+
+
+@adapter_app.command("disable")
+def cmd_adapter_disable(
+    name: str = typer.Argument(..., help="adapter 名（config.adapters 的键）。"),
+    reason: str = typer.Option(
+        "", "--reason", help="停用原因（写入状态文件，供 orch adapters / 控制台展示）。",
+    ),
+    config: str | None = typer.Option(None, "--config", help=_CONFIG_OPT_HELP),
+) -> None:
+    """§12：人工标记不可用（调度器停止选中）——by=human，原子替换写状态文件（§5.6.1）。"""
+    cfg_path = _resolve_config_path(config)
+    cfg = _read_config_file(cfg_path)
+    availability = _open_availability_or_exit(cfg_path)
+    _require_known_adapter(name, cfg, availability)
+    availability.disable(name, reason=reason, by="human")
+    _echo(f"[adapter] ⛔ {name} 已停用（by=human；reason={reason or '-'}）"
+          f" → {availability.path}")
+
+
+@adapter_app.command("enable")
+def cmd_adapter_enable(
+    name: str = typer.Argument(..., help="adapter 名（config.adapters 的键）。"),
+    config: str | None = typer.Option(None, "--config", help=_CONFIG_OPT_HELP),
+) -> None:
+    """§12：人工恢复，清零 fail_streak（§5.6.3 唯一恢复路径，禁止自动恢复）。"""
+    cfg_path = _resolve_config_path(config)
+    cfg = _read_config_file(cfg_path)
+    availability = _open_availability_or_exit(cfg_path)
+    _require_known_adapter(name, cfg, availability)
+    availability.enable(name)
+    _echo(f"[adapter] ✅ {name} 已恢复（fail_streak 清零） → {availability.path}")
 
 
 # ——————————————————————————————————————————————————————————————

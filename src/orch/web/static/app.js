@@ -176,6 +176,7 @@ function switchWorkspace(name) {
   $("#workspace-empty").classList.remove("hidden");
   loadHealth();
   loadThreads();
+  loadAdapters(true);   // 适配器状态是工作区级事实（状态文件与 config.yaml 同目录）
 }
 
 async function loadHealth() {
@@ -212,6 +213,117 @@ function switchView(name) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   if (name === "config") loadConfig();
   if (name === "metrics") loadMetrics();
+  if (name === "adapters") loadAdapters();
+}
+
+// ————————————————————————————————————————————————
+// M5 §12 适配器面板：列全部 adapter（✅/⛔ 徽章 + enable/disable 开关按钮，
+// disable 可填 reason），行为与 CLI 两命令等价（同一原子替换写路径）。
+// 刷新沿 D6 轮询节奏（pollLoop 内捎带），另有手动 ⟳ 与切页即拉。
+// ————————————————————————————————————————————————
+let adapterRows = [];
+
+function fmtAdapterTs(ts) {
+  const v = Number(ts || 0);
+  if (!isFinite(v) || v <= 0) return "—";
+  return fmtLastActivity(v);   // 状态变更时刻：今天显示时分，跨天带月日
+}
+
+function renderAdapters() {
+  const box = $("#adapters-list");
+  if (!box) return;
+  // 轮询重渲染**不得**吞掉用户正在填的停用原因：先存后还。
+  const typed = {};
+  box.querySelectorAll(".adp-reason").forEach((i) => {
+    if (i.value) typed[i.dataset.adpReason] = i.value;
+  });
+  if (!adapterRows.length) {
+    box.innerHTML = '<div class="chat-empty">config.yaml 未声明 adapters，且状态文件无记录</div>';
+    return;
+  }
+  box.innerHTML = adapterRows.map((r) => {
+    const off = r.status !== "enabled";
+    const name = escapeHtmlAttr(String(r.name));   // 同时进属性值与文本，按属性口径转义
+    const meta = [
+      off ? `by=${escapeHtml(String(r.by || "-"))}` : null,
+      off && r.ts ? fmtAdapterTs(r.ts) : null,
+      `fail_streak=${escapeHtml(String(r.fail_streak))}`,
+    ].filter(Boolean).join(" · ");
+    const reason = off && r.reason
+      ? `<div class="adp-reason-txt">原因：${escapeHtml(String(r.reason))}</div>` : "";
+    const ctl = off
+      ? `<button class="btn-primary adp-btn" data-adp="${name}" data-act="enable">✅ 恢复</button>`
+      : `<input class="inp adp-reason" data-adp-reason="${name}" placeholder="停用原因（可选）" />` +
+        `<button class="btn-danger adp-btn" data-adp="${name}" data-act="disable">⛔ 停用</button>`;
+    return (
+      `<div class="adp-row${off ? " off" : ""}">` +
+        `<span class="adp-badge ${off ? "off" : "ok"}">${off ? "⛔" : "✅"}</span>` +
+        `<span class="adp-name mono">${name}</span>` +
+        `<span class="adp-meta">${escapeHtml(meta)}</span>` +
+        `<span class="adp-ctl">${ctl}</span>` +
+        reason +
+      `</div>`
+    );
+  }).join("");
+  box.querySelectorAll(".adp-reason").forEach((i) => {
+    const v = typed[i.dataset.adpReason];
+    if (v) i.value = v;
+  });
+}
+
+function updateAdapterAlerts() {
+  const offNames = adapterRows.filter((r) => r.status !== "enabled").map((r) => r.name);
+  const text = offNames.length
+    ? `已停用 ${offNames.length} 个适配器：${offNames.join("、")}` +
+      "　—— 绑定它们的角色将降级到 fallback；无备胎的角色待办保持 pending 等待人工恢复。"
+    : "";
+  const bar = $("#adapter-warn");
+  if (bar) {
+    bar.classList.toggle("hidden", !offNames.length);
+    const t = $("#adapter-warn-text");
+    if (t) t.textContent = text;
+  }
+  const alert = $("#adapters-alert");
+  if (alert) {
+    alert.classList.toggle("hidden", !offNames.length);
+    alert.textContent = offNames.length ? "⛔ " + text : "";
+  }
+  const dot = $("#tab-adp-dot");
+  if (dot) dot.classList.toggle("hidden", !offNames.length);
+}
+
+async function loadAdapters(quiet = false) {
+  try {
+    const d = await api("/api/adapters");
+    adapterRows = d.adapters || [];
+  } catch (e) {
+    if (!quiet) {
+      const box = $("#adapters-list");
+      if (box) box.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
+      toast("载入适配器失败: " + e.message, "err");
+    }
+    return;
+  }
+  renderAdapters();
+  updateAdapterAlerts();
+}
+
+async function setAdapter(name, act) {
+  const body = { name };
+  if (act === "disable") {
+    const inp = document.querySelector(`.adp-reason[data-adp-reason="${CSS.escape(name)}"]`);
+    const reason = inp ? inp.value.trim() : "";
+    if (reason) body.reason = reason;
+  }
+  try {
+    const d = await api(`/api/adapters/${act}`, { method: "POST", body });
+    adapterRows = d.adapters || adapterRows;
+    renderAdapters();
+    updateAdapterAlerts();
+    toast(act === "disable" ? `已停用 ${name}` : `已恢复 ${name}（fail_streak 清零）`);
+  } catch (e) {
+    toast((act === "disable" ? "停用失败: " : "恢复失败: ") + e.message, "err");
+  }
 }
 
 // ————————————————————————————————————————————————
@@ -1243,13 +1355,24 @@ async function pollLoop() {
   pollInFlight = true;
   let ok = true;
   try {
-    const [evData, s] = await Promise.all([
+    // M5：适配器可用性同节奏捎带（人工/自动的 enable|disable 最多 1.5s 内反映到面板与
+    // 警示条）。它是独立于线程的全局事实，失败不拖累主轮询（单独 catch 成 null）。
+    const [evData, s, adp] = await Promise.all([
       api(`/api/threads/${tid}/events`),
       api(`/api/threads/${tid}/status`),
+      api("/api/adapters").catch(() => null),
     ]);
     if (tid !== selectedThread) { pollInFlight = false; return; }  // 已切线程：丢弃
     ingestEvents(evData.events || [], false);
     applyStatusPayload(s);
+    if (adp) {
+      adapterRows = adp.adapters || [];
+      updateAdapterAlerts();
+      const box = $("#adapters-list");
+      // 面板可见且用户没在其中输入/点击时才重渲染（避免抢焦点）。
+      if ($("#view-adapters").classList.contains("active")
+          && box && !box.contains(document.activeElement)) renderAdapters();
+    }
   } catch (e) {
     ok = false;
   } finally {
@@ -1577,6 +1700,23 @@ function bind() {
   $("#btn-load-metrics").addEventListener("click", loadMetrics);
   $("#btn-run-bench").addEventListener("click", runBench);
 
+  // M5 §12：适配器面板 —— 刷新 / 每行开关按钮（委托）/ 警示条直达。
+  $("#btn-load-adapters").addEventListener("click", () => loadAdapters());
+  $("#btn-goto-adapters").addEventListener("click", () => switchView("adapters"));
+  $("#adapters-list").addEventListener("click", (e) => {
+    const btn = e.target.closest(".adp-btn");
+    if (!btn) return;
+    setAdapter(btn.dataset.adp, btn.dataset.act);
+  });
+  $("#adapters-list").addEventListener("keydown", (e) => {
+    // 停用原因输入框内回车 = 点"停用"（与 composer 的 Enter 语义一致）。
+    if (e.key !== "Enter") return;
+    const inp = e.target.closest(".adp-reason");
+    if (!inp) return;
+    e.preventDefault();
+    setAdapter(inp.dataset.adpReason, "disable");
+  });
+
   // R5 D2：筛选弹出面板 + #n 回车跳转（无跳转按钮）。
   populateFilterTypes();
   $("#btn-filter").addEventListener("click", (e) => { e.stopPropagation(); toggleFilterPop(); });
@@ -1712,4 +1852,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadWorkspaces();   // ②：先定当前工作区，后续请求自动携带 ?ws=
   loadHealth();
   loadThreads();
+  loadAdapters(true);       // M5：进站即知可用性（警示条/页签点在选线程前就要准）
 });

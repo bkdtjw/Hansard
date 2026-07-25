@@ -299,3 +299,38 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
      追加后删行（不忠实）。T3 落实；
   ⑧ `orch status` 的 --config 与 --workspace 并存，互为补充；
   ⑨ metrics extra 具体格式 T3 自定，键名 `fallback_switch` / `adapter_trip` 锁死。
+- T2 ✅ adapters/state.py（22 绿）：原子替换/缺失全 enabled/损坏拒猜/RLock；
+  record_success 不改 status（恢复只认人工 enable）。追认：validate 不要求主绑定
+  已声明（角色名兜底分支的前提，加此规则会炸既有配置）。
+- T4 ✅ 适配层（卡内先红后绿 30 测试）：AdapterUnavailableError(adapter_name,detail)；
+  Cli 超时/无块两分支送 pattern 分类（复用 state.DEFAULT 常量），未命中原路径逐字
+  不变；Api 包 message_fn；Mock 增 unavailable_after/key_by="call"。追认三条：
+  JSON 解码失败不做特征分类但**计入 streak**（§5.6.3"无法解析出信封"字面）；
+  显式 `unavailable_patterns: []` = 关闭特征分类；超时无文本不分类（不注入合成串）。
+  移交提醒：跳闸落盘名用调度器解析的生效绑定名（exc.adapter_name 仅审计线索）；
+  chaos 的 _IdempotentMockAdapter 重发分支不走父类，T6 需同步适配。
+- T3 ✅ 调度双环接线（D/G 组 11 绿，含 R1 回环）：新增 scheduler/availability.py
+  共用模块，同步/异步同源（make_availability/resolve_binding/note_* /rebind/on_*）；
+  store 仅两处（append_event 增 make_dispatches=True 缺省关键字、新增 reset_attempts）。
+  **R1（spec 冲突裁决）**：§13 字面 = fallback_switch 指标**逐次降级派发**各记一条
+  （附录B 实测 16 条），审计事件保持 §5.6.2 首次一条（5 条）；T1 侧 G 断言改三层
+  双向对账（备胎实例调用数推导+硬构成校验+extra 分组）。chaos-50 硬门槛复跑保持。
+  记录在案：①同步环原本无传输级失败处理（异常穿出）、异步环无 attempts 重试——
+  §5.1 与实现的**既有偏差**（M0 起），本卡仅在 availability 启用时补齐 attempts
+  语义以保 332 基线，无条件启用属后续裁决；②"传输级"型别判据（TimeoutError/
+  ValueError/OSError）在调度层，pattern 分类在适配层（§7.6 分工不破）；③无 sessions
+  行/backend 空 → 不换绑不 reset（无活会话可作废）；④审计事件 to=[] 渲染显示
+  @moderator 与 terminate 同口径（无派发行，仅显示层）。
+- T5 ✅ CLI+web+控制台按钮（E/F 组 10 绿 → M5 availability 43 全绿；全量 375）：
+  三命令 orch adapters / adapter disable / adapter enable；status --config 与
+  --workspace 并存；web 三端点 + 前端适配器页签（徽章+开关按钮+reason 输入+警示条
+  +页签红点，D6 轮询捎带，重渲染保输入焦点）；生产接线补 T3 缺口：装配建
+  "adapter 名→实例"映射、写回 config['adapter_state_path']、装载校验一行人话报错。
+  §17 决策（T5）：run 轮询间隔沿 --interval 缺省 1s；三命令 --config 缺省=./config.yaml；
+  接线仅在 config 有 adapters+roles 的真实装配分支启用（Fake 演示路径逐字不变）；
+  ts 显示本地时间 ts=0 显示 "-"；enable/disable 名字校验集=config∪状态文件,
+  双空不校验；面板轮询沿 D6 1.5s。
+  记录在案（留后续,不阻 M5）：①同一 adapter 名被多角色引用且 invoke 工况不同时
+  不建共享实例——降级触发显式 KeyError,宁可响亮失败不静默串 worktree（与 M2 期
+  "未知 target"健壮性缺口同族）；②api/mock 型 fallback 在真实装配无实例（既有
+  "真实装配仅 cli"边界的延伸）；③装载校验只在两处 run 装配触发,只读命令不阻断。

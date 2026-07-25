@@ -22,6 +22,7 @@
     </div>
     <nav class="tabs">
       <button class="tab active" data-view="threads">线程</button>
+      <button class="tab" data-view="adapters">适配器<span id="tab-adp-dot" class="tab-dot hidden">⛔</span></button>
       <button class="tab" data-view="config">配置</button>
       <button class="tab" data-view="metrics">指标</button>
       <button class="tab" data-view="bench">基准</button>
@@ -73,6 +74,13 @@
                   </div>
                 </div>
               </div>
+            </div>
+
+            <!-- M5 §12：适配器停用/阻塞警示条（存在 disabled 时出现，点击直达适配器面板） -->
+            <div id="adapter-warn" class="adapter-banner hidden">
+              <span class="adp-warn-icon">⛔</span>
+              <span id="adapter-warn-text" class="adp-warn-text"></span>
+              <button id="btn-goto-adapters" class="btn-ghost">管理适配器 →</button>
             </div>
 
             <!-- 门禁琥珀 banner：suspended 时出现 -->
@@ -149,6 +157,23 @@
             <div id="board-content" class="board-content"></div>
           </div>
         </aside>
+      </div>
+    </section>
+
+    <!-- ========== 适配器视图（spec §12：控制台必须为每个 adapter 提供开关按钮） ========== -->
+    <section id="view-adapters" class="view">
+      <div class="panel glass">
+        <div class="panel-head">
+          <h3>适配器可用性 <span class="panel-sub">§5.6 降级路由 · 与 orch adapter enable|disable 同一写路径</span></h3>
+          <button id="btn-load-adapters" class="btn-ghost">⟳ 刷新</button>
+        </div>
+        <div id="adapters-alert" class="adapter-banner panel-alert hidden"></div>
+        <div id="adapters-list" class="adp-list"></div>
+        <p class="form-note">
+          停用后调度器停止选中该 adapter：有 fallback 的角色自动降级，无备胎的角色待办保持
+          pending（不消耗重试预算）。恢复仅限人工——本页按钮或 <code>orch adapter enable</code>，
+          恢复时清零 fail_streak。by=auto 表示由自动跳闸（额度特征命中 / 连续失败）写入。
+        </p>
       </div>
     </section>
 
