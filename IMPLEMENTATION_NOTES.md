@@ -445,3 +445,32 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   · 宪法修订授权凭据(info-3):评审性质上无法采信工具内引文,已明示"请人类
     git show 3831ef8 亲核"——转达用户终审。
   评审终版 §16 十三条逐条表(文件:行号)在其 closure 报告内,完成定义第 3 项直引。
+
+### 真实后端第 3/4 家接入:grok + opencode(2026-07-25 陪跑,Lead 亲做)
+- 用户指令"都测试一下"。实测(Lead 亲跑,全部免费档零成本;拓片留 scratchpad):
+  · grok 0.2.112(C:\Users\nirvana\.grok\bin\grok.exe):`-p <prompt> --output-format
+    json` 单 JSON,回复在 text、会话在 sessionId(与 claude result/session_id 同构
+    异名);`--resume <sid>` 热续实测通过(记得上轮内容);`--allow` 官方兼容别名
+    --allowedTools,权限注入 claude 同形;`--cwd/--max-turns/--no-subagents` 齐备。
+  · opencode 1.18.4(npm .cmd 垫片不可直启,真身
+    AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe):`run <msg>
+    --format json` JSON 行事件流,type=="text" 的 part.text 拼接为回复,sessionID
+    行顶层;`-s <sid>` 热续实测通过。
+- 接入胶水(测试先行 3 红→绿,样本取自实测拓片零测试计费):_unwrap_agent_output
+  "json" 分支双键名兼容(result|text / session_id|sessionId,claude 向后兼容),
+  新增 "opencode-stream" 分支;test_cli_adapter +3;全量 395 passed。
+- E2E 冒烟(orch-demos 三工作区,config 均含 unavailable_patterns/trip_after):
+  · grok-ws 一把过:pm(grok)提"众智成事"→moderator(grok)terminate,两会话独立,
+    全部首次合法。
+  · oc-ws 第一轮 pm 两次 JSON decode 失败(模型轮盘)→ failed→moderator(opencode)
+    诚实汇报并终止——重试/升级链路按 spec;第二轮全流程过("众智成城")。
+    顺带暴露 §14 缺口:失败 invoke 不落审计日志(挂 task_ef1a8021)。
+    streak 2 后被同 adapter 成功调用清零,§5.6.3 语义正确。
+  · **hetero-ws 降级实战(M5 首次真实后端全链路)**:pm/moderator 主 grok、备
+    opencode;grok 完成第一轮(三候选+选定「智联协同」)→ 人工 disable grok →
+    E4/E6 降级审计事件入群聊 → opencode 冷启动读全量历史接棒,论证精准衔接
+    grok 的选择 → handoff@human 挂起(Q6 非正式门禁)→ approve gate-7 复活。
+    指标:[8] 降级切换 3(pm2+mod1)、[9] 自动跳闸 0(手动禁用不混计,诚实)。
+- 意义:①第 3/4 家供应商接入成本实测=配置一段+解包分支几十行(§13"从第 3 家
+  起算"口径的实证);②Q2 遗留"≥2 家异构厂商"达成(grok+opencode 同线程混编);
+  ③M5 降级路由首次在真实后端验证,跨厂商半途接手上下文零丢失。

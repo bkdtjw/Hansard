@@ -279,11 +279,41 @@ def _unwrap_agent_output(stdout: str, config: dict) -> tuple[str, str | None]:
       - "text"（默认；claude 裸文本 / M2 既有行为）：整段 stdout 即回复；sid 交 _extract_sid。
       - "stream-json"（kimi -p --output-format stream-json，实测）：逐行 JSON；
         role=="assistant" 的 content 依序拼接为回复；带 session_id 的行（session.resume_hint）取会话号。
-      - "json"（claude -p --output-format json 单结果，实测）：整段是一个 JSON；
-        result 字段为回复文本；session_id 字段为会话号。
+      - "json"（claude -p --output-format json / grok -p --output-format json，
+        实测 2026-07-25 grok 0.2.112）：整段是一个 JSON；回复文本在 result（claude）
+        或 text（grok）字段；会话号在 session_id（claude）或 sessionId（grok）。
+      - "opencode-stream"（opencode run --format json，实测 2026-07-25 v1.18.4）：
+        逐行 JSON 事件流；type=="text" 事件的 part.text 依序拼接为回复；
+        sessionID 在各行顶层，取首见。
     回复文本再交 _extract_last_json_block 取信封。纯格式转换，无角色逻辑（§7.6）。
     """
     wire = str(config.get("wire_format", "text"))
+    if wire == "opencode-stream":
+        parts: list[str] = []
+        sid: str | None = None
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            part = obj.get("part")
+            if (
+                obj.get("type") == "text"
+                and isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                parts.append(part["text"])
+            if sid is None:
+                cand = obj.get("sessionID")
+                if isinstance(cand, str) and cand:
+                    sid = cand
+        return "".join(parts), sid
     if wire == "stream-json":
         parts: list[str] = []
         sid: str | None = None
@@ -310,8 +340,13 @@ def _unwrap_agent_output(stdout: str, config: dict) -> tuple[str, str | None]:
         except json.JSONDecodeError:
             return stdout, None
         if isinstance(obj, dict):
+            # claude: result/session_id；grok: text/sessionId（同构异名，两组都认）
             text = obj.get("result")
+            if not isinstance(text, str):
+                text = obj.get("text")
             sid = obj.get("session_id")
+            if not (isinstance(sid, str) and sid):
+                sid = obj.get("sessionId")
             return (
                 text if isinstance(text, str) else stdout,
                 sid if isinstance(sid, str) and sid else None,

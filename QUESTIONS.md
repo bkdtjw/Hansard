@@ -24,6 +24,9 @@ Q1 [M2/T-realCLI] 三家真实 CLI（claude/codex/kimi）的 --help flag 与 ses
         + supports_resume 可配）+ config 真实装配（_build_adapters_from_config）。claude 因工具子进程
         OAuth 凭据隔离 401，待你终端修通认证后同法接入（其 --session-id 可自控 UUID、
         --output-format json 单结果，无需提取正则）。codex 未测。
+        2026-07-25 追记：第 3/4 家接入达成（grok 0.2.112 / opencode 1.18.4，
+        实测细节与接入胶水见 IMPLEMENTATION_NOTES"真实后端第 3/4 家接入"节；
+        grok=json 双键名兼容、opencode=新增 opencode-stream 解包；热续均实测通过）。
 
 Q2 [M2/T-realE2E] 真实后端小功能全流程 + 停机三小时验收
   背景: spec §15 M2 验收标准要求"≥2 家异构后端 + 1 次门禁 + 停机后重启续跑"
@@ -37,6 +40,9 @@ Q2 [M2/T-realE2E] 真实后端小功能全流程 + 停机三小时验收
         session_id。全链路：render 视图→kimi.exe subprocess→stream-json 解包→信封入队→调度→session
         提取→终止清单。遗留：≥2 家异构厂商（claude 待认证）、"停机三小时"长时段（控制流已由 M2
         假适配器 停机-重启-approve 端到端验证；真实长时段可即时 Ctrl+C 重启演示，未跑满三小时）。
+        2026-07-25 追记：遗留之一"≥2 家异构厂商"达成——grok+opencode 同线程混编联跑
+        （hetero-ws t-db6a3fa7），且含 M5 降级实战：grok 半途被人工禁用，opencode
+        冷启动接手上下文零丢失至收尾，降级审计事件/指标/门禁恢复全链路真实验证。
 
 Q7 [render/§6.2×§10] A 类触发事件对目标角色不可见：gate_decision 后 moderator 收到"只针对 #5 回应"却看不到 #5 内容
   背景: 真实联跑铁证（calc 线程 E5 invoke 日志）：渲给 moderator 的 prompt 含指令尾

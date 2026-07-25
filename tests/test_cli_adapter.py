@@ -517,6 +517,63 @@ def test_unwrap_text_mode_backward_compatible():
     assert sid is None
 
 
+def test_unwrap_json_grok_shape():
+    """grok -p --output-format json（0.2.112 陪跑实测 2026-07-25）：单 JSON，
+    回复文本在 text 字段、会话号在 sessionId——与 claude 的 result/session_id
+    同构异名，"json" 分支须两组键名都认。"""
+    import json as _json
+    from orch.adapters import _unwrap_agent_output, _extract_last_json_block
+    stdout = _json.dumps({
+        "text": '收到\n```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```',
+        "stopReason": "EndTurn",
+        "sessionId": "019f98e7-3524-7cc2-8b72-c7bfaa27149c",
+        "usage": {"input_tokens": 12062, "output_tokens": 22},
+    })
+    text, sid = _unwrap_agent_output(stdout, {"wire_format": "json"})
+    assert sid == "019f98e7-3524-7cc2-8b72-c7bfaa27149c"
+    env = _json.loads(_extract_last_json_block(text))
+    assert env["type"] == "chat"
+
+
+def test_unwrap_opencode_stream_shape():
+    """opencode run --format json（1.18.4 陪跑实测 2026-07-25）：JSON 行事件流，
+    type=="text" 事件的 part.text 依序拼接为回复；sessionID 任一行顶层，取首见。"""
+    import json as _json
+    from orch.adapters import _unwrap_agent_output, _extract_last_json_block
+    sid = "ses_067183819ffegq7nYvGPABOTKF"
+    lines = [
+        _json.dumps({"type": "step_start", "timestamp": 1, "sessionID": sid,
+                     "part": {"type": "step-start"}}),
+        _json.dumps({"type": "text", "timestamp": 2, "sessionID": sid,
+                     "part": {"type": "text", "text": "前半 "}}),
+        _json.dumps({"type": "text", "timestamp": 3, "sessionID": sid,
+                     "part": {"type": "text",
+                              "text": '```json\n{"to":["pm"],"type":"report","body":"ok"}\n```'}}),
+        _json.dumps({"type": "step_finish", "timestamp": 4, "sessionID": sid,
+                     "part": {"type": "step-finish", "reason": "stop"}}),
+    ]
+    text, got_sid = _unwrap_agent_output(
+        "\n".join(lines), {"wire_format": "opencode-stream"})
+    assert got_sid == sid
+    env = _json.loads(_extract_last_json_block(text))
+    assert env["type"] == "report"
+
+
+def test_unwrap_opencode_stream_skips_non_text_events():
+    """opencode-stream：非 text 事件（step/tool 等）不得混入回复文本；sid 照常提取。"""
+    import json as _json
+    from orch.adapters import _unwrap_agent_output
+    lines = [
+        _json.dumps({"type": "step_start", "sessionID": "ses_x",
+                     "part": {"type": "step-start"}}),
+        _json.dumps({"type": "tool", "sessionID": "ses_x",
+                     "part": {"type": "tool", "text": "不该出现"}}),
+    ]
+    text, sid = _unwrap_agent_output("\n".join(lines), {"wire_format": "opencode-stream"})
+    assert text == ""
+    assert sid == "ses_x"
+
+
 def test_build_adapters_from_config_cli_kind():
     """真实装配：config kind=cli → CliAdapter，role 层字段覆盖 adapter 层（Q1/Q2 陪跑）。"""
     from orch.cli.main import _build_adapters_from_config
