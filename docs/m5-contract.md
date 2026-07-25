@@ -74,7 +74,12 @@ class AdapterUnavailableError(Exception):
 - 异常消费：
   - AdapterUnavailableError → availability.disable(name, by="auto",
     reason=detail 摘要) + 跳闸审计事件 + metrics(adapter_trip, trigger="pattern")；
-    该行回 pending、attempts 不变；本轮 continue（下轮重解析接手）。
+    该行回 pending、attempts 不变；**同一轮内立即重解析该组**（spec §5.6.3
+    "立即按 §5.6.2 重解析"字面）：解析出新绑定 → 当场换绑重派该组再续后续组
+    （保持组间最小事件号先后）；None → note_blocked 跳过。
+    （R2 修订 2026-07-25：初稿"本轮 continue 下轮接手"与 spec 冲突，已废——
+    kill 时序错开双跳闸时会让下游组先产出回复，破坏 §9.4 逐字节一致，
+    T6 混沌跨 seed 取证。）
   - 其他传输级失败（超时/进程失败/解析失败）→ 既有 attempts 语义不变，
     叠加 availability.record_failure(trip_after=该 adapter 配置或缺省)；
     返回 True 时补跳闸审计事件 + metrics(adapter_trip, trigger="streak")。
@@ -93,6 +98,9 @@ class AdapterUnavailableError(Exception):
 - metrics 表键名冻结：`fallback_switch`（extra 含 role/from/to）、
   `adapter_trip`（extra 含 adapter/trigger）。`orch metrics` 汇总两行：
   降级切换次数、自动跳闸次数（可按分组展开）。
+- 频次口径（R1 修订 2026-07-25）：`fallback_switch` **指标**逐次降级派发各记
+  一条（§13 字面"每次…派发记一条"）；切换**审计事件**保持首次一条（§5.6.2）。
+  二者有意不同频，禁止共用去重判定。
 
 ## 5. Store 原语（T3，src/orch/store/__init__.py 仅新增，禁改既有）
 

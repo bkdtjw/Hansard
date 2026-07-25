@@ -846,6 +846,21 @@ def _transport_failure_fallout(store, target: str, event_ids: list[int],
     return False
 
 
+class _TripRetry:
+    """哨兵型别：本组特征命中跳闸，须在**同一轮内立即**重解析后当场重试（§5.6.3 第 1 条）。
+
+    spec §5.6.3 第 1 条原文："该次失败**不计** attempts；派发行回 pending 并**立即**按
+    §5.6.2 重解析（通常由 fallback 接手）"。"立即"= 同一轮、同一组位置上换绑重试，
+    **不是**留到下一轮——否则本组会被本轮跳过、其后续组照常派发，事件先后次序相对
+    "不中断基准"发生交错（T6 混沌取证：§9.4 终态逐字节一致破防）。
+    """
+
+    __slots__ = ()
+
+
+_TRIP_RETRY = _TripRetry()
+
+
 def _dispatch_group(
     store,
     config: dict,
@@ -856,15 +871,62 @@ def _dispatch_group(
     availability: AdapterAvailability | None = None,
     effective: str | None = None,
 ) -> bool:
-    """处理单个 (target, event_ids) 组。成功返回 True，失败（两次 schema 败）返回 False。
+    """处理单个 (target, event_ids) 组；含 §5.6.3 第 1 条的"跳闸→立即重解析→当场重试"。
+
+    成功返回 True；失败（两次 schema 败 / 传输级失败 / 跳闸后全链不可用）返回 False。
+    单次尝试的全部落盘语义见 ``_dispatch_group_once``；本函数只加**同轮换绑重试**外层：
+      跳闸（_TRIP_RETRY）→ 该组各行已回 pending（attempts 不变）→ 就地 resolve_effective_adapter
+      → 有新绑定则以新绑定当场重跑本组（切换审计 / 换绑冷启动 / attempts 归零逻辑照旧）；
+      解析为 None → 走既有 note_blocked 通告后跳过本组（其余组照常调度）。
+
+    终止性（无需任何计数器，§16.9 也不允许新增内存计数）：每次 _TRIP_RETRY 必然伴随一次
+    ``availability.disable``，绑定链（主绑定 + fallback）长度有限且跳闸单向（仅人工 enable
+    可逆），故同一轮内的重试次数上界 = 该角色链长，天然收敛。
+    """
+    while True:
+        outcome = _dispatch_group_once(
+            store, config, adapters, target, event_ids,
+            availability=availability, effective=effective,
+        )
+        if outcome is not _TRIP_RETRY:
+            return bool(outcome)
+        # 跳闸已落盘（disable by=auto + 审计事件 + 指标），本组各行已回 pending、attempts 不变。
+        # §5.6.3 第 1 条"立即按 §5.6.2 重解析"：就地重算生效绑定（availability 已在
+        # on_unavailable 内更新，无需重读文件——本进程写者即自己）。
+        effective = resolve_binding(config, target, availability)
+        if effective is None:
+            note_blocked(store, target, primary_adapter_name(config, target))
+            _RUN_LOG.info(
+                "%s E%s → %s 跳闸后已无可用适配器，保持 pending 等待人工 enable（§5.6.2）",
+                store.thread_dir.name, event_ids, target,
+            )
+            return False
+        _RUN_LOG.info("%s E%s → %s 跳闸后立即改由 %s 重试（§5.6.3-1）",
+                      store.thread_dir.name, event_ids, target, effective)
+
+
+def _dispatch_group_once(
+    store,
+    config: dict,
+    adapters: dict,
+    target: str,
+    event_ids: list[int],
+    *,
+    availability: AdapterAvailability | None = None,
+    effective: str | None = None,
+) -> bool | _TripRetry:
+    """处理单个 (target, event_ids) 组的**一次**尝试。
+
+    成功返回 True，失败（两次 schema 败 / 传输级失败）返回 False，特征命中跳闸返回
+    ``_TRIP_RETRY``（由 ``_dispatch_group`` 同轮换绑重试）。
 
     M5 §5.6（availability 非 None 时才启用；为 None 时以下全部退化为不存在）：
       · adapter 实例按**生效绑定名**取（契约 §3）；
-      · effective ≠ 主绑定 → 首次追加切换审计事件 + 指标；
+      · effective ≠ 主绑定 → 首次追加切换审计事件 + 每次派发记指标；
       · effective ≠ sessions.backend → 会话作废（sid 空 / gen+1 / backend 更新）+ 本组
         attempts 归零，随后按冷启动路径 invoke；
       · invoke 抛 AdapterUnavailableError → 跳闸（by=auto）+ 审计 + 指标，行回 pending、
-        attempts 不变，本轮跳过（下轮重解析由备胎接手）；
+        attempts 不变，返回 _TRIP_RETRY（同轮立即换绑重试，§5.6.3 第 1 条）；
       · 其他传输级失败 → 既有 attempts 语义（_transport_failure_fallout）+ record_failure；
       · 成功 invoke → record_success。schema 校验失败**不触碰**可用性（§5.6.3）。
 
@@ -952,11 +1014,12 @@ def _dispatch_group(
             if availability is None:
                 raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。
             # §5.6.3 第 1 条：立即跳闸（记在**自己解析出的**生效绑定名上）+ 审计 + 指标；
-            # 该次失败**不计** attempts，派发行回 pending，本轮跳过 → 下轮重解析接手。
+            # 该次失败**不计** attempts，派发行回 pending，随后由 _dispatch_group 在
+            # **同一轮内立即**重解析（通常由 fallback 当场接手）。
             on_unavailable(store, availability, str(effective), exc)
             for eid in event_ids:
                 store.set_pending(eid, target)
-            return False
+            return _TRIP_RETRY
         except TRANSPORT_FAILURE_ERRORS as exc:
             if availability is None:
                 raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。

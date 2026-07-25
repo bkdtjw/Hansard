@@ -58,6 +58,7 @@ from orch.scheduler.availability import (
 )
 from orch.scheduler.core import (
     _MAX_SCHEMA_RETRY,
+    _TRIP_RETRY,
     _apply_bb_if_eligible,
     _assemble_view,
     _enforce_sender_constraint,
@@ -223,7 +224,42 @@ async def _dispatch_group_async(
     availability: AdapterAvailability | None = None,
     effective: str | None = None,
 ) -> None:
-    """处理单个 (target, event_ids) 组的异步版本。
+    """§5.6.3 第 1 条的"跳闸→立即重解析→当场重试"外层（与 core._dispatch_group 同源同修）。
+
+    重试在**本协程内串行**完成：不引入任何跨组屏障，并行判定仍只看 §5.1 的写域两两不相交
+    （同一 target 的组本就串行，重试不改变任何组间关系）。终止性同同步环：每次重试必伴随
+    一次 disable，绑定链有限且跳闸单向，无需计数器。
+    """
+    while True:
+        outcome = await _dispatch_group_async_once(
+            store, config, adapters, target, event_ids, lock,
+            availability=availability, effective=effective,
+        )
+        if outcome is not _TRIP_RETRY:
+            return
+        effective = resolve_binding(config, target, availability)
+        if effective is None:
+            async with lock:
+                note_blocked(store, target, primary_adapter_name(config, target))
+            return
+        # 有新绑定 → 同一轮内当场以新绑定重跑本组（切换审计 / 换绑冷启动照旧）。
+
+
+async def _dispatch_group_async_once(
+    store,
+    config: dict,
+    adapters: dict,
+    target: str,
+    event_ids: list[int],
+    lock: asyncio.Lock,
+    *,
+    availability: AdapterAvailability | None = None,
+    effective: str | None = None,
+) -> object:
+    """处理单个 (target, event_ids) 组的异步版本（**一次**尝试）。
+
+    返回 ``_TRIP_RETRY`` 表示特征命中跳闸、需由 ``_dispatch_group_async`` 同轮换绑重试；
+    其余情况返回 None（成功或已落盘的失败）。
 
     落盘顺序严格对齐 §5.1 与 sync 版 _dispatch_group：
       mark_dispatching → invoke → schema 校验 → autocommit → audit → reply_and_done → bb_ops。
@@ -296,12 +332,12 @@ async def _dispatch_group_async(
             # M5 §5.6.3（仅在启用时）：先按分类结果消费，与同步环同源。
             if availability is not None and isinstance(exc, AdapterUnavailableError):
                 # 特征命中 → 跳闸 + 审计 + 指标；该次失败不计 attempts，行回 pending，
-                # 本轮跳过（下轮重解析由备胎接手）。
+                # 由外层 _dispatch_group_async **同一轮内立即**重解析（§5.6.3 第 1 条）。
                 async with lock:
                     on_unavailable(store, availability, str(effective), exc)
                     for eid in event_ids:
                         store.set_pending(eid, target)
-                return
+                return _TRIP_RETRY
             if availability is not None and isinstance(exc, TRANSPORT_FAILURE_ERRORS):
                 # 其他传输级失败 → 既有 attempts 语义（同源 _transport_failure_fallout）
                 # 叠加 fail_streak 记账（达阈值则跳闸 + 审计 + 指标）。
