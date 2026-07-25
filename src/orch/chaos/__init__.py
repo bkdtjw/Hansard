@@ -43,6 +43,7 @@ from orch.adapters.state import AdapterAvailability
 from orch.chaos.expected import EXPECTED_TYPE_SEQUENCE
 from orch.scheduler.availability import (
     KIND_ADAPTER_BLOCKED,
+    KIND_ADAPTER_RECOVERED,
     KIND_ADAPTER_TRIP,
     KIND_FALLBACK_SWITCH,
     METRIC_FALLBACK_SWITCH,
@@ -544,9 +545,16 @@ class ChaosHarness:
 #     （与 tests/test_m5_availability.py G 组同一口径；附录B 本就允许事件号偏移）。
 # ======================================================================
 
-# 契约 §4 冻结的三种 M5 审计事件 meta.kind（比较前一律剔除；它们不生成派发行）。
+# 契约 §4 的 M5 审计事件 meta.kind 全集（比较前一律剔除；它们一律不生成派发行）。
+# 必须与 orch.scheduler.availability 的 KIND_* 保持同步：任何一种漏剔，都会让它混进
+# "剔除审计后的类型序列/事件号名次"里，把 spec 明文允许的偏移判成终态失真（R6b）。
+# adapter_recovered（角色回归主绑定的通告）当前混沌场景不产生——场景里跳闸只单向、
+# 无跑中 enable——但口径必须先行覆盖，否则将来一引入"跑中 enable 回归"就静默失真。
 _M5_AUDIT_KINDS: tuple[str, ...] = (
-    KIND_FALLBACK_SWITCH, KIND_ADAPTER_BLOCKED, KIND_ADAPTER_TRIP,
+    KIND_FALLBACK_SWITCH,
+    KIND_ADAPTER_BLOCKED,
+    KIND_ADAPTER_TRIP,
+    KIND_ADAPTER_RECOVERED,
 )
 
 ADAPTER_INJECTION_SITES: tuple[str, ...] = (
