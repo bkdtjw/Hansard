@@ -61,6 +61,8 @@
                 <span id="wk-title" class="wk-title" title="">…</span>
                 <span id="wk-status" class="badge">—</span>
                 <span id="dispatch-summary" class="dispatch-summary"></span>
+                <!-- M5 §12：角色行生效绑定（主绑定 ⛔ 时显示 →备胎；全链不可用点名警示） -->
+                <span id="role-bindings" class="role-bindings"></span>
               </div>
               <div class="th-right">
                 <button id="btn-primary-action" class="btn-primary">▶ 运行一轮</button>
@@ -78,7 +80,7 @@
 
             <!-- M5 §12：适配器停用/阻塞警示条（存在 disabled 时出现，点击直达适配器面板） -->
             <div id="adapter-warn" class="adapter-banner hidden">
-              <span class="adp-warn-icon">⛔</span>
+              <span id="adapter-warn-icon" class="adp-warn-icon">⛔</span>
               <span id="adapter-warn-text" class="adp-warn-text"></span>
               <button id="btn-goto-adapters" class="btn-ghost">管理适配器 →</button>
             </div>

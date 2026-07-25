@@ -170,6 +170,7 @@ function switchWorkspace(name) {
   lastStatus = null;
   unseenCount = 0;
   clearTimeout(pollTimer);
+  pollActive = false;
   updateLiveIndicator("hidden");
   updateNewMsgsFloat();
   $("#workspace").classList.add("hidden");
@@ -271,22 +272,57 @@ function renderAdapters() {
   });
 }
 
+// M5 §12（评审 minor-2）：警示分两档——
+//   · **阻塞**（某角色主绑定与全部备胎都停用，status 端点的 roles[].blocked）→ 红色点名角色；
+//   · 仅"有 disabled 但备胎兜住" → 温和提示（编排在继续，不该长期红着吓人）。
+function blockedRolesOf(s) {
+  return ((s && s.roles) || []).filter((r) => r.blocked).map((r) => String(r.role));
+}
+
+function renderRoleBindings(s) {
+  const el = $("#role-bindings");
+  if (!el) return;
+  const rows = (s && s.roles) || [];
+  // 只渲染"有话要说"的角色（降级中或阻塞）：一切正常时一枚不渲染（恒态 chip = 噪音）。
+  const notable = rows.filter((r) => r.blocked || r.effective !== r.primary);
+  if (!notable.length) { el.innerHTML = ""; return; }
+  el.innerHTML = notable.map((r) => {
+    const role = escapeHtml(String(r.role));
+    const primary = escapeHtml(String(r.primary));
+    if (r.blocked) {
+      return `<span class="rb-chip blocked" title="主绑定 ${primary} 与全部备胎均已停用：` +
+             `待办保持 pending，等待人工恢复">${role} ⚠ 无可用</span>`;
+    }
+    return `<span class="rb-chip degraded" title="主绑定 ${primary} 已停用，本轮由备胎承接">` +
+           `${role} ⛔${primary}→${escapeHtml(String(r.effective))}</span>`;
+  }).join("");
+}
+
 function updateAdapterAlerts() {
   const offNames = adapterRows.filter((r) => r.status !== "enabled").map((r) => r.name);
-  const text = offNames.length
-    ? `已停用 ${offNames.length} 个适配器：${offNames.join("、")}` +
-      "　—— 绑定它们的角色将降级到 fallback；无备胎的角色待办保持 pending 等待人工恢复。"
-    : "";
+  const blocked = blockedRolesOf(lastStatus);
+  const text = blocked.length
+    ? `角色 ${blocked.join("、")} 无可用适配器（主绑定与全部备胎均已停用）：` +
+      "相关待办保持 pending 不消耗重试预算，需人工恢复后自动接手。"
+    : (offNames.length
+        ? `已停用 ${offNames.length} 个适配器：${offNames.join("、")}` +
+          "　—— 相关角色已降级到备胎，编排继续。"
+        : "");
+  const show = Boolean(text);
   const bar = $("#adapter-warn");
   if (bar) {
-    bar.classList.toggle("hidden", !offNames.length);
+    bar.classList.toggle("hidden", !show);
+    bar.classList.toggle("mild", show && !blocked.length);
     const t = $("#adapter-warn-text");
     if (t) t.textContent = text;
+    const ic = $("#adapter-warn-icon");
+    if (ic) ic.textContent = blocked.length ? "⛔" : "⚠";
   }
   const alert = $("#adapters-alert");
   if (alert) {
-    alert.classList.toggle("hidden", !offNames.length);
-    alert.textContent = offNames.length ? "⛔ " + text : "";
+    alert.classList.toggle("hidden", !show);
+    alert.classList.toggle("mild", show && !blocked.length);
+    alert.textContent = show ? (blocked.length ? "⛔ " : "⚠ ") + text : "";
   }
   const dot = $("#tab-adp-dot");
   if (dot) dot.classList.toggle("hidden", !offNames.length);
@@ -1126,6 +1162,8 @@ function applyStatusPayload(s) {
   badge.className = `badge ${s.status}`;
   applyStatusMatrix(s.status);
   renderDispatchSummary(s);
+  renderRoleBindings(s);      // M5 §12：角色行生效绑定
+  updateAdapterAlerts();      // 阻塞点名依赖 status 投影，状态一变就重评警示档位
   updateTypingBar(s);
   // D19：以 status 端点权威状态重评门禁 banner。
   refreshGateFromEvents(currentEvents, s.status);
@@ -1320,6 +1358,9 @@ const POLL_MAX = 12000;
 let pollTimer = null;
 let pollInterval = POLL_BASE;
 let pollInFlight = false;
+// 事件轮询是否仍在自我重排（终态/未选线程/页面不可见 → false）。可用性心跳据此
+// 决定要不要自己去拉 status，避免两条线重复请求同一端点。
+let pollActive = false;
 let pollTick = 0;
 let unseenCount = 0;
 
@@ -1348,8 +1389,9 @@ function schedulePoll() {
 }
 
 async function pollLoop() {
-  if (!selectedThread) { updateLiveIndicator("hidden"); return; }
-  if (document.hidden) return;                     // 不可见：暂停（visibilitychange 恢复）
+  if (!selectedThread) { pollActive = false; updateLiveIndicator("hidden"); return; }
+  if (document.hidden) { pollActive = false; return; }  // 不可见：暂停（visibilitychange 恢复）
+  pollActive = true;
   if (pollInFlight) { schedulePoll(); return; }    // 防堆积：上次未返回不发下次
   const tid = selectedThread;
   pollInFlight = true;
@@ -1380,6 +1422,7 @@ async function pollLoop() {
   }
   pollInterval = ok ? POLL_BASE : Math.min(pollInterval * 2, POLL_MAX);  // 退避加倍/复位
   if (lastStatus && lastStatus.status === "terminated") {
+    pollActive = false;                            // 交棒给可用性心跳（它仍按 D6 跑）
     updateLiveIndicator("off");                    // 终态流不再变化：停轮
     return;
   }
@@ -1393,7 +1436,59 @@ function startPolling() {
   clearTimeout(pollTimer);
   pollInterval = POLL_BASE;
   pollTick = 0;
+  pollActive = true;
   pollLoop();
+}
+
+// ————————————————————————————————————————————————
+// M5 §12 · 可用性心跳（R4b 修复）——**独立于**线程事件轮询的一条线。
+//
+// 根因：pollLoop 对 terminated 线程按 D6 语义"停轮"且不再重排，于是
+// applyStatusPayload → renderRoleBindings / updateAdapterAlerts 这条链在终态线程上
+// 永久停摆；而适配器可用性是**线程之外的事实**（CLI/控制台随时改），停轮那一刻的
+// 快照就冻住了 —— 页面因此看不到 disable 后的阻塞警示（§12"必须显著警示"落空）。
+// 未选中线程时更是一点驱动都没有。
+//
+// 修法：把"可用性 + 角色投影"解耦成常驻心跳：
+//   · 恒定 D6 节奏（POLL_BASE），页面不可见则空转重排（不发请求），可见即恢复；
+//   · 线程是否选中 / 是否终态**都跑**（未选中时只刷 /api/adapters）；
+//   · 事件轮询活跃时（pollActive）不重复拉 status —— 那条线已经在喂同一个渲染函数；
+//   · **不碰 /events、不动 live 指示灯**：终态"事件流不再变化"的 D6 语义原样保留。
+// ————————————————————————————————————————————————
+let availTimer = null;
+let availInFlight = false;
+
+async function availabilityHeartbeat() {
+  clearTimeout(availTimer);
+  if (document.hidden || availInFlight) {          // 不可见/上轮未回：空转，绝不堆积
+    availTimer = setTimeout(availabilityHeartbeat, POLL_BASE);
+    return;
+  }
+  availInFlight = true;
+  try {
+    const adp = await api("/api/adapters").catch(() => null);
+    if (adp) {
+      adapterRows = adp.adapters || [];
+      const box = $("#adapters-list");
+      if ($("#view-adapters").classList.contains("active")
+          && box && !box.contains(document.activeElement)) renderAdapters();
+    }
+    // 事件轮询停摆（终态 / 尚未启动）时，由心跳把含 roles 的 status 喂进渲染。
+    if (selectedThread && !pollActive) {
+      const tid = selectedThread;
+      const s = await api(`/api/threads/${tid}/status`).catch(() => null);
+      if (s && tid === selectedThread) applyStatusPayload(s);   // 内含角色行 + 警示条
+    }
+    updateAdapterAlerts();
+  } finally {
+    availInFlight = false;
+  }
+  availTimer = setTimeout(availabilityHeartbeat, POLL_BASE);
+}
+
+function startAvailabilityHeartbeat() {
+  clearTimeout(availTimer);
+  availabilityHeartbeat();
 }
 
 // ————————————————————————————————————————————————
@@ -1797,14 +1892,18 @@ function bind() {
     }
   }, { passive: true });
 
-  // R5 D6：页面不可见暂停轮询；可见立即拉取一次。
+  // R5 D6：页面不可见暂停轮询；可见立即拉取一次（可用性心跳同步暂停/立即补一拍）。
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       clearTimeout(pollTimer);
+      pollActive = false;
       updateLiveIndicator("paused");
-    } else if (selectedThread) {
-      pollInterval = POLL_BASE;
-      pollLoop();
+    } else {
+      startAvailabilityHeartbeat();   // 回到前台先补一次可用性（不依赖选中线程）
+      if (selectedThread) {
+        pollInterval = POLL_BASE;
+        pollLoop();
+      }
     }
   });
 
@@ -1852,5 +1951,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadWorkspaces();   // ②：先定当前工作区，后续请求自动携带 ?ws=
   loadHealth();
   loadThreads();
-  loadAdapters(true);       // M5：进站即知可用性（警示条/页签点在选线程前就要准）
+  // M5：可用性心跳常驻（进站即知；且不随线程终态/未选中而停 —— R4b 根因修复）。
+  startAvailabilityHeartbeat();
 });

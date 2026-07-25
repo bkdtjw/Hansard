@@ -237,20 +237,32 @@ def _known_adapter_names(config: dict, availability) -> set[str]:
 
 
 def _prepare_availability_config(config: dict, cfg_path: Path) -> list[str]:
-    """生产装配接线（§5.6/§11.1）：装载期校验 + 把状态文件路径写回 config。
+    """生产装配接线（§5.6/§11.1）：装载期校验 + 状态文件探载 + 把路径写回 config。
 
     返回错误清单（空 = 合法且已接线）：非空时**不**写回任何键，由调用方一行人话
-    报错退出（§11.1"装载时校验，违者启动报错"）。写回的两个键：
+    报错（CLI 退出 1 / web 转 JSON 错误响应）。两类错误、同一出口：
+      1. §11.1 配置校验（fallback 未声明 / 带工具角色绑 api 型）；
+      2. §5.6.1 状态文件损坏 —— **装配期探载**（评审 minor-3）：不探的话要等
+         run_thread 内首轮 reload 才炸，会被 per-thread 兜底吞成一行 repr、退出码
+         仍 0，既非"启动报错"也让运维误以为跑过了。探载只读不建文件（缺失=全 enabled）。
+    写回的两个键：
       · config['adapter_state_path'] —— 调度层 make_availability 的唯一开关；
       · config['config_path']        —— 供实现方按 state_path_for 再派生（便于排障）。
-    `orch run` 与 web `POST /api/threads/{id}/run` 两处装配共用本函数（同源）。
+    `orch run` 与 web `POST /api/threads/{id}/run` 两处装配共用本函数（同源单点）。
     """
-    from orch.adapters.state import state_path_for, validate_availability_config
+    from orch.adapters.state import (
+        AdapterStateError, state_path_for, validate_availability_config,
+    )
     errors = validate_availability_config(config)
     if errors:
         return errors
+    state_path = state_path_for(cfg_path)
+    try:
+        _open_availability(cfg_path)
+    except AdapterStateError as exc:
+        return [str(exc)]
     config["config_path"] = str(cfg_path)
-    config["adapter_state_path"] = str(state_path_for(cfg_path))
+    config["adapter_state_path"] = str(state_path)
     return []
 
 
@@ -323,11 +335,12 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
     role 层字段（can_decide/write_scope/tools/supports_resume）覆盖 adapter 层。
     暂只支持 kind=cli（真实联跑）；其它 kind 显式报错，不臆造后端（诚实边界）。
 
-    M5 §5.6.2：返回的映射**同时**含两类键——
-      · 角色名键（既有兼容分支，逐字不变：M0–M4 全部调用方与测试依赖它）；
-      · **adapter 名键**（新增）：调度层按生效绑定名取实例
-        （scheduler.availability.adapter_instance 先查名字键），降级到 fallback 时
-        必须能按名字拿到实例。见 `_add_adapter_name_keys` 的歧义处置。
+    M5 §5.6.2（评审 major-2 冻结）：返回的映射含三类键，供调度层
+    ``scheduler.availability.adapter_instance`` 的兜底链 复合键 → 名字键 → 角色名键：
+      · **复合键 f"{role}::{name}"**（权威）：每角色 × (主绑定 + 各 fallback) 各一个
+        实例，绑**该角色**的 worktree / tools / merged 配置（§8.1 落代码隔离）；
+      · adapter 名键：主绑定名 → 别名到该角色实例（同一对象），兼容 M5 早期映射；
+      · 角色名键：M0–M4 既有映射，全部既有调用方与测试依赖，逐字保留。
     """
     from orch.adapters import CliAdapter
     from orch.scheduler.permissions import ensure_worktrees
@@ -366,70 +379,52 @@ def _build_adapters_from_config(roles: list[str], config: dict, thread_dir: Path
                 f"真实装配暂只支持 kind=cli（角色 {role!r} 解析到 kind={kind!r}）；"
                 "混合/API 后端属后续陪跑项。"
             )
-    _add_adapter_name_keys(out, roles, config, worktrees, thread_dir)
+    _add_binding_keys(out, roles, config, worktrees, thread_dir)
     return out
 
 
-# 只影响调度/渲染、不影响 CliAdapter.invoke 的角色级字段：判定"同一 adapter 名被多个
-# 角色引用时能否共用一个实例"时忽略它们（其余任何差异都判为不可共用）。
-_ROLE_ONLY_KEYS = ("prompt", "can_decide", "verify", "fallback", "adapter")
-
-
-def _add_adapter_name_keys(
+def _add_binding_keys(
     out: dict, roles: list[str], config: dict, worktrees: dict, thread_dir: Path,
 ) -> None:
-    """§5.6.2 生效绑定按**名字**取实例：为角色引用链上的每个 cli 型 adapter 名建实例。
+    """§5.6.2 生效绑定取实例：为每个"角色 × 绑定链上的 adapter 名"各建一个实例。
 
-    引用链 = 每个活跃角色的 [主绑定] + fallback（§5.6.2 的解析域）。逐名处置：
-      · 该名已是某角色的主绑定 → **别名**到已建的角色实例（同一对象，零行为变化）；
-      · 仅作 fallback 出现 → 用引用它的角色的 merged 配置新建一个实例；
-      · 被多个角色引用 → 仅当各角色的 invoke 相关配置（worktree + merged 去掉
-        `_ROLE_ONLY_KEYS`）逐字相同才建一个共享实例；**否则不建**——一个实例无法同时
-        正确承载两套 worktree / tools（§8.1 落代码隔离），宁可让调度层按名取不到实例
-        而显式 KeyError，也不静默拿错 worktree 跑（那是权限缺陷，不是可用性降级）。
-      · 非 cli 型的名字不建实例（与本函数上文"真实装配只支持 kind=cli"同一诚实边界）。
+    绑定链 = 该角色的 [主绑定] + fallback（§5.6.2 的解析域）。逐 (role, name) 处置：
+      · name == 该角色主绑定 → 复合键**别名**到已建的角色实例（同一对象，零行为变化）；
+      · name 是该角色的 fallback → 新建实例，绑**该角色**的 merged 配置与 worktree
+        （评审 major-2：同名 adapter 在不同角色下 tools/write_scope/worktree 各异，
+        一个实例扛不了两套；按 (role, name) 建实例既保 §8.1 隔离又不丢降级能力）；
+      · 非 cli 型的名字不建实例（与"真实装配只支持 kind=cli"同一诚实边界）。
+    adapter 名键（无角色前缀）只为**主绑定**登记别名：同名被多角色引用时按 roles 顺序
+    首个主绑定者胜——它只是兜底链的中间环，权威永远是复合键。
     """
     from orch.adapters import CliAdapter
 
     adapters_conf = config.get("adapters", {}) or {}
     roles_conf = config.get("roles", {}) or {}
 
-    refs: dict[str, list[str]] = {}
     for role in roles:
         rc = dict(roles_conf.get(role, {}) or {})
-        chain = [str(rc.get("adapter") or role)]
+        primary = str(rc.get("adapter") or role)
+        chain = [primary]
         fallback = rc.get("fallback") or []
         if isinstance(fallback, (list, tuple)):
             chain.extend(str(item) for item in fallback)
-        for name in chain:
-            owners = refs.setdefault(name, [])
-            if role not in owners:
-                owners.append(role)
 
-    for name, owners in refs.items():
-        if name in out:
-            continue                      # 与角色名同键：既有角色实例已覆盖，不重复建
-        ac = dict(adapters_conf.get(name, {}) or {})
-        if str(ac.get("kind", "")) != "cli":
-            continue                      # 非 cli 型（或未声明）：不臆造实例
-        built: list[tuple] = []
-        for role in owners:
-            rc = dict(roles_conf.get(role, {}) or {})
-            merged = {**ac, **rc}
-            wt = worktrees.get(role, Path(thread_dir))
-            sig = (str(wt), json.dumps(
-                {k: v for k, v in merged.items() if k not in _ROLE_ONLY_KEYS},
-                sort_keys=True, ensure_ascii=False, default=str,
-            ))
-            built.append((sig, role, merged, wt))
-        if len({sig for sig, _r, _m, _w in built}) != 1:
-            continue                      # 多角色引用且配置不一致：拒绝共用（见 docstring）
-        _sig, role, merged, wt = built[0]
-        if str(roles_conf.get(role, {}).get("adapter") or role) == name and role in out:
-            out[name] = out[role]         # 主绑定：别名到同一对象
-        else:
-            out[name] = CliAdapter(
-                role=role, config=merged, worktree=wt, adapter_name=name,
+        for name in chain:
+            composite = f"{role}::{name}"
+            if composite in out:
+                continue                      # 同名在链上重复出现：只建一次
+            if name == primary and role in out:
+                out[composite] = out[role]    # 主绑定：复合键别名到角色实例
+                out.setdefault(name, out[role])
+                continue
+            ac = dict(adapters_conf.get(name, {}) or {})
+            if str(ac.get("kind", "")) != "cli":
+                continue                      # 非 cli 型（或未声明）：不臆造实例
+            out[composite] = CliAdapter(
+                role=role, config={**ac, **rc},
+                worktree=worktrees.get(role, Path(thread_dir)),
+                adapter_name=name,
             )
 
 
@@ -510,7 +505,7 @@ def cmd_run(
                 # 报错退出（启动报错，不喷 Traceback），**不**带着非法配置继续跑。
                 errors = _prepare_availability_config(cfg, _workspace_config_path(ws))
                 if errors:
-                    _echo("[错误] config.yaml 可用性配置非法（§11.1），拒绝启动："
+                    _echo("[错误] 适配器可用性装载失败（§5.6.1/§11.1），拒绝启动："
                           + "；".join(errors))
                     raise typer.Exit(code=1)
                 adapters = _build_adapters_from_config(roles, cfg, tdir)
@@ -713,9 +708,12 @@ def cmd_status(
             f" attempts={row['attempts']}"
         )
 
-    # §12 可用性呈现：--config 与既有 --workspace **并存**，不给 --config 则逐字同旧输出。
-    if config:
-        _echo_role_bindings(store, _resolve_config_path(config))
+    # §12 可用性呈现：--config 与既有 --workspace **并存**。缺省 --config 时（评审
+    # minor-1）自动取 <workspace>/config.yaml —— 与 `orch run` 同一约定，默认姿势下
+    # 也看得见降级；该文件不存在才退回逐字同旧的纯 status 输出（不臆造绑定）。
+    cfg_path = _resolve_config_path(config) if config else _workspace_config_path(ws)
+    if config or cfg_path.exists():
+        _echo_role_bindings(store, cfg_path)
 
 
 def _echo_role_bindings(store: "orch.store.Store", cfg_path: Path) -> None:
@@ -1301,6 +1299,63 @@ def _collect_metric_values(store: "orch.store.Store", key: str) -> list[float]:
     return [float(r["value"]) for r in rows]
 
 
+def _collect_metric_extras(store: "orch.store.Store", key: str) -> list[str]:
+    """某 key 的全部 extra 文本（一行一条；无表/无行 → 空列表）。
+
+    §13 两项可用性指标的分组维度就编码在 extra 里（契约 §4 冻结）：
+    `role={role}:from={primary}:to={effective}` / `adapter={name}:trigger={trigger}`。
+    """
+    try:
+        rows = store._con.execute(
+            "SELECT extra FROM metrics WHERE key=? ORDER BY ts ASC", (key,)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - metrics 表缺失等极端情况兜底为空
+        return []
+    return [str(r["extra"] or "") for r in rows]
+
+
+def _parse_metric_extra(extra: str) -> dict:
+    """`k=v:k=v` → dict（无法解析的片段忽略；只做投影，不解读语义）。"""
+    out: dict = {}
+    for part in str(extra or "").split(":"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _group_metric_extras(extras: list[str], fields: tuple[str, ...], sep: str) -> list[tuple[str, int]]:
+    """按 extra 里的若干字段分组计数，返回 [(分组标签, 条数)]（按标签排序，可复算）。"""
+    counts: dict[str, int] = {}
+    for extra in extras:
+        parsed = _parse_metric_extra(extra)
+        label = sep.join(str(parsed.get(f) or "?") for f in fields)
+        counts[label] = counts.get(label, 0) + 1
+    return sorted(counts.items())
+
+
+def _availability_metric_summary(dirs: list[Path]) -> dict:
+    """§13 新两行的原始量（评审 major-1）：现查 metrics 表**行数**，不近似不编造。
+
+      · 降级切换次数 = key='fallback_switch' 行数（§13"每次 effective ≠ 主绑定的派发记
+        一条"），按 (role, 生效绑定) 分组；
+      · 自动跳闸次数 = key='adapter_trip' 行数，按 (adapter, 触发条件) 分类。
+    CLI `orch metrics` 与 GET /api/metrics 共用本函数，两处口径不可能漂移。
+    """
+    switch_extras: list[str] = []
+    trip_extras: list[str] = []
+    for d in dirs:
+        store = orch.store.Store(d)
+        switch_extras.extend(_collect_metric_extras(store, "fallback_switch"))
+        trip_extras.extend(_collect_metric_extras(store, "adapter_trip"))
+    return {
+        "switch_total": len(switch_extras),
+        "switch_groups": _group_metric_extras(switch_extras, ("role", "to"), "→"),
+        "trip_total": len(trip_extras),
+        "trip_groups": _group_metric_extras(trip_extras, ("adapter", "trigger"), "/"),
+    }
+
+
 def _fmt_num(x: float | None, suffix: str = "") -> str:
     if x is None:
         return "N/A"
@@ -1429,6 +1484,15 @@ def cmd_metrics(
     _echo(f"    mock 层通过率 %              : {_fmt_pct(chaos_mock_pct)}")
     _echo(f"    真实层通过率 %               : {_fmt_pct(chaos_real_pct)}")
     _echo(f"[7] 新增供应商 adapter 行数(adapter LoC, cloc, 从第3家起算): {adapter_loc}")
+
+    # —— §13 可用性两项（M5，评审 major-1）：现查 metrics 表行数，分组子行不重复标签 ——
+    avail = _availability_metric_summary(dirs)
+    _echo(f"[8] 降级切换次数(fallback switch) : {avail['switch_total']}")
+    for label, n in avail["switch_groups"]:
+        _echo(f"      · {label}: {n}")
+    _echo(f"[9] 自动跳闸次数(adapter trip)    : {avail['trip_total']}")
+    for label, n in avail["trip_groups"]:
+        _echo(f"      · {label}: {n}")
 
 
 def _count_adapter_loc_from_third() -> str:

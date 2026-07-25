@@ -134,6 +134,40 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
     return 200, {"events": out}
 
 
+def _role_binding_projection(ws: Path, store: "orch.store.Store") -> list[dict]:
+    """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
+
+    键名冻结：{role, primary, effective, blocked}；effective=None ⇔ blocked=True
+    （该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用 state.resolve_effective_adapter，
+    与调度层同一判据；本函数**不写盘、不改配置**。
+    状态文件损坏 → 空投影（不猜测；run 端点会给出人话报错，读页面不该被打断）。
+    """
+    from orch.adapters.state import AdapterStateError, resolve_effective_adapter
+
+    cfg_path = clim._workspace_config_path(ws)
+    cfg = clim._read_config_file(cfg_path)
+    roles_cfg = cfg.get("roles") or {}
+    roles = clim._thread_roles(store) or [str(r) for r in roles_cfg]
+    if not roles:
+        return []
+    try:
+        availability = clim._open_availability(cfg_path)
+    except AdapterStateError:
+        return []
+    out = []
+    for role in roles:
+        rc = roles_cfg.get(role) or {}
+        primary = str(rc.get("adapter") or role)
+        effective = resolve_effective_adapter(role, roles_cfg, availability)
+        out.append({
+            "role": role,
+            "primary": primary,
+            "effective": effective,
+            "blocked": effective is None,
+        })
+    return out
+
+
 def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
     store = _require_thread(ws, tid)
     pend = store.pending_dispatches()
@@ -146,6 +180,8 @@ def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
             }
             for r in pend
         ],
+        # M5 §12：角色行的生效绑定 / 阻塞点名（前端据此渲染，不再只看"有没有 disabled"）。
+        "roles": _role_binding_projection(ws, store),
     }
 
 
@@ -173,9 +209,12 @@ def _ep_thread_run(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
         # M5 §5.6/§11.1 生产装配接线（与 orch run 同源：clim._prepare_availability_config）：
         # 先装载期校验，错误清单非空 → 400 一行人话；合法则把状态文件路径写回 config，
         # 调度层每轮 reload 自然感知控制台/CLI 的 enable/disable，无需任何推送通道。
+        # 校验 + 状态文件探载失败 → JSON 错误响应（**不退进程**：网关进程常驻，
+        # 一个坏 workspace 不该拖垮控制台；运维在页面上就能看到人话原因）。
         errors = clim._prepare_availability_config(config, clim._workspace_config_path(ws))
         if errors:
-            raise _ApiError(400, "config.yaml 可用性配置非法（§11.1）：" + "；".join(errors))
+            raise _ApiError(
+                400, "适配器可用性装载失败（§5.6.1/§11.1）：" + "；".join(errors))
         adapters = clim._build_adapters_from_config(roles, config, ws / tid)
     else:
         adapters = clim._build_default_adapters(roles)
@@ -389,6 +428,15 @@ def _ep_metrics(ws: Path, query: dict) -> tuple[int, dict]:
         {"label": "chaos_real_pass_pct", "value": clim._fmt_pct(chaos_real_pct)},
         {"label": "adapter_loc", "value": adapter_loc},
     ]
+    # §13 可用性两项（M5，评审 major-1）：标签用 §13 行名，值 = metrics 表现查行数；
+    # 分组子行的标签**不含**这两个字面（前端与测试都按字面唯一定位这两行）。
+    avail = clim._availability_metric_summary(dirs)
+    rows.append({"label": "降级切换次数", "value": str(avail["switch_total"])})
+    rows.extend({"label": f"· {label}", "value": str(n)}
+                for label, n in avail["switch_groups"])
+    rows.append({"label": "自动跳闸次数", "value": str(avail["trip_total"])})
+    rows.extend({"label": f"· {label}", "value": str(n)}
+                for label, n in avail["trip_groups"])
     return 200, {"rows": rows}
 
 

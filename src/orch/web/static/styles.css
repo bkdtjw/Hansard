@@ -789,6 +789,22 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
   border-left: 4px solid var(--danger-solid); border-radius: var(--radius-card);
 }
 .adapter-banner.panel-alert { margin-bottom: 12px; font-size: 13px; color: var(--txt); }
+/* 温和档：仅"有 disabled 但备胎兜住"——编排在继续，不该长期红着吓人（琥珀，同门禁色系）。 */
+.adapter-banner.mild {
+  background: rgba(251, 191, 36, 0.12); border-color: #fbbf2477;
+  border-left-color: var(--gate);
+}
+.adapter-banner.mild .adp-warn-icon { color: var(--gate); }
+
+/* 线程头角色行：只在降级/阻塞时出现（恒态 chip = 噪音）。 */
+.role-bindings { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rb-chip {
+  font-size: 11.5px; padding: 2px 8px; border-radius: var(--radius-chip);
+  border: 1px solid var(--glass-brd); background: rgba(255, 255, 255, 0.05);
+  white-space: nowrap; cursor: help;
+}
+.rb-chip.degraded { color: #fbbf24; border-color: #fbbf2466; background: rgba(251, 191, 36, 0.14); }
+.rb-chip.blocked { color: #fca5a5; border-color: #f8717188; background: rgba(248, 113, 113, 0.16); font-weight: 600; }
 .adp-warn-icon { color: var(--danger-solid); font-size: 16px; }
 .adp-warn-text { color: var(--txt); font-size: 13px; line-height: 1.5; flex: 1 1 auto; min-width: 200px; }
 
