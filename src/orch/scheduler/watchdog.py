@@ -53,6 +53,11 @@ from __future__ import annotations
 import time
 
 from orch.scheduler._dispatch import dispatching_rows
+from orch.scheduler.availability import (
+    make_availability,
+    on_watchdog_timeout,
+    resolve_binding,
+)
 
 # §5.3 默认阈值（config.thread_defaults 未给时兜底；与 spec 括注一致）。
 _DEFAULT_LOOP_LIMIT = 3
@@ -193,6 +198,10 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
     # 本层未实现，留待 M2 真实后端；M1 worker 派发为 mock 且同步返回，活循环中通常
     # 枚举不到 dispatching 行，此级别在真实活循环里实际是 no-op（详见模块与函数
     # docstring 的完整说明）——本行只做计数，不代表已完成对账。 ——
+    # M5 §5.6.4（评审 minor-4）："超时既走看门狗路径也计入 fail_streak"。availability
+    # 惰性装载：只有真出现过期行才读状态文件（无过期行时本级别与接线前逐字一致，零读盘）。
+    availability = None
+    availability_ready = False
     for row in dispatching_rows(store):
         deadline = row.get("deadline_ts")
         if deadline is None:
@@ -201,6 +210,21 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
             eid = int(row["event_id"])
             tgt = row["target"]
             new_attempts = store.bump_attempt(eid, tgt)
+            if not availability_ready:
+                availability = make_availability(config)
+                if availability is not None:
+                    availability.reload()
+                availability_ready = True
+            if availability is not None:
+                # 生效绑定**现场 resolve**（不读 sessions：会话表可能滞后于本次派发实际
+                # 用的绑定）。全链不可用 → 无从归属这次超时，不记（诚实边界）。
+                effective = resolve_binding(config, tgt, availability)
+                if effective is not None:
+                    on_watchdog_timeout(
+                        store, config, availability, effective,
+                        detail=(f"看门狗单次调用超时：{tgt} E{eid} "
+                                f"deadline={deadline}（§5.3 级别1 / §5.6.4）"),
+                    )
             actions.append({
                 "level": 1, "event_id": eid, "target": tgt,
                 "attempts": new_attempts,

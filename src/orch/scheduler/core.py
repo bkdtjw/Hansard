@@ -27,14 +27,16 @@ from orch.scheduler.availability import (
     AdapterAvailability,
     AdapterUnavailableError,
     adapter_instance,
+    apply_rebinding,
     make_availability,
     note_blocked,
     note_fallback_switch,
+    note_recovered,
     on_invoke_success,
     on_transport_failure,
     on_unavailable,
+    prev_binding,
     primary_adapter_name,
-    rebind_session_if_needed,
     resolve_binding,
 )
 from orch.scheduler.permissions import (
@@ -962,16 +964,22 @@ def _dispatch_group_once(
 
     # ————————————————————————————————————————————————————————
     # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，聚合与并行判定不变）：
-    #   ① effective ≠ 主绑定 → 首次追加切换审计事件（不生成派发行）+ §13 埋点；
-    #   ② effective ≠ sessions.backend → 视为会话死亡：sid 置空 / gen+1 / backend 更新，
-    #      并对本组各行 attempts 归零，随后自然走冷启动全量组装（§6.1–6.4）。
+    #   ① prev-binding 先从审计链盘上推导（必须在追加本轮通告**之前**取，否则刚落的
+    #      切换/回归事件会把自己算成"上一次"，评审 major-6）；
+    #   ② effective ≠ 主绑定 → 切换通告（首次才记）+ §13 每次派发埋点；
+    #      effective == 主绑定且盘上仍处降级中 → 回归通告 adapter_recovered（major-4）；
+    #   ③ 换绑落实：attempts 归零看 effective ≠ prev（与有无 sessions 行无关）；
+    #      会话作废（sid 空 / gen+1 / backend）只在确有 sessions 行且 backend 不同时做。
     # ————————————————————————————————————————————————————————
     if availability is not None:
         eff = str(effective)
+        prev = prev_binding(store, target, primary)
         if eff != primary:
             note_fallback_switch(store, availability, target, primary, eff)
-        rebind_session_if_needed(
-            store, _session_row(store, target), target, eff, event_ids,
+        else:
+            note_recovered(store, target, primary)
+        apply_rebinding(
+            store, _session_row(store, target), target, eff, event_ids, prev,
         )
 
     # 标 dispatching + 落盘绝对截止时间戳（§4.4 事务(2)、§16.2）。

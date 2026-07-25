@@ -46,14 +46,16 @@ from orch.scheduler.availability import (
     AdapterAvailability,
     AdapterUnavailableError,
     adapter_instance,
+    apply_rebinding,
     make_availability,
     note_blocked,
     note_fallback_switch,
+    note_recovered,
     on_invoke_success,
     on_transport_failure,
     on_unavailable,
+    prev_binding,
     primary_adapter_name,
-    rebind_session_if_needed,
     resolve_binding,
 )
 from orch.scheduler.core import (
@@ -292,14 +294,18 @@ async def _dispatch_group_async_once(
         if merged_ids != list(event_ids):
             event_ids = merged_ids
         # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，与 core._dispatch_group 同源同修）：
-        # 切换审计事件（首次、不生成派发行）+ 会话作废（sid 空/gen+1/backend 更新）+ 本组
-        # attempts 归零。全部在锁内（sqlite 单连接串行化）。
+        # prev 先推导 → 切换通告（首次）/ 回归通告 adapter_recovered → 换绑落实
+        # （attempts 归零看 effective≠prev；会话作废只在确有 sessions 行时）。
+        # 全部在锁内（sqlite 单连接串行化）。
         if availability is not None:
             eff = str(effective)
+            prev = prev_binding(store, target, primary)
             if eff != primary:
                 note_fallback_switch(store, availability, target, primary, eff)
-            rebind_session_if_needed(
-                store, _session_row(store, target), target, eff, event_ids,
+            else:
+                note_recovered(store, target, primary)
+            apply_rebinding(
+                store, _session_row(store, target), target, eff, event_ids, prev,
             )
         for eid in event_ids:
             store.mark_dispatching(eid, target, deadline_ts)
