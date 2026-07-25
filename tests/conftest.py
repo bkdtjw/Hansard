@@ -11,6 +11,11 @@
 M4-T5 · chaos_50 marker + --chaos-50 flag（spec §15 M4 硬门槛）
    默认 pytest 不跑 `chaos_50` 标记用例（避免每次 CI 都吃 50 轮混沌）；
    仅当命令行显式传入 `--chaos-50` 时才收集并运行。
+
+M5-T1 · chaos_m5 marker + --chaos-m5 flag（spec §15 M5 "切换间隙 kill -9 ≥20 轮"）
+   同一惯例另立一个标志（docs/m5-contract.md §8 要求）：默认不跑 `chaos_m5`
+   标记用例，仅当命令行显式传入 `--chaos-m5` 时才收集并运行。
+   与 `--chaos-50` 彼此独立、互不影响。
 """
 
 from __future__ import annotations
@@ -36,6 +41,13 @@ def pytest_addoption(parser):
         default=False,
         help="Run M4 chaos 50-round hard-gate tests (spec §15 M4).",
     )
+    # —— M5-T1 新增：适配器切换间隙混沌 opt-in（与 --chaos-50 独立）——
+    parser.addoption(
+        "--chaos-m5",
+        action="store_true",
+        default=False,
+        help="Run M5 adapter-switch chaos tests, >=20 rounds (spec §15 M5).",
+    )
 
 
 def pytest_configure(config):
@@ -44,10 +56,24 @@ def pytest_configure(config):
         "markers",
         "chaos_50: mark test as M4 chaos 50-round hard gate (skipped without --chaos-50).",
     )
+    # —— M5-T1 新增：chaos_m5 marker ——
+    config.addinivalue_line(
+        "markers",
+        "chaos_m5: mark test as M5 adapter-switch chaos gate (skipped without --chaos-m5).",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """未指定 `--chaos-50` 时对所有 `chaos_50` 用例贴 skip 标记（不影响其它用例）。"""
+    """未指定 `--chaos-50` / `--chaos-m5` 时对相应标记用例贴 skip（不影响其它用例）。"""
+    # —— M5-T1 新增：chaos_m5 的独立门控（先处理，不改动下方 chaos_50 既有逻辑）——
+    if not config.getoption("--chaos-m5"):
+        skip_m5 = pytest.mark.skip(
+            reason="chaos_m5 gate skipped by default; pass --chaos-m5 to run.",
+        )
+        for item in items:
+            if "chaos_m5" in item.keywords:
+                item.add_marker(skip_m5)
+
     if config.getoption("--chaos-50"):
         return
     skip_chaos = pytest.mark.skip(

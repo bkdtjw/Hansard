@@ -275,3 +275,27 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   （AdapterAvailability/resolve_effective_adapter/AdapterUnavailableError/
   Store.reset_attempts/CLI 三命令/web 端点/metrics 键/事件 meta.kind）。
 - 接手基线：302 passed, 1 skipped（63s，动工前亲跑）。
+
+### M5 施工台账
+- T1 ✅ 验收测试先行 46 用例见红（43 availability + 3 chaos opt-in `--chaos-m5`），
+  302 基线零回归（Lead 亲跑三条完成标准）。conftest 仅追加 chaos_m5 门控块，
+  chaos_50 逻辑逐字未动（Lead diff 亲核）。
+- T1 九条契约歧义 Lead 裁决（均为 spec 之下契约粒度，无 spec 冲突，不入 QUESTIONS）：
+  ① 状态文件路径经 `config['adapter_state_path']`（装配层回写绝对路径，缺失 →
+     可用性逻辑整体退化为全 enabled，既有 302 测试零改动的兼容前提）；
+  ② adapters 映射按 adapter 名取实例，保留"role 无 adapter 声明回落角色名"分支；
+  ③ 附录B 事件号偏移 → MockAdapter 增 `key_by="call"`（契约 §2 扩展，T4 落实；
+     fixture 文件不动）；
+  ④ "终态逐字节一致"的 M5 口径 = 剔除 M5 审计事件后把事件号映射为名次再逐字节
+     比较 + 过滤后类型序列 == 附录B（R-T1 口径的延伸，其余维度不放松）；
+  ⑤ chaos 符号冻结采 T1 自决：`AdapterChaosHarness(workspace, script, seed,
+     unavailable_after).run(rounds) -> ChaosReport`（复用 M4 五字段）+
+     `ADAPTER_INJECTION_SITES = {adapter_trip_post, fallback_switch_post,
+     rebind_dispatch_post, random_mix}`；
+  ⑥ 同步环全阻塞语义 = 无可调度组立即返回（M0"无待办即返回"同款退化），轮询节奏
+     归 orch run 外层；async 环沿既有等待机制 + 轮询（缺省 ≤2s，属 §17）；
+  ⑦ 审计事件免派发行 = `Store.append_event` 增缺省关键字 `make_dispatches=True`
+     （缺省行为逐字不变）。**禁止** to=[] 特判（那是兜底路由语义）、**禁止**
+     追加后删行（不忠实）。T3 落实；
+  ⑧ `orch status` 的 --config 与 --workspace 并存，互为补充；
+  ⑨ metrics extra 具体格式 T3 自定，键名 `fallback_switch` / `adapter_trip` 锁死。
