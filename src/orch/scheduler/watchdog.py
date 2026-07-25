@@ -198,8 +198,12 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
     # 本层未实现，留待 M2 真实后端；M1 worker 派发为 mock 且同步返回，活循环中通常
     # 枚举不到 dispatching 行，此级别在真实活循环里实际是 no-op（详见模块与函数
     # docstring 的完整说明）——本行只做计数，不代表已完成对账。 ——
-    # M5 §5.6.4（评审 minor-4）："超时既走看门狗路径也计入 fail_streak"。availability
-    # 惰性装载：只有真出现过期行才读状态文件（无过期行时本级别与接线前逐字一致，零读盘）。
+    # M5 §5.6.4（评审 minor-4 + closure N1）："超时既走看门狗路径也计入 fail_streak"——
+    # 一次超时是**一次**失败事实，不是每轮巡检各一次。滞留的 dispatching 行（进程已死、
+    # 行留在盘上）会被每一轮 check 重新枚举；若每轮都记，几轮内就能把主绑定连同备胎整条
+    # 链跳闸，而这期间根本没有发生任何新的 invoke。判据只用盘上量（§16.9/§16.10）：
+    # **本轮 bump 前 attempts == 0**（= 这条行第一次被观察到超时）才记一次。
+    # availability 惰性装载：只有真要记的那一次才读状态文件（其余轮零读盘）。
     availability = None
     availability_ready = False
     for row in dispatching_rows(store):
@@ -209,22 +213,24 @@ def check_watchdogs(store, config: dict, *, now: float | None = None) -> list[di
         if ts_now > float(deadline):
             eid = int(row["event_id"])
             tgt = row["target"]
-            new_attempts = store.bump_attempt(eid, tgt)
-            if not availability_ready:
-                availability = make_availability(config)
+            first_observation = int(row.get("attempts") or 0) == 0
+            new_attempts = store.bump_attempt(eid, tgt)   # 级别1 既有语义：每轮照旧 +1
+            if first_observation:
+                if not availability_ready:
+                    availability = make_availability(config)
+                    if availability is not None:
+                        availability.reload()
+                    availability_ready = True
                 if availability is not None:
-                    availability.reload()
-                availability_ready = True
-            if availability is not None:
-                # 生效绑定**现场 resolve**（不读 sessions：会话表可能滞后于本次派发实际
-                # 用的绑定）。全链不可用 → 无从归属这次超时，不记（诚实边界）。
-                effective = resolve_binding(config, tgt, availability)
-                if effective is not None:
-                    on_watchdog_timeout(
-                        store, config, availability, effective,
-                        detail=(f"看门狗单次调用超时：{tgt} E{eid} "
-                                f"deadline={deadline}（§5.3 级别1 / §5.6.4）"),
-                    )
+                    # 生效绑定**现场 resolve**（不读 sessions：会话表可能滞后于本次派发
+                    # 实际用的绑定）。全链不可用 → 无从归属这次超时，不记（诚实边界）。
+                    effective = resolve_binding(config, tgt, availability)
+                    if effective is not None:
+                        on_watchdog_timeout(
+                            store, config, availability, effective,
+                            detail=(f"看门狗单次调用超时：{tgt} E{eid} "
+                                    f"deadline={deadline}（§5.3 级别1 / §5.6.4）"),
+                        )
             actions.append({
                 "level": 1, "event_id": eid, "target": tgt,
                 "attempts": new_attempts,

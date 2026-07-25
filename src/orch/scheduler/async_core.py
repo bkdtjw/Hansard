@@ -294,19 +294,18 @@ async def _dispatch_group_async_once(
         if merged_ids != list(event_ids):
             event_ids = merged_ids
         # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，与 core._dispatch_group 同源同修）：
-        # prev 先推导 → 切换通告（首次）/ 回归通告 adapter_recovered → 换绑落实
-        # （attempts 归零看 effective≠prev；会话作废只在确有 sessions 行时）。
-        # 全部在锁内（sqlite 单连接串行化）。
+        # prev 先推导（读序）→ **先**换绑落实（attempts 归零 / 会话作废）→ **后**落通告
+        # （写序，R7 N3：两步非单事务，先归零才自愈）。全部在锁内（sqlite 单连接串行化）。
         if availability is not None:
             eff = str(effective)
             prev = prev_binding(store, target, primary)
+            apply_rebinding(
+                store, _session_row(store, target), target, eff, event_ids, prev,
+            )
             if eff != primary:
                 note_fallback_switch(store, availability, target, primary, eff)
             else:
                 note_recovered(store, target, primary)
-            apply_rebinding(
-                store, _session_row(store, target), target, eff, event_ids, prev,
-            )
         for eid in event_ids:
             store.mark_dispatching(eid, target, deadline_ts)
         # R-T2 · E（§8.2 首轮审计兜底，与 core._dispatch_group 同源同修）：worktree 存在但

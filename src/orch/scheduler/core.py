@@ -966,21 +966,24 @@ def _dispatch_group_once(
     # M5 §5.6.2 换绑前置（**在标 dispatching 之前**，聚合与并行判定不变）：
     #   ① prev-binding 先从审计链盘上推导（必须在追加本轮通告**之前**取，否则刚落的
     #      切换/回归事件会把自己算成"上一次"，评审 major-6）；
-    #   ② effective ≠ 主绑定 → 切换通告（首次才记）+ §13 每次派发埋点；
-    #      effective == 主绑定且盘上仍处降级中 → 回归通告 adapter_recovered（major-4）；
-    #   ③ 换绑落实：attempts 归零看 effective ≠ prev（与有无 sessions 行无关）；
-    #      会话作废（sid 空 / gen+1 / backend）只在确有 sessions 行且 backend 不同时做。
+    #   ② 换绑落实**先行**（R7 N3 崩溃窗口）：attempts 归零看 effective ≠ prev（与有无
+    #      sessions 行无关）；会话作废（sid 空 / gen+1 / backend）只在确有 sessions 行且
+    #      backend 不同时做。两步不是单事务，故次序本身就是正确性：**先归零后落通告**——
+    #      窗口内 kill 只丢一条通告，重启后 prev 仍推导为主绑定 → 归零幂等重做 + 补记通告
+    #      （自愈）；反过来先落通告则去重会抑制重记，该行永久失去归零机会（不自愈）。
+    #   ③ effective ≠ 主绑定 → 切换通告（首次才记）+ §13 每次派发埋点；
+    #      effective == 主绑定且盘上仍处降级中 → 回归通告 adapter_recovered（major-4）。
     # ————————————————————————————————————————————————————————
     if availability is not None:
         eff = str(effective)
-        prev = prev_binding(store, target, primary)
+        prev = prev_binding(store, target, primary)   # 读序不变：通告落盘前取 prev
+        apply_rebinding(
+            store, _session_row(store, target), target, eff, event_ids, prev,
+        )
         if eff != primary:
             note_fallback_switch(store, availability, target, primary, eff)
         else:
             note_recovered(store, target, primary)
-        apply_rebinding(
-            store, _session_row(store, target), target, eff, event_ids, prev,
-        )
 
     # 标 dispatching + 落盘绝对截止时间戳（§4.4 事务(2)、§16.2）。
     deadline_ts = time.time() + _timeout_for(config, target)
