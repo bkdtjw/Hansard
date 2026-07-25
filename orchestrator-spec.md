@@ -39,6 +39,9 @@
 | 门禁 gate | 不可逆操作前的人工审批点（§10） |
 | 看门狗 watchdog | 超时 / 环路 / 轮数三级防护（§5.3） |
 | 会话 session | CLI 后端的原生对话（--resume 可续），仅作缓存（§7.5） |
+| 可用性 availability | adapter 的 enabled/disabled 两态，全局（跨线程），落盘于适配器状态文件（§5.6.1） |
+| 降级路由 fallback | 角色主绑定不可用时，按 fallback 顺序取首个可用 adapter（§5.6.2） |
+| 跳闸 trip | 编排器依报错特征或连续失败自动置 disabled（§5.6.3） |
 
 ## 2. 总体架构（五层）
 
@@ -128,6 +131,7 @@
 ```
 orchestrator/                 # 本系统自身
   config.yaml
+  adapter_state.json          # 适配器可用性（全局，跨线程；原子替换写，§5.6.1）
   prompts/                    # 各角色提示词模板
   threads/
     t-001/
@@ -146,7 +150,7 @@ orchestrator/                 # 本系统自身
 
 | 类别 | 内容 | 重启后处理 |
 |---|---|---|
-| 真相（落盘） | 事件日志；派发表（含绝对截止时间戳）；黑板文件；worktree（靠 autocommit）；线程元数据；作业表 | 直接装载 |
+| 真相（落盘） | 事件日志；派发表（含绝对截止时间戳）；黑板文件；worktree（靠 autocommit）；线程元数据；作业表；适配器状态文件（§5.6.1） | 直接装载 |
 | 可推导（不落盘） | 每角色四层视图；环路计数；轮数 | 由日志 + 黑板重算 |
 | 半真半假 | 会话表 (sid, last_evt, gen) | 装载但一律视为"可能已死"：热续失败 → 冷启动 |
 
@@ -234,12 +238,13 @@ thread_id 不进表：一线程一个 db 文件，天然隔离。
 ```
 while thread.status == running:
     batch = 全部 pending 派发行, 按 event_id 升序
-    if batch 为空: 等待(新事件 / 作业回调 / 门禁恢复)
+    if batch 为空 或 无可调度组: 等待(新事件 / 作业回调 / 门禁恢复 / 适配器状态变更)
     groups = group_by(batch, target)        # 聚合: 同目标多行 → 一次调用
     # 并行判定: 各 target 的 write_scope 两两不相交 → 并行调度;
     # 相交者按组内最小 event_id 串行
     # target=human 的行不 invoke：置 gate_wait 并挂起线程（§10）
     for g in schedule(groups):
+        # 生效绑定解析(§5.6.2)；无可用 → 本组保持 pending，本轮跳过
         标 dispatching + deadline = now + timeout(g.target)     # 落盘
         view = 组装视图(g.target, g.event_ids)                  # §6
         env, sess = adapter.invoke(view, session)               # 超时→kill
@@ -284,6 +289,31 @@ terminate 信封落盘时不生成派发行（它是信号，不是待办）。�
 ### 5.5 特权操作与系统执行器
 
 merge 到主干、部署、删除分支等不可逆操作**禁止**由任何 agent 直接执行（工具白名单不含它们）。流程：agent 发 gate_request（corr=gate-xx，body 说明操作与参数）→ 人类批准 → 编排器内置的**系统执行器**按 config 中 gate_ops 的命令模板执行，结果作为 system 事件入队。凭据只存在于编排器环境，不进任何 agent 环境。
+
+### 5.6 适配器可用性与降级路由
+
+**5.6.1 状态与存储。** 每个 adapter 恰有一个可用性状态 `enabled | disabled`，连同 `{reason, by: human|auto, ts, fail_streak}` 存于全局文件 `orchestrator/adapter_state.json`——不进线程 db：额度是供应商级事实，跨线程共享。写入**必须**原子替换（临时文件 + rename）；写者有二：CLI／控制台（人工 enable/disable，§12）与调度器（跳闸与 streak 维护），最后写入者胜，竞态最坏后果是一次多余的人工重设。文件缺失 → 视为全部 enabled（冷启动默认）；文件损坏 → 启动报错，**禁止**猜测（§9 同一哲学）。调度器每轮调度前重读该文件（轮询间隔属 §17）；**禁止**只在启动时读一次。
+
+**5.6.2 生效绑定解析（每次派发时现算，不落盘）。**
+
+```
+effective_adapter(role) = [roles[role].adapter] + roles[role].fallback 中首个 enabled 项
+```
+
+- 解析发生在 §5.1 标 dispatching 之前；聚合与并行判定不变（它们是角色级概念，与绑定无关）。
+- effective ≠ sessions.backend → 视为会话死亡：sid 置空、gen += 1、backend 更新，走冷启动全量组装（§6.1–6.4）。原主恢复 enabled 后，下一次派发自然回归主绑定（同样冷启动）。
+- 换绑重派时该派发行 attempts 归零（新后端享有完整重试预算；跳闸单向 + 链长有限，不存在无限循环）。
+- 每次 effective ≠ 主绑定，追加一条 system 审计事件（body 含角色、原绑定、生效绑定、原因），**比照 terminate（§5.4）：落盘但不生成派发行**——是通告不是待办。同一（role，生效绑定）连续派发只在首次记录；"首次"判定一律现查日志，**禁止**内存驻留去重状态（§16 第 9 条）。
+- 全部不可用 → 该派发行**保持 pending**，本轮跳过；进入此状态的首次追加一条 system 通告事件（同上不生成派发行），CLI 与控制台**必须**显著呈现（§12）。**禁止**对无可用 adapter 的角色空转重试或消耗 attempts；其余角色照常调度，线程不挂起。人工 enable 后 pending 行被主循环自然接手——与 §9.1 "pending 行不需处理"同一机制，零新增派发状态。等待与唤醒见 §5.1 伪代码，**禁止**忙等。
+
+**5.6.3 自动跳闸。** 满足其一即置 disabled（by=auto）：
+
+1. **特征命中**：invoke 传输级报错文本（stderr / 进程退出信息 / 无输出错误）命中该 adapter 的 unavailable_patterns（大小写不敏感子串，默认清单属 §17）→ 立即跳闸。该次失败**不计** attempts；派发行回 pending 并立即按 §5.6.2 重解析（通常由 fallback 接手）。
+2. **连续失败**：传输级失败（超时 / 进程失败 / 无法解析出信封）使该 adapter 的 fail_streak += 1，成功 invoke 清零；fail_streak ≥ trip_after（默认 3，可配）→ 跳闸。schema 校验失败**不计入** streak——那是输出质量问题不是可用性问题（§5.1 原地重调路径与 attempts 语义不变，跳闸只是叠加副作用）。
+
+跳闸时追加 system 审计事件（不生成派发行），body 含 adapter、触发条件、原始报错摘要。恢复**仅限**人工 `orch adapter enable`（同时清零 fail_streak）；**禁止**任何形式的自动恢复或冷却重试。
+
+**5.6.4 与既有机制的边界。** 看门狗（§5.3）语义不变，超时既走看门狗路径也计入 fail_streak。崩溃恢复（§9.1）唯一新增：启动时装载 adapter_state.json（真相类，直接装载）；恢复出的行经主循环自然走 §5.6.2 解析，无新对账分支。切换前失败 invoke 留下的脏 worktree，处理与既有重试路径完全一致（§9.2 第 3 层：git status 如实呈现，从现场继续），无新规则。
 
 ## 6. 上下文组装（视图渲染）——调度层职责
 
@@ -399,6 +429,8 @@ sessions 表 {sid, last_evt, gen}：last_evt = 已通过增量送达该会话的
 
 输入翻译（视图 → 该家原生格式）／输出规范化（强制合法信封，失败退回）／能力申报（Caps，静态配置于 config.yaml）。新增一家供应商 = 新增一个 adapter 文件 + 一段配置，调度层零改动（§13 有对应埋点）。
 
+输出规范化职责扩展（§5.6）：invoke 的错误报告**必须**区分传输级失败与额度类失败（依 unavailable_patterns 识别，识别责任在适配层）；调度器只消费分类结果，**禁止**在调度层散布各家报错文案的字符串匹配。
+
 ## 8. 权限与验证（不信汇报，只信系统侧）
 
 ### 8.1 权限强制三件套（全部在 prompt 之外）
@@ -489,14 +521,16 @@ adapters:
                timeout_s: 600, max_concurrent: 2}
   codex_cli:  {kind: cli, start_cmd: "codex exec …",
                resume_cmd: "codex exec resume {sid} …", timeout_s: 600}
-  kimi_cli:   {kind: cli, start_cmd: "kimi …", resume_cmd: "…", timeout_s: 600}
+  kimi_cli:   {kind: cli, start_cmd: "kimi …", resume_cmd: "…", timeout_s: 600,
+               unavailable_patterns: ["quota", "insufficient", "rate limit", "429", "额度"],
+               trip_after: 3}
   cheap_api:  {kind: api, model: "<低成本模型>", timeout_s: 120}
   mock:       {kind: mock, script: tests/fixtures/like_feature.yaml}
 roles:
   moderator: {adapter: cheap_api, can_decide: true,  write_scope: [], tools: [],
               prompt: prompts/moderator.md}
-  pm:        {adapter: kimi_cli,  can_decide: true,  write_scope: [docs/],
-              tools: [Edit, Write], prompt: prompts/pm.md}
+  pm:        {adapter: kimi_cli,  fallback: [claude_cli], can_decide: true,
+              write_scope: [docs/], tools: [Edit, Write], prompt: prompts/pm.md}
   backend:   {adapter: claude_cli, can_decide: false, write_scope: [server/],
               tools: [Edit, Write, "Bash(pytest:*)"], prompt: prompts/backend.md}
   frontend:  {adapter: codex_cli, can_decide: false, write_scope: [web/],
@@ -507,6 +541,8 @@ roles:
               verify: {cmd: "pytest -q", cwd: "{worktree:backend}"},
               prompt: prompts/tester.md}
 ```
+
+可用性与降级字段（§5.6）：`fallback` 为有序列表，缺省 `[]`（无备胎：不可用即等待人工处理）；`unavailable_patterns` / `trip_after` 为 adapter 级可选字段（缺省值属 §17）。装载时校验，违者启动报错：fallback 项必须是已声明的 adapter；tools 或 write_scope 非空的角色，其主绑定与 fallback 项**必须**为 cli 型（API 型不带工具循环，§7.3）。moderator **建议**配置非空 fallback（它不可用会阻塞兜底路由）。
 
 角色 = 配置。内置五角色只是预置文件；自定义角色即新增一段配置 + 提示词文件。**禁止**把任何角色逻辑写死进代码（moderator 的兜底地位除外——它是调度层机制的一部分）。同一角色可通过改一行 adapter 绑定在供应商之间热替换。
 
@@ -533,8 +569,13 @@ roles:
 | `orch metrics [t-001]` | 输出 §13 全部指标 |
 | `orch bench resume <fixture>` | 同任务开 / 关 resume 各跑 N 次的 token 对比实验 |
 | `orch reopen t-001` / `orch stop` | 重开已终止线程 / 优雅停机 |
+| `orch adapters` | 列全部 adapter：状态 ✅/⛔、reason、by（手动/自动）、ts、fail_streak（§5.6） |
+| `orch adapter disable <name> [--reason …]` | 人工标记不可用（调度器停止选中） |
+| `orch adapter enable <name>` | 人工恢复，清零 fail_streak |
 
 运维分工（必须体现在实现里）：事件日志用于回放审计，原生会话用于现场勘查——attach 是纯 API 方案给不了的红利，**必须**实现。
+
+可用性呈现（§5.6）：`orch status` 与控制台的角色行显示当前生效绑定，主绑定被禁用时显示 ⛔ 与生效备胎；存在"无可用 adapter"的阻塞角色时**必须**显著警示。控制台**必须**为每个 adapter 提供 enable/disable 开关按钮（disable 可填 reason），行为与 CLI 两命令等价（同一原子替换写路径）。
 
 ## 13. 指标埋点（采集点随代码一起交付，禁止事后补测不可复算的数字）
 
@@ -547,6 +588,8 @@ roles:
 | resume 输入 token 节省 % | `orch bench resume`：同一 fixture 任务开 / 关 resume 各跑 ≥ 3 次 | 输入 token 均值差（单次无意义，模型输出非确定） |
 | 混沌轮数与两层结果 | harness 输出 | mock 层通过率（须 100%）／真实层完成率 |
 | 新增供应商适配器行数 | cloc 单文件 | 从第 3 家起算（前两家的成本花在打磨抽象上） |
+| 降级切换次数 | 每次 effective ≠ 主绑定的派发记一条 | 计数，按 (role, adapter) 分组 |
+| 自动跳闸次数 | 每次 auto 跳闸记一条 | 计数，按触发条件分类 |
 
 所有原始量落 metrics 表；`orch metrics` 汇总输出。**禁止**输出任何无法从原始量复算的数字。
 
@@ -568,6 +611,7 @@ roles:
 | **M2** 真实后端冷启动 + 权限 + 门禁 | claude / codex / kimi / API 适配器（仅冷启动）；权限三件套；门禁与系统执行器 | ≥ 2 家异构后端（以本机实际安装为准）完成 1 个小功能全流程，含 1 次人工门禁与"停机后重启续跑"；越权写入注入测试被拦截 |
 | **M3** resume + 聚合 + 并行 + 多线程 | 热续增量；同目标聚合；写域并行；本地 CI 回调；多线程并发 | `orch bench resume` 产出对比报告；双线程并发互不干扰测试 |
 | **M4** 混沌加固 + 指标 | 故障注入钩子覆盖 §4.4 全部间隙；≥ 50 轮混沌；metrics 汇总 | mock 层 100% 通过；`orch metrics` 能输出 §13 全表 |
+| **M5** 适配器可用性 + 降级路由 | 全局状态文件；手动 enable/disable；生效绑定解析与换绑冷启动；自动跳闸（特征 + 连续失败）；阻塞等待与通告；mock 适配器支持脚本化额度故障；CLI 三命令与控制台开关按钮；指标两项（§5.6） | mock 下：disable 主绑定 → fallback 接手完成附录 B 任务，终态与不中断基准一致；无 fallback 角色阻塞等待、enable 后续跑完成；注入额度报错 → 自动跳闸 + 降级接手 E2E；连续失败跳闸路径单测；切换间隙 kill -9 混沌 ≥ 20 轮 100% 通过（§9.4 第一层扩展场景）；`orch adapters` 输出与状态文件一致；两项指标可复算 |
 
 实现顺序铁律：全量组装（M0–M2）先于 resume 增量（M3）——API 型、冷启动、换供应商三条路径都只依赖全量路径，它是地基；resume 只是省 token 的优化，不是可依赖的存储。
 
@@ -589,7 +633,7 @@ roles:
 
 ## 17. 开放决策点（实现者自决，记录于 IMPLEMENTATION_NOTES.md）
 
-board.md 的具体渲染格式；token 估算方法（tiktoken 近似或字符系数皆可，但全系统必须一致）；CLI 输出中定位最后一个 json 块的具体解析策略；并行调度的 asyncio 结构（TaskGroup 组织方式）；五个内置角色提示词的完整文案（须遵守 §11.3 三段结构）；bench 用 fixture 任务的选择；per-adapter 并发信号量默认值。
+board.md 的具体渲染格式；token 估算方法（tiktoken 近似或字符系数皆可，但全系统必须一致）；CLI 输出中定位最后一个 json 块的具体解析策略；并行调度的 asyncio 结构（TaskGroup 组织方式）；五个内置角色提示词的完整文案（须遵守 §11.3 三段结构）；bench 用 fixture 任务的选择；per-adapter 并发信号量默认值；适配器状态文件轮询间隔；unavailable_patterns 默认清单；adapter_state.json 的具体字段编排（须含 status/reason/by/ts/fail_streak）。
 
 ## 附录 A：信封作者字段 JSON Schema
 
