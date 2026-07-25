@@ -5,7 +5,8 @@
 并把结果规范化为**只含作者字段**的信封；系统字段（id/thread_id/ts/from/re/meta）
 由编排器权威赋值，禁止模型/后端自报（§3.1、§16.11）。
 
-M0 冻结契约见 docs/m0-contract.md §3；M2 追加见 docs/m2-contract.md §2。
+M0 冻结契约见 docs/m0-contract.md §3；M2 追加见 docs/m2-contract.md §2；
+M5 错误分类见 docs/m5-contract.md §2（§7.6 输出规范化职责扩展）。
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, TypedDict
+
+from .state import DEFAULT_UNAVAILABLE_PATTERNS
 
 # 作者字段白名单（spec §3.1 / 附录A）：mock 返回的信封只允许这些键；
 # 系统字段（id/thread_id/ts/from/re/meta）由编排器权威赋值，禁止模型自报（§3.1、§16.11）。
@@ -46,12 +49,112 @@ _MOCK_CAPS: Caps = {
 }
 
 
+# ======================================================================
+# M5：额度类失败与传输级失败的分类（spec §7.6 末段 / §5.6.3 第 1 条）
+#
+# §7.6："invoke 的错误报告**必须**区分传输级失败与额度类失败（依 unavailable_patterns
+# 识别，识别责任在适配层）；调度器只消费分类结果，**禁止**在调度层散布各家报错文案的
+# 字符串匹配。"——因此本节的子串匹配是**唯一**允许出现该匹配的地方。
+#
+# 边界（§5.6.3）：只有**传输级失败**（超时 / 进程失败 / 无输出）才进分类；
+# schema 层非法信封（json 块能取到但内容非法）是输出质量问题，不是可用性问题，
+# 一律维持 §5.1 原地重调路径，既有异常逐字不变。
+# ======================================================================
+
+
+class AdapterUnavailableError(Exception):
+    """额度类失败（契约 §2）：该 adapter 当前不可用，应由调度层跳闸 + 降级路由。
+
+    - ``adapter_name``：触发的 adapter **配置名**（roles[role].adapter 的键名；
+      构造时未知则用角色名兜底，与 ``state.resolve_effective_adapter`` 同一约定）。
+      调度层记账时仍应以自身解析出的生效绑定名为准，本字段是审计线索。
+    - ``detail``：命中的原始报错摘要（跳闸审计事件 body/meta.detail 的素材，契约 §4）。
+    """
+
+    def __init__(self, adapter_name: str, detail: str = "") -> None:
+        self.adapter_name = str(adapter_name)
+        self.detail = str(detail)
+        super().__init__(
+            f"适配器 {self.adapter_name!r} 不可用（额度类，§5.6.3）：{self.detail}"
+        )
+
+
+def _as_text(value: object) -> str:
+    """把 stderr/stdout（可能是 None / bytes / str）统一成 str，不可解码则替换。"""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _summarize(text: str, limit: int = 200) -> str:
+    """多行报错压成一行摘要（供审计事件展示）；只做空白折叠与截断，不解读语义。"""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _unavailable_patterns(config: dict) -> tuple[str, ...]:
+    """该 adapter 的特征清单：config.unavailable_patterns（§11.1）缺省用契约 §1 常量。
+
+    显式给出的列表**照单全收**（空列表 = 明示关闭特征分类）；键缺失或类型不合
+    （非 list/tuple）→ 回落默认清单，装载期校验属 §11.1 调用方职责。
+    """
+    raw = (config or {}).get("unavailable_patterns")
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(p) for p in raw if str(p))
+    return DEFAULT_UNAVAILABLE_PATTERNS
+
+
+def _classify_unavailable(config: dict, *texts: object) -> str | None:
+    """传输级报错文本命中特征 → 返回 detail 摘要；未命中 / 无文本 → None。
+
+    匹配口径（§5.6.3 第 1 条 + §17 裁决）：**大小写不敏感子串**。
+    "无文本"（如超时且管道空）→ 不分类，走既有失败路径（契约 §2："未命中 → 既有
+    失败路径不变"，无文本自然也无从命中）。
+    """
+    haystack = "\n".join(t for t in (_as_text(x) for x in texts) if t)
+    if not haystack.strip():
+        return None
+    lowered = haystack.lower()
+    for pattern in _unavailable_patterns(config):
+        if pattern.lower() in lowered:
+            return f"命中特征 {pattern!r}：{_summarize(haystack)}"
+    return None
+
+
+def _exit_info(proc: object) -> str:
+    """子进程"退出信息"文本（§5.6.3 列举的三类报错文本之一）；正常退出返回空串。"""
+    rc = getattr(proc, "returncode", None)
+    if rc is None or rc == 0:
+        return ""
+    return f"exit code {rc}"
+
+
+def _drain_after_kill(proc: object) -> tuple[str, str]:
+    """kill 后排空管道（既有行为，调用次数不变），把读到的文本交给分类器。"""
+    drained = proc.communicate()  # type: ignore[attr-defined]
+    if isinstance(drained, tuple) and len(drained) == 2:
+        return _as_text(drained[0]), _as_text(drained[1])
+    return "", ""
+
+
 class MockAdapter:
     """脚本化确定性 agent（spec §7.4）。
 
     按 (role, 事件号) 查 script 返回预置作者字段信封；每处理一个事件号向落盘
     ledger 追加一行 '{role}:{event_id}'，供混沌测试校验 exactly-once（§9.4）。
     适配层无角色逻辑：只查表 + 规范化输出格式。
+
+    M5 追加（契约 §2）——两个可选开关，缺省行为与 M0–M4 逐字一致：
+      · ``unavailable_after: int | None``：第 k 次 invoke 起（含该次）恒抛
+        ``AdapterUnavailableError``（detail = ``unavailable_text``），供 §5.6.3
+        第 1 条"特征命中即跳闸"的调度侧验收。被抛的调用**不查表、不写 ledger**
+        （没处理成功就没有副作用），ledger 语义因此不变。
+      · ``key_by: "event"|"call"``："call" 改按**该实例的调用序号**（从 1 起）
+        查脚本表，与真实事件号解耦——M5 多出的通告/审计事件会让附录B 的事件号
+        整体偏移，而脚本表的"第 i 次取用"语义不受偏移影响。ledger 仍记**真实
+        触发事件号**（exactly-once 对账口径不变）。
     """
 
     caps: Caps
@@ -63,12 +166,28 @@ class MockAdapter:
         script: dict,
         ledger_path: str | Path,
         caps: Caps | None = None,
+        unavailable_after: int | None = None,
+        unavailable_text: str = "quota exceeded (mock)",
+        key_by: str = "event",
+        adapter_name: str | None = None,
     ) -> None:
-        # script: {触发事件号(int): 预置作者字段信封(dict)}，来自附录B fixture 切片。
+        # script: {触发事件号(int): 预置作者字段信封(dict)}，来自附录B fixture 切片；
+        # key_by="call" 时键改为调用序号（1,2,3,…）。
+        if key_by not in ("event", "call"):
+            raise ValueError(
+                f"key_by 只允许 'event' | 'call'，实得 {key_by!r}"
+            )
         self.role = role
         self.script = script
         self.ledger_path = Path(ledger_path)
         self.caps = caps if caps is not None else dict(_MOCK_CAPS)  # type: ignore[assignment]
+        self.unavailable_after = unavailable_after
+        self.unavailable_text = unavailable_text
+        self.key_by = key_by
+        # 额度错误里的 adapter 配置名；mock 通常按角色构造，故缺省用角色名兜底。
+        self.adapter_name = str(adapter_name or role)
+        # 本实例对该角色的调用序号（从 1 起，与 FakeCli/FakeApi 的 call_no 同一约定）。
+        self.call_no = 0
 
     def invoke(
         self, view: dict, sess: dict | None
@@ -79,11 +198,20 @@ class MockAdapter:
         副作用：写 ledger 前自动创建父目录（parents=True, exist_ok=True，T1 裁决③），
         追加一行 '{role}:{event_id}\\n'。返回 (env_dict, sess)；sess 原样透传
         （mock 不产生新会话状态）。
+
+        M5：``unavailable_after`` 命中时在**任何**查表/副作用之前抛额度类错误。
         """
+        self.call_no += 1
+        if (
+            self.unavailable_after is not None
+            and self.call_no >= int(self.unavailable_after)
+        ):
+            raise AdapterUnavailableError(self.adapter_name, self.unavailable_text)
+
         event_id = max(view["event_ids"])
 
-        # —— 查表：取该角色对该触发号的预置信封，规范化为只含作者字段的副本 —— #
-        scripted = self.script[event_id]
+        # —— 查表：取该角色对本次调用的预置信封，规范化为只含作者字段的副本 —— #
+        scripted = self.script[self.call_no if self.key_by == "call" else event_id]
         env = {k: scripted[k] for k in _AUTHOR_FIELDS if k in scripted}
 
         # —— 副作用：ledger 追加一行（exactly-once 校验依据，§9.4）—— #
@@ -253,6 +381,11 @@ class CliAdapter:
 
     M2 只做冷启动路径；resume_cmd 保留但不调用（M3）。
     真实 CLI 的 flag/session_id 正则以 `--help` 实测为准（QUESTIONS.md Q1/Q2 陪跑）。
+
+    M5（§7.6 末段 / §5.6.3 第 1 条）：传输级失败（超时 / 进程失败 / 无输出）时，
+    把可得的 stderr / 退出信息 / 错误文本与 ``unavailable_patterns`` 匹配，命中即抛
+    ``AdapterUnavailableError``；未命中则既有失败路径（TimeoutError / ValueError）
+    逐字不变。json 块取到但内容非法属输出质量问题，**不**分类。
     """
 
     caps: Caps
@@ -264,6 +397,7 @@ class CliAdapter:
         config: dict,
         worktree: Path,
         caps: Caps | None = None,
+        adapter_name: str | None = None,
     ) -> None:
         self.role = role
         self.config = dict(config)
@@ -271,6 +405,10 @@ class CliAdapter:
         self.caps = caps if caps is not None else _caps_from_config(
             config, supports_resume=bool(config.get("supports_resume", True))
         )
+        # adapter 配置名：显式参数 > config 里的键名（roles[role].adapter，见
+        # cli.main._build_adapters_from_config 的 merged）> 角色名兜底（同
+        # state.resolve_effective_adapter 的主绑定约定）。仅用于错误归属，不影响 invoke。
+        self.adapter_name = str(adapter_name or self.config.get("adapter") or role)
 
     def invoke(
         self, view: dict, sess: dict | None
@@ -298,10 +436,21 @@ class CliAdapter:
             errors="replace",
         )
         try:
-            stdout, _stderr = proc.communicate(timeout=timeout_s or None)
-        except subprocess.TimeoutExpired:
+            stdout, stderr = proc.communicate(timeout=timeout_s or None)
+        except subprocess.TimeoutExpired as exc:
             proc.kill()
-            proc.communicate()
+            drained_out, drained_err = _drain_after_kill(proc)
+            # 超时属传输级失败：kill 后能读到的报错文本仍要过一遍特征匹配（§5.6.3-1）；
+            # 无文本可判 → 不分类，既有 TimeoutError 路径逐字不变。
+            detail = _classify_unavailable(
+                self.config,
+                getattr(exc, "stderr", None),
+                getattr(exc, "output", None),
+                drained_err,
+                drained_out,
+            )
+            if detail is not None:
+                raise AdapterUnavailableError(self.adapter_name, detail) from exc
             raise TimeoutError(
                 f"CliAdapter[{self.role}] timed out after {timeout_s}s"
             )
@@ -309,6 +458,12 @@ class CliAdapter:
         agent_text, sid_hint = _unwrap_agent_output(stdout or "", self.config)
         block = _extract_last_json_block(agent_text or "")
         if block is None:
+            # 无输出 / 进程失败（拿不到信封块）——传输级失败，先分类后回落既有路径。
+            detail = _classify_unavailable(
+                self.config, stderr, _exit_info(proc), stdout,
+            )
+            if detail is not None:
+                raise AdapterUnavailableError(self.adapter_name, detail)
             raise ValueError(
                 f"CliAdapter[{self.role}] no ```json block in stdout"
             )
@@ -337,6 +492,9 @@ class ApiAdapter:
     M2 边界（任务卡红线）：不做真实网络调用；接受可注入 `message_fn(view, config)`
     骨架，默认实现在真实联网前抛 NotImplementedError（M2 不启用；由 FakeApiAdapter
     在测试路径下取代默认 fn）。
+
+    M5（§7.6 末段）：message_fn 抛出的传输级失败按 ``unavailable_patterns`` 分类，
+    命中 → ``AdapterUnavailableError``；未命中 → 原异常原样上抛（不包装、不吞）。
     """
 
     caps: Caps
@@ -348,9 +506,12 @@ class ApiAdapter:
         config: dict,
         caps: Caps | None = None,
         message_fn: Callable[[dict, dict], dict] | None = None,
+        adapter_name: str | None = None,
     ) -> None:
         self.role = role
         self.config = dict(config)
+        # 与 CliAdapter 同一约定：显式参数 > config 键名 > 角色名兜底（仅用于错误归属）。
+        self.adapter_name = str(adapter_name or self.config.get("adapter") or role)
         self.caps = caps if caps is not None else _caps_from_config(
             config, supports_resume=False
         )
@@ -369,13 +530,24 @@ class ApiAdapter:
         - 忽略 sess（§7.3 无会话概念），返回 sess=None（永远全量组装）。
         - 未注入 message_fn 时（真实网络路径），M2 不启用 → NotImplementedError。
           测试请用 FakeApiAdapter 或注入 message_fn。
+        - M5：messages 调用抛出的传输级失败经特征匹配分类（§7.6/§5.6.3-1）。
         """
         if self._message_fn is None:
             raise NotImplementedError(
                 "ApiAdapter 真实网络路径未启用（M2 边界）；"
                 "测试请用 FakeApiAdapter 或注入 message_fn。"
             )
-        raw = self._message_fn(view, self.config)
+        try:
+            raw = self._message_fn(view, self.config)
+        except AdapterUnavailableError:
+            raise  # 已由更底层分类过，原样上抛（不重复包装）
+        except Exception as exc:  # noqa: BLE001 — §7.6：分类责任在适配层，此处必须兜住
+            detail = _classify_unavailable(
+                self.config, f"{type(exc).__name__}: {exc}",
+            )
+            if detail is not None:
+                raise AdapterUnavailableError(self.adapter_name, detail) from exc
+            raise  # 未命中 → 既有失败路径逐字不变
         env = _strip_to_author_fields(raw)
         return env, None
 
