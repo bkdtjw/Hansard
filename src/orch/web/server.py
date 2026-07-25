@@ -211,10 +211,13 @@ def _ep_thread_run(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
         # 调度层每轮 reload 自然感知控制台/CLI 的 enable/disable，无需任何推送通道。
         # 校验 + 状态文件探载失败 → JSON 错误响应（**不退进程**：网关进程常驻，
         # 一个坏 workspace 不该拖垮控制台；运维在页面上就能看到人话原因）。
-        errors = clim._prepare_availability_config(config, clim._workspace_config_path(ws))
+        errors = clim._prepare_availability_config(
+            config, clim._workspace_config_path(ws), roles=roles,
+        )
         if errors:
             raise _ApiError(
-                400, "适配器可用性装载失败（§5.6.1/§11.1）：" + "；".join(errors))
+                400,
+                "适配器装载/装配检查未通过（§5.6.1/§7.3/§11.1）：" + "；".join(errors))
         adapters = clim._build_adapters_from_config(roles, config, ws / tid)
     else:
         adapters = clim._build_default_adapters(roles)

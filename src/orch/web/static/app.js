@@ -168,6 +168,7 @@ function switchWorkspace(name) {
   selectedThread = null;
   currentEvents = [];
   lastStatus = null;
+  lastRoles = [];
   unseenCount = 0;
   clearTimeout(pollTimer);
   pollActive = false;
@@ -275,14 +276,18 @@ function renderAdapters() {
 // M5 §12（评审 minor-2）：警示分两档——
 //   · **阻塞**（某角色主绑定与全部备胎都停用，status 端点的 roles[].blocked）→ 红色点名角色；
 //   · 仅"有 disabled 但备胎兜住" → 温和提示（编排在继续，不该长期红着吓人）。
-function blockedRolesOf(s) {
-  return ((s && s.roles) || []).filter((r) => r.blocked).map((r) => String(r.role));
+// 角色投影的**单一数据源**：status 端点的 roles[]（两条线都往这里写——事件轮询的
+// applyStatusPayload，与 N5 减负后只喂角色渲染的可用性心跳）。切线程/切工作区清空。
+let lastRoles = [];
+
+function blockedRolesOf() {
+  return lastRoles.filter((r) => r.blocked).map((r) => String(r.role));
 }
 
-function renderRoleBindings(s) {
+function renderRoleBindings() {
   const el = $("#role-bindings");
   if (!el) return;
-  const rows = (s && s.roles) || [];
+  const rows = lastRoles;
   // 只渲染"有话要说"的角色（降级中或阻塞）：一切正常时一枚不渲染（恒态 chip = 噪音）。
   const notable = rows.filter((r) => r.blocked || r.effective !== r.primary);
   if (!notable.length) { el.innerHTML = ""; return; }
@@ -300,7 +305,7 @@ function renderRoleBindings(s) {
 
 function updateAdapterAlerts() {
   const offNames = adapterRows.filter((r) => r.status !== "enabled").map((r) => r.name);
-  const blocked = blockedRolesOf(lastStatus);
+  const blocked = blockedRolesOf();
   const text = blocked.length
     ? `角色 ${blocked.join("、")} 无可用适配器（主绑定与全部备胎均已停用）：` +
       "相关待办保持 pending 不消耗重试预算，需人工恢复后自动接手。"
@@ -499,6 +504,8 @@ async function createThread() {
 async function selectThread(tid) {
   selectedThread = tid;
   lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
+  lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
+  availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
   $("#workspace-empty").classList.add("hidden");
   $("#workspace").classList.remove("hidden");
   $("#wk-title").textContent = tid;   // 占位；loadEvents 后由 E1 摘要替换
@@ -1162,8 +1169,9 @@ function applyStatusPayload(s) {
   badge.className = `badge ${s.status}`;
   applyStatusMatrix(s.status);
   renderDispatchSummary(s);
-  renderRoleBindings(s);      // M5 §12：角色行生效绑定
-  updateAdapterAlerts();      // 阻塞点名依赖 status 投影，状态一变就重评警示档位
+  lastRoles = s.roles || [];  // M5 §12：角色投影单一数据源
+  renderRoleBindings();       // 角色行生效绑定
+  updateAdapterAlerts();      // 阻塞点名依赖角色投影，状态一变就重评警示档位
   updateTypingBar(s);
   // D19：以 status 端点权威状态重评门禁 banner。
   refreshGateFromEvents(currentEvents, s.status);
@@ -1397,24 +1405,15 @@ async function pollLoop() {
   pollInFlight = true;
   let ok = true;
   try {
-    // M5：适配器可用性同节奏捎带（人工/自动的 enable|disable 最多 1.5s 内反映到面板与
-    // 警示条）。它是独立于线程的全局事实，失败不拖累主轮询（单独 catch 成 null）。
-    const [evData, s, adp] = await Promise.all([
+    // N4：/api/adapters **不**在这条线拉——适配器是线程之外的全局事实，单一数据源
+    // 是可用性心跳（availabilityHeartbeat）；这里只管本线程的事件与状态。
+    const [evData, s] = await Promise.all([
       api(`/api/threads/${tid}/events`),
       api(`/api/threads/${tid}/status`),
-      api("/api/adapters").catch(() => null),
     ]);
     if (tid !== selectedThread) { pollInFlight = false; return; }  // 已切线程：丢弃
     ingestEvents(evData.events || [], false);
     applyStatusPayload(s);
-    if (adp) {
-      adapterRows = adp.adapters || [];
-      updateAdapterAlerts();
-      const box = $("#adapters-list");
-      // 面板可见且用户没在其中输入/点击时才重渲染（避免抢焦点）。
-      if ($("#view-adapters").classList.contains("active")
-          && box && !box.contains(document.activeElement)) renderAdapters();
-    }
   } catch (e) {
     ok = false;
   } finally {
@@ -1457,6 +1456,10 @@ function startPolling() {
 // ————————————————————————————————————————————————
 let availTimer = null;
 let availInFlight = false;
+let availTick = 0;
+// N5：事件轮询停摆时（终态线程），角色投影按**每 3 拍**（≈4.5s）取一次即可——它只随
+// 人工 enable/disable 变化；/api/adapters 仍每拍拉（全局开关要即时）。
+const ROLE_STATUS_EVERY = 3;
 
 async function availabilityHeartbeat() {
   clearTimeout(availTimer);
@@ -1473,14 +1476,21 @@ async function availabilityHeartbeat() {
       if ($("#view-adapters").classList.contains("active")
           && box && !box.contains(document.activeElement)) renderAdapters();
     }
-    // 事件轮询停摆（终态 / 尚未启动）时，由心跳把含 roles 的 status 喂进渲染。
-    if (selectedThread && !pollActive) {
+    // 事件轮询停摆（终态 / 尚未启动）时，由心跳补角色投影：**只喂角色相关渲染**，
+    // 不走 applyStatusPayload —— 那条路会连带跑状态矩阵/派发 chips/正在响应/门禁
+    // banner，而这些的数据源（事件流）在终态线程上根本不再变化（N5 减负）。
+    if (selectedThread && !pollActive
+        && availTick % ROLE_STATUS_EVERY === 0) {
       const tid = selectedThread;
       const s = await api(`/api/threads/${tid}/status`).catch(() => null);
-      if (s && tid === selectedThread) applyStatusPayload(s);   // 内含角色行 + 警示条
+      if (s && tid === selectedThread) {
+        lastRoles = s.roles || [];
+        renderRoleBindings();
+      }
     }
     updateAdapterAlerts();
   } finally {
+    availTick += 1;
     availInFlight = false;
   }
   availTimer = setTimeout(availabilityHeartbeat, POLL_BASE);

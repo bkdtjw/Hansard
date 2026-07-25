@@ -236,13 +236,48 @@ def _known_adapter_names(config: dict, availability) -> set[str]:
     return {row["name"] for row in _adapter_rows(config, availability)}
 
 
-def _prepare_availability_config(config: dict, cfg_path: Path) -> list[str]:
-    """生产装配接线（§5.6/§11.1）：装载期校验 + 状态文件探载 + 把路径写回 config。
+def _assembly_feasibility_errors(config: dict, roles: list[str]) -> list[str]:
+    """真实装配可行性（closure N2）：绑定链上出现装配层建不出实例的 adapter → 启动报错。
+
+    §11.1 **允许**无 tools/write_scope 的角色配 api 型 fallback（那是规格层面的合法，
+    收紧 ``validate_availability_config`` 属 spec 之外的改进，禁止）；但本仓库的真实
+    装配只建 cli 型实例（诚实边界，见 ``_build_adapters_from_config``）。两者相遇 =
+    主绑定一停用，调度层按名取不到备胎实例 → 运行期崩环、被 per-thread 兜底吞成一行
+    repr 且退出码仍 0（静默停滞）。故在**装配之前**点名报错：响亮失败优于静默停滞。
+
+    只检查本线程**真的会装配**的角色（roles），不波及 config 里其它角色的声明。
+    """
+    adapters_conf = config.get("adapters") or {}
+    roles_conf = config.get("roles") or {}
+    errors: list[str] = []
+    for role in roles:
+        rc = roles_conf.get(role) or {}
+        chain = [str(rc.get("adapter") or role)]
+        fallback = rc.get("fallback") or []
+        if isinstance(fallback, (list, tuple)):
+            chain.extend(str(item) for item in fallback)
+        for name in chain:
+            conf = adapters_conf.get(name)
+            kind = str((conf or {}).get("kind") or "") if isinstance(conf, dict) else ""
+            if kind and kind != "cli":
+                errors.append(
+                    f"角色 {role} 的绑定链含 {kind} 型 adapter {name!r}，真实装配只支持"
+                    f" kind=cli（§7.3）：请把 {name!r} 改为 cli 型，或从 {role} 的"
+                    f" adapter/fallback 中移除；混合后端属后续陪跑项"
+                )
+    return errors
+
+
+def _prepare_availability_config(
+    config: dict, cfg_path: Path, roles: list[str] | None = None,
+) -> list[str]:
+    """生产装配接线（§5.6/§11.1）：装载期校验 + 装配可行性 + 状态文件探载 + 写回路径。
 
     返回错误清单（空 = 合法且已接线）：非空时**不**写回任何键，由调用方一行人话
-    报错（CLI 退出 1 / web 转 JSON 错误响应）。两类错误、同一出口：
+    报错（CLI 退出 1 / web 转 JSON 错误响应）。三类错误、同一出口：
       1. §11.1 配置校验（fallback 未声明 / 带工具角色绑 api 型）；
-      2. §5.6.1 状态文件损坏 —— **装配期探载**（评审 minor-3）：不探的话要等
+      2. 真实装配可行性（closure N2，仅当传入 roles）—— 见 ``_assembly_feasibility_errors``；
+      3. §5.6.1 状态文件损坏 —— **装配期探载**（评审 minor-3）：不探的话要等
          run_thread 内首轮 reload 才炸，会被 per-thread 兜底吞成一行 repr、退出码
          仍 0，既非"启动报错"也让运维误以为跑过了。探载只读不建文件（缺失=全 enabled）。
     写回的两个键：
@@ -254,6 +289,9 @@ def _prepare_availability_config(config: dict, cfg_path: Path) -> list[str]:
         AdapterStateError, state_path_for, validate_availability_config,
     )
     errors = validate_availability_config(config)
+    if errors:
+        return errors
+    errors = _assembly_feasibility_errors(config, roles or [])
     if errors:
         return errors
     state_path = state_path_for(cfg_path)
@@ -503,10 +541,12 @@ def cmd_run(
             if cfg.get("adapters") and cfg.get("roles"):
                 # M5 §5.6/§11.1 生产装配接线：先校验后接线；错误清单非空 → 一行人话
                 # 报错退出（启动报错，不喷 Traceback），**不**带着非法配置继续跑。
-                errors = _prepare_availability_config(cfg, _workspace_config_path(ws))
+                errors = _prepare_availability_config(
+                    cfg, _workspace_config_path(ws), roles=roles,
+                )
                 if errors:
-                    _echo("[错误] 适配器可用性装载失败（§5.6.1/§11.1），拒绝启动："
-                          + "；".join(errors))
+                    _echo("[错误] 适配器装载/装配检查未通过（§5.6.1/§7.3/§11.1），"
+                          "拒绝启动：" + "；".join(errors))
                     raise typer.Exit(code=1)
                 adapters = _build_adapters_from_config(roles, cfg, tdir)
             else:
