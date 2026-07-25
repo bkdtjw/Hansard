@@ -391,3 +391,43 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
     我同意,但是注意:前端要有按钮开启关闭哈"),批准即含按钮修订;终审时
     用户可复核 git show 3831ef8。
   回环序:R5(T1,测试先红)→R3(T3)→R4(T5)→Lead 全套亲验→评审 closure。
+- **closure 复核(同一评审,probe 级亲跑)**:13 条中 11 条实证 closed,info-2(有意
+  保留)/info-3(须人类亲核 git show 3831ef8)合理挂起;R4b(心跳解耦)后 Lead 真机
+  复验 chip/警示条两拍内出现。**但整改引入 1 blocking + 4 minor + 3 info 新问题**:
+  · **N1 blocking(minor-4 整改的回归,Lead 裁决失误自记)**:watchdog level-1 自
+    M1 起只 bump 不改 status(半成品,模块自陈),滞留 dispatching 行每轮重扫;
+    R3 按我的裁决把 record_failure 挂上后,probe7 实测 6 轮内主+备胎全链
+    auto-disable(全局状态文件,跨线程,仅人工可恢复)。评审批评成立:我把
+    "实际影响小"的限定当耳旁风,且 test_r5_minor4 的取证面(单轮+trip_after=5)
+    恰好挡住放大。**修正裁决:watchdog 计 streak 仅在该行 attempts 0→1 的首次
+    观察记一次**(盘上判据/零新状态/杀死放大;invoke 路径计数不变)。→R7a
+  · N2 minor(非 cli 备胎运行期 KeyError 崩环):真实装配对"无 tools 角色配 api
+    型 fallback"(§11.1 允许,本装配做不出)启动即一行人话报错,不放行到运行期。
+    →R7c
+  · N3 minor(prev-binding 崩溃窗口丢归零):次序改为 reset_attempts 先于切换
+    审计落盘(reset 幂等,窗口自愈)。→R7a
+  · N4 minor(/api/adapters 双线重复拉取):摘掉 pollLoop 旧捎带,心跳单源。→R7c
+  · N5 minor(终态线程心跳每拍全量 applyStatusPayload+两次盘读永不停止):
+    终态只喂 roles 渲染,thread-status 降频,盘读有界。→R7c
+  · info 三条记录不动:阻塞断链"失败无回复"窄漏(契约已备案);每派发 2-3 次全量
+    events 扫描 O(N²)(max_rounds=100 缺省有界,留性能项);裸名键指向首个主绑定
+    者实例的隐雷(被复合键优先屏蔽,留档警示后人)。
+  · M5 之外既有缺口(评审顺带确认):cmd_run 从不调 §9.1 recover、level-1 完整
+    动作序列未实现——已挂独立后台任务卡(task_548ffdae),不混入 M5。
+  回环序2:R7b(T1 红)→R7a(T3)→R7c(T5)→Lead 亲验→评审终局 closure。
+- R7b ✅ 3 红(滞留行 6 轮放大/写序倒置/api 备胎运行期才炸退出码 0——三条全红在
+  缺口本身)。裁决:N3 次序断言写法唯一,历史盘面不下自愈单;N1 保留计数仅首观察;
+  N2 落装配层不动 §11.1 校验(收紧宪法允许的配置=违禁改进)。
+- R7a ✅ 调度侧两条:watchdog 计 streak 仅 attempts 0→1 首观察(非首次连状态文件
+  都不读;bump/不改 status 既有语义一字不动);换绑写序对调=reset_attempts 先于
+  fallback_switch 审计(读序不变,reset 幂等窗口自愈)。备案:attempts 列双用语义
+  恰好合理(invoke 已计过的行不再重计);chaos fallback_switch_pre 注释与新写序
+  轻微漂移(外观,不影响锚点与 4 用例)。
+- R7c ✅ 装配/前端三条:_assembly_feasibility_errors 单点(§11.1 校验→装配可行性
+  →状态文件探载),api 型备胎启动一行人话 exit 1/web 转 400 JSON;pollLoop 摘掉
+  adapters 捎带(实测 9.2s 窗口 13 次→6 次单线;loadAdapters 保留为显式动作即时
+  刷新,非轮询线);终态线程心跳降频 ROLE_STATUS_EVERY=3 且只喂 roles 渲染(实测
+  status 2 次/9.2s、events 0 次,D6 终态语义保持;blocked 点名时延≤4.5s 明示取舍)。
+- R7 后 Lead 终验:60+30+392 全绿、chaos-m5 双 seed 4 passed、chaos-50 保持;
+  真机(仅桩 document.hidden):adapters 恰单线 1.5s 节奏,disable→chip×3+红条点名
+  →enable 消隐全周期正常。

@@ -1962,3 +1962,173 @@ def test_r5_info1_async_all_unavailable_keeps_pending(thread_dir, tmp_dir):
     blocked = _audit_events(st, "adapter_blocked")
     assert len(blocked) == 1, [e["body"] for e in blocked]
     assert _dispatch_count_for_event(thread_dir, blocked[0]["id"]) == 0
+
+
+# ======================================================================
+# R7b · closure 复核整改的测试先行（Lead 回环规格；前缀 test_r7_）
+#
+#   N1 [blocking] 看门狗放大：滞留 dispatching 行每轮都记 fail_streak → 数轮内把
+#      主绑定连同备胎整条链拖垮（假故障，非真实可用性事实）。
+#   N3 换绑归零的崩溃窗口：reset_attempts 必须发生在 fallback_switch 审计事件落盘
+#      **之前**——否则在两者之间 kill，重启后审计链已表达"已切换"（去重抑制重记），
+#      attempts 永远失去归零机会（不自愈）。
+#   N2 非 cli 备胎的装配代价：§11.1 允许 tools/write_scope 皆空的角色配 api 型
+#      fallback，但真实装配只建 cli 实例 → 降级那一刻运行期 KeyError 崩环。
+#      须在**启动装配期**一行人话报错退出（与损坏状态文件同款出口）。
+#   N4/N5 按 Lead 规格跳过（web 双线拉取 / 终态线程心跳，改由 R7c 代码修 + 真机验）。
+# ======================================================================
+
+
+def test_r7_n1_watchdog_does_not_amplify_fail_streak(thread_dir, tmp_dir):
+    """N1（blocking）：滞留 dispatching 行连跑 6 轮看门狗，fail_streak 恒为 1。
+
+    §5.6.4 只说"超时**既走看门狗路径也计入** fail_streak"——一次超时是一次失败事实，
+    不是每轮巡检各一次。滞留行（进程被 kill、行留在 dispatching）会被每一轮 check
+    重新枚举；若每轮都记，trip_after=3 时第 3 轮就把主绑定跳闸，之后 resolve 落到备胎
+    身上继续每轮记，再 3 轮把备胎也跳闸——整条绑定链被一条陈旧的滞留行拖垮，而这
+    期间根本没有发生任何新的 invoke 失败。
+
+    判据（缺一即失败）：
+      · cli_a.fail_streak == 1（只在 attempts 0→1 的首轮记这一次）
+      · cli_a.status 全程 enabled、零 adapter_trip 事件
+      · 备胎 cli_b.fail_streak == 0（不被传染）
+      · attempts == 6（§5.3 级别1 既有语义不变：每轮仍计一次 attempt）
+    """
+    cfg, state_path = _sched_config(tmp_dir, trip_after=3)
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    deadline = 1_000_000.0
+    st.mark_dispatching(e1, "pm", deadline)
+
+    rounds = 6
+    for k in range(rounds):
+        # 假时钟逐轮推进（§16.2：只用落盘绝对时间戳比较，绝不 sleep）。
+        orch.scheduler.check_watchdogs(st, cfg, now=deadline + 1.0 + k)
+
+    snap = _availability(state_path).snapshot()
+    entry = snap.get("cli_a")
+    assert entry is not None, f"首轮超时应给 cli_a 记一次失败：{snap}"
+    assert entry["fail_streak"] == 1, (
+        f"一条滞留行连跑 {rounds} 轮只算一次超时失败；实得 fail_streak="
+        f"{entry['fail_streak']}（每轮重复记 = 假故障放大）"
+    )
+    assert entry["status"] == "enabled", entry
+    assert _audit_events(st, "adapter_trip") == [], \
+        [e["body"] for e in _audit_events(st, "adapter_trip")]
+    assert (snap.get("cli_b") or {}).get("fail_streak", 0) == 0, \
+        f"备胎不得被同一条滞留行传染：{snap.get('cli_b')}"
+
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == rounds, \
+        "§5.3 级别1 既有语义不变：每轮仍 bump 一次 attempt"
+
+
+def test_r7_n3_attempts_reset_lands_before_switch_audit(thread_dir, tmp_dir):
+    """N3：降级换绑路径里 `reset_attempts` 必须排在 fallback_switch 审计事件落盘之前。
+
+    口径说明（Lead 给的两种写法里选"调用次序"这一种）：
+      两步不是单事务。若先落审计、后归零，在两者之间 kill 会留下"审计链已表达已切换、
+      attempts 仍是旧值"的盘面——重启后 prev-binding 从审计链推导出的就是备胎，
+      `effective == prev` → 归零分支不再进入，这条派发行**永远**失去归零机会（不自愈）。
+      反过来先归零、后落审计：窗口里 kill 只会丢掉一条通告事件，重启后 prev 仍推导为
+      主绑定 → 归零（幂等重做）+ 补记通告，自愈。故次序本身就是正确性的一部分。
+
+    取证方式：在 Store **实例**上包一层记录用的透明壳（真实方法照常执行，不 mock 被测
+    逻辑），只记录 (reset_attempts / 审计事件 append) 的先后。
+    """
+    cfg, state_path = _sched_config(tmp_dir)
+    _availability(state_path).disable("cli_a", reason="额度耗尽", by="human")
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    st.bump_attempt(e1, "pm")
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == 1
+
+    calls: list[str] = []
+    real_reset = st.reset_attempts
+    real_append = st.append_event
+
+    def _reset_spy(event_id, target):
+        calls.append("reset_attempts")
+        return real_reset(event_id, target)
+
+    def _append_spy(**kw):
+        eid = real_append(**kw)
+        kind = (kw.get("meta") or {}).get("kind")
+        if kind in _M5_AUDIT_KINDS:
+            calls.append(f"audit:{kind}")
+        return eid
+
+    st.reset_attempts = _reset_spy
+    st.append_event = _append_spy
+
+    primary = _fake("pm", {})
+    spare = _fake("pm", {1: _handoff(["moderator"])})
+    mod = _fake("moderator", {1: _terminate()})
+    orch.scheduler.run_thread(
+        st, cfg, {"cli_a": primary, "cli_b": spare, "mod_api": mod})
+
+    assert st.get_meta("status") == "terminated", calls
+    assert spare.call_no == 1 and primary.call_no == 0
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == 0, "换绑重派须归零"
+
+    assert "reset_attempts" in calls, calls
+    assert "audit:fallback_switch" in calls, calls
+    assert calls.index("reset_attempts") < calls.index("audit:fallback_switch"), (
+        "崩溃窗口：attempts 归零必须先于切换审计落盘，否则两步之间 kill 会让归零"
+        f"永久丢失（不自愈）。实测调用序：{calls}"
+    )
+
+
+def _api_fallback_config(tmp_dir: Path) -> Path:
+    """§11.1 合法但装配层扛不住的配置：无 tools/write_scope 的角色配 api 型 fallback。
+
+    §11.1 只对"tools 或 write_scope 非空"的角色要求主绑定与 fallback 全为 cli 型，
+    故 pm（两者皆空）挂 `cheap_api` 作备胎能通过 validate_availability_config——
+    但真实装配只建 cli 实例，降级那一刻按名取实例即 KeyError。
+    max_rounds 压到 5：本用例只验启动出口，不让 HEAD 上的旧路径把假 CLI 的失败
+    重试灌成长跑（看门狗级别3 会及时挂起线程）。
+    """
+    cfg = {
+        "thread_defaults": {"max_rounds": 5, "loop_limit": 3, "chat_ttl": 10},
+        "adapters": {
+            "cli_a": {"kind": "cli", "start_cmd": "orch-fake-cli-a -p", "timeout_s": 5},
+            "cheap_api": {"kind": "api", "model": "<低成本模型>", "timeout_s": 5},
+        },
+        "roles": {
+            "pm": {"adapter": "cli_a", "fallback": ["cheap_api"],
+                   "can_decide": True, "write_scope": [], "tools": []},
+            "moderator": {"adapter": "cli_a", "can_decide": True,
+                          "write_scope": [], "tools": []},
+        },
+    }
+    p = tmp_dir / "config.yaml"
+    p.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    return p
+
+
+def test_r7_n2_api_fallback_aborts_at_assembly_not_runtime(tmp_dir):
+    """N2：api 型 fallback 无法装配 → 启动装配期一行人话 exit 1，而不是运行期 KeyError。
+
+    §11.1 放行这种配置（角色无 tools/write_scope），装配层却只建 cli 实例：主绑定一旦
+    停用/跳闸，`adapter_instance` 按名取不到备胎实例 → KeyError 穿出 run_thread、被
+    cmd_run 的 per-thread 兜底吞成一行 repr、退出码仍 0 —— 用户看到的是"跑过了"，
+    实际整条线程静默停滞。出口须与损坏状态文件一致：启动即报错退出。
+    """
+    cfg_path = _api_fallback_config(tmp_dir)
+    _tid = _cli_new_thread(tmp_dir)
+    assert cfg_path.exists()
+
+    r = _runner().invoke(orch.cli.app, ["run", "--workspace", str(tmp_dir), "--once"])
+
+    assert r.exit_code == 1, (
+        f"api 型 fallback 无法装配，必须启动即 exit 1；实得 {r.exit_code}\n{r.output}"
+    )
+    assert "Traceback" not in r.output, r.output
+    assert "KeyError" not in r.output, (
+        "不得把它拖到运行期变成 KeyError 崩环（那是静默停滞，不是响亮失败）\n" + r.output
+    )
+    assert "cheap_api" in r.output, r.output
+    assert "pm" in r.output, r.output
