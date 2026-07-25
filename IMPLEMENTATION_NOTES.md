@@ -431,3 +431,17 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 - R7 后 Lead 终验:60+30+392 全绿、chaos-m5 双 seed 4 passed、chaos-50 保持;
   真机(仅桩 document.hidden):adapters 恰单线 1.5s 节奏,disable→chip×3+红条点名
   →enable 消隐全周期正常。
+- **终局 closure(第三轮,同一评审亲跑 probe7/10/11/12 复验)**:N1-N5 全 closed
+  (probe7 滞留行 7 轮 streak 恒 1 零跳闸零传染;probe12 写序不变式"通告存在⇒reset
+  已提交"自愈成立且 fallback_switch_pre 锚点覆盖不降反升;probe11 装配期 exit 1/
+  web 400 不退进程;N4/N5 读码+Lead 真机计数自洽)。**总裁决:可验收**。
+  三轮共 18 条发现,blocking/major 全数实证 closed;残留逐条裁决:
+  · minor(缺 kind 键的 fallback 仍漏到运行期 KeyError,`if kind and`→`if kind`
+    一行可闭)+ info(KeyError 抛点爆炸半径未收敛)→ 已挂独立后台任务卡,
+    列交付后清单第一项(评审原话),不触及 §15 M5 任一验收标准;
+  · info(attempts 列双用致真实超时落在 attempts>0 行时漏计 streak——方向安全,
+    少跳不误跳)、info(record_metric 与审计间崩溃窗口致指标多计一条——§13 逐次
+    口径下可辩)、chaos 注释漂移(外观)→ 记录挂账;
+  · 宪法修订授权凭据(info-3):评审性质上无法采信工具内引文,已明示"请人类
+    git show 3831ef8 亲核"——转达用户终审。
+  评审终版 §16 十三条逐条表(文件:行号)在其 closure 报告内,完成定义第 3 项直引。
