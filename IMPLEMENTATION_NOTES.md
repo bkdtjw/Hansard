@@ -263,3 +263,15 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   切换时清线程态/停轮询。
 - 证据：test_cli_grammar 6 连 + test_late_reply_marker 2 连 + test_web_multiws 3 连
   红→绿；全量 302 passed 零回归；preview 8796 三工作区实切 + 真实 E10 徽章亲验。
+
+### M5 立项：适配器可用性与降级路由（2026-07-25，用户批准的 spec 修订）
+- 动机：kimi 额度耗尽暴露"系统无可用性概念"缺口（§5.1 对断粮 adapter 反复撞墙）；
+  中转站额度不可见 → 手动标记为第一公民，自动跳闸为兜底。
+- 用户裁决：增补稿过目后批准；跳闸恢复=一律手动；追加"控制台必须有 enable/disable
+  开关按钮"。环境事实（用户口述）：grok/opencode/claude(中转站) 可用，kimi 断粮。
+- Lead 胶水：SPEC-AMENDMENT-M5-draft.md（设计记录，已标注合入状态）；spec 合入
+  A1–A10（新 §5.6 + §1/§4.1/§4.2/§5.1 伪代码/§7.6/§11.1/§12/§13/§15/§17 增补，
+  用户授权的宪法修订，非擅改）；MILESTONE→M5；docs/m5-contract.md 冻结跨卡接口
+  （AdapterAvailability/resolve_effective_adapter/AdapterUnavailableError/
+  Store.reset_attempts/CLI 三命令/web 端点/metrics 键/事件 meta.kind）。
+- 接手基线：302 passed, 1 skipped（63s，动工前亲跑）。
