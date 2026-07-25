@@ -111,7 +111,8 @@ def test_adapter_trip_fallback_scenario_matches_baseline(tmp_dir, like_feature_s
 # ==================================================================
 
 @pytest.mark.chaos_m5
-def test_adapter_switch_chaos_20_rounds_hard_gate(tmp_dir, like_feature_script):
+@pytest.mark.parametrize("seed", [20260725, 7])
+def test_adapter_switch_chaos_20_rounds_hard_gate(tmp_dir, like_feature_script, seed):
     """spec §15 M5：切换间隙 kill -9 混沌 ≥ 20 轮，通过率必须 100%。
 
     通过判据（缺一即失败）：
@@ -120,17 +121,25 @@ def test_adapter_switch_chaos_20_rounds_hard_gate(tmp_dir, like_feature_script):
       3. failed_seeds 为空
       4. ledger_ok is True（每个事件副作用恰好一次，§9.4）
       5. terminal_ok is True（终态与不中断基准一致）
+
+    【为什么必须跨两个 seed（R5 · 评审 major-3）】
+      单 seed 的 20 轮对 R2 类缺陷是**盲**的：R2（"跳闸后本轮 continue、下轮才重解析"
+      偏离 spec §5.6.3"立即重解析"）只在 kill 把双角色跳闸错开时暴露，出现率 ≈1.5%
+      轮次，seed=20260725 的 20 轮恰好一次都没踩中。T6 的跨 seed 取证已把 seed=7 证成
+      **敏感锚点**：monkeypatch 关掉 R2 修复后，seed=7 精确复现 types-mismatch
+      （report/defect 相邻互换）；打开修复后 20/20 全绿。故把 7 固化进硬门槛参数，
+      让这条回归今后跑不掉（IMPLEMENTATION_NOTES.md「M5 独立评审」major-3 裁决）。
     """
     import orch.chaos
 
-    ws = tmp_dir / "m5-chaos-20"
+    ws = tmp_dir / f"m5-chaos-20-seed{seed}"
     ws.mkdir()
 
     rounds = 20
     harness = orch.chaos.AdapterChaosHarness(
         workspace=ws,
         script=like_feature_script,
-        seed=20260725,
+        seed=seed,
         unavailable_after=2,
     )
     report = harness.run(rounds=rounds)

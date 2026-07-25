@@ -357,3 +357,37 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
   当场换绑重跑本组（组间最小事件号先后不变;异步组内串行重试,不加跨组屏障;
   终止性=跳闸单向+链长有限,零计数器）。因果取证:monkeypatch 关掉修复,三锚点
   seed(7/107/20260704) 精确复现同一失败签名;打开后全 20/20。
+- **M5 独立评审(只读 opus,probe 级取证)**:13 条发现(6 major/4 minor/3 info),
+  总裁决"需回环"。Lead 逐条裁决:
+  · major-2/评审挑战⑤(§11.1 范例配置降级即 KeyError):**收回 T5 记录在案①,
+    升级 blocking**——评审论证成立:装配已为每 owner 算出 (sig,role,merged,wt),
+    按 (role,name) 各建实例既保隔离又不丢功能;KeyError 实为静默停滞(穿出
+    run_thread 断全轮+cmd_run 吞成刷屏)非"响亮失败"。冻结修复契约:装配注册
+    复合键 f"{role}::{name}"(每角色×主绑定+各 fallback 一实例,绑该角色
+    worktree/tools);调度 adapter_instance 先查 f"{target}::{effective}" 再查
+    effective 再查 target(兜底链保既有绿)。→R3(调度侧)+R4(装配侧)
+  · major-1(§13 两项指标无汇总出口):orch metrics 与 /api/metrics 补两行,
+    标签用 §13 行名。→R4
+  · major-3(20 轮门槛对 R2 盲):chaos 硬门槛测试参数化 seed [20260725, 7]
+    (7 对 R2 缺陷敏感,负对照已证)。→R5(测试)
+  · major-4/5(切换与阻塞通告跨"恢复→再进入"漏记):spec"连续"字面=中断后
+    重新首次。冻结:新增第四种通告 meta.kind="adapter_recovered"(role 回归
+    主绑定时,免派发行,现查去重同款)作为盘上断链锚;switch/blocked 去重以
+    "最近一条同类事件之后无 recovered/成功回复"为连续判据(全盘上现查,
+    零内存态)。→R3
+  · major-6(attempts 归零被 sessions 行有无 gate):spec 原文无限定。冻结:
+    prev-binding 从审计链盘上推导(无活跃 switch 记录=primary),effective≠prev
+    即归零,与去重共用推导。→R3
+  · minor-1(裸 status 无呈现):--workspace 模式自动从 ws/config.yaml 派生。→R4
+  · minor-2(控制台角色行无生效绑定/警示不点名):status 端点补角色投影
+    (primary/effective/blocked,只读投影,Q3-A 同例),前端角色行显示绑定,
+    警示条点名阻塞角色;"有 disabled 但备胎兜住"降为提示。→R4
+  · minor-3(状态文件损坏非启动报错):装配启动时探载,损坏一行人话 exit 1。→R4
+  · minor-4(看门狗超时不计 streak):活循环看门狗 kill 路径接 record_failure;
+    recover 路径 b) 若 availability 不可达则报告说明。→R3
+  · info-1(异步环测试覆盖薄):补 async 跳闸/阻塞取证。→R5
+  · info-2(可用性开关双失败语义):维持记录,M5 不动(无条件启用属后续裁决)。
+  · info-3(宪法修订授权凭据):用户 2026-07-25 会话原话批准增补稿("你的方案
+    我同意,但是注意:前端要有按钮开启关闭哈"),批准即含按钮修订;终审时
+    用户可复核 git show 3831ef8。
+  回环序:R5(T1,测试先红)→R3(T3)→R4(T5)→Lead 全套亲验→评审 closure。

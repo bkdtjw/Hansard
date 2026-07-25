@@ -58,8 +58,12 @@ from tests.helpers import EXPECTED_TYPE_SEQUENCE
 # 公共小工具（只读盘 / 只查表；不 mock 任何被测对象）
 # ======================================================================
 
-# 契约 §4 冻结的三种 M5 审计事件 meta.kind。
-_M5_AUDIT_KINDS = ("fallback_switch", "adapter_blocked", "adapter_trip")
+# 契约 §4 冻结的 M5 审计事件 meta.kind（R3/评审 major-4 追加第四种 adapter_recovered）。
+# 凡"与不中断基准比较终态"的口径都按本清单剔除审计事件——漏一种就会在"跑中人工
+# enable 回归"的场景里把 recovered 事件算进事件号名次，导致比较口径失真。
+_M5_AUDIT_KINDS = (
+    "fallback_switch", "adapter_blocked", "adapter_trip", "adapter_recovered",
+)
 
 
 def _dispatch_row(thread_dir, event_id: int, target: str) -> dict | None:
@@ -1365,3 +1369,596 @@ def test_g_fallback_run_matches_baseline_artifacts(tmp_dir, like_feature_script)
     rank = _rank_map(st)
     assert _normalized_ledger(ledger, rank) == _normalized_ledger(base_ledger, base_rank)
     assert _normalized_state(tdir, rank) == _normalized_state(base_dir, base_rank)
+
+
+# ======================================================================
+# R5 · 独立评审整改的测试先行（Lead 裁决见 IMPLEMENTATION_NOTES.md「M5 独立评审」节）
+#
+# 统一前缀 test_r5_，便于用 -k 与既有 43 个用例分离。冻结契约逐条对应：
+#   major-1  §13 两项指标须有汇总出口（orch metrics + /api/metrics，标签用 §13 行名）
+#   major-2  装配复合键 f"{role}::{name}"（每角色×主绑定+各 fallback 一实例，绑该角色
+#            worktree/tools）；调度 adapter_instance 兜底链 复合键 → effective → target
+#   major-4  新增第四种通告 meta.kind="adapter_recovered"（回归主绑定时，免派发行、
+#            首次才记）；switch 去重以"最近一条同类事件之后无 recovered/成功回复"为判据
+#   major-5  阻塞通告同理：恢复→再进入阻塞必须重新通告
+#   major-6  attempts 归零不得被"有无 sessions 行"把门（prev-binding 从审计链盘上推导）
+#   minor-1  裸 `orch status --workspace` 也从 ws/config.yaml 派生可用性呈现
+#   minor-2  status 端点补角色投影（primary/effective/blocked）
+#   minor-3  状态文件损坏 → 装配启动时探载，一行人话 exit 1（非 Traceback、非进入循环）
+#   minor-4  看门狗超时（活循环 kill 路径）计入 fail_streak
+#   info-1   异步环补跳闸/阻塞两条取证
+# ======================================================================
+
+
+def _last_number(text: str) -> float:
+    """取一行文本里**最后一个**数值（表格行形如 `[8] 降级切换次数(...) : 2.00`）。
+
+    不锁输出措辞/分隔符（§12 只要求字段齐全）；取最后一个数值可避开行首编号
+    `[8]`。无数值（例如 "N/A"）→ 断言失败，暴露"有原始量却没汇总出来"。
+    """
+    import re
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text)
+    assert nums, f"该行没有可复算的数值（疑似 N/A）: {text!r}"
+    return float(nums[-1])
+
+
+def _metrics_line_value(output: str, label: str) -> float:
+    lines = [ln for ln in output.splitlines() if label in ln]
+    assert len(lines) == 1, f"`orch metrics` 应恰有一行含 {label!r}，实得 {lines}"
+    return _last_number(lines[0])
+
+
+def _run_degraded_for_metrics(ws: Path, thread_name: str = "t-m5"):
+    """在 ws 下跑一趟"跳闸 → 降级 → 两次降级派发"的 mock 流。
+
+    §13 原始量确定构成（已实测）：
+      · adapter_trip     1 条（cli_a 第 1 次 invoke 抛额度错误 → 特征命中跳闸）
+      · fallback_switch  2 条（跳闸后同轮换绑接手 1 次 + moderator 再指派后又 1 次；
+        §13 "每次 effective ≠ 主绑定的派发记一条"逐次口径）
+    返回 (store, thread_dir)。
+    """
+    cfg, _state_path = _sched_config(ws)
+    tdir = ws / thread_name
+    st = orch.store.Store(tdir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    primary = orch.adapters.MockAdapter(
+        role="pm", script={}, ledger_path=ws / "ledger.txt", unavailable_after=1,
+    )
+    spare = _fake("pm", {
+        1: _handoff(["moderator"], "第一次交接"),
+        2: {"to": [], "type": "report", "body": "第二次汇报"},
+    })
+    mod = _fake("moderator", {
+        1: {"to": ["pm"], "type": "assign", "body": "再来一轮"},
+        2: _terminate(),
+    })
+    orch.scheduler.run_thread(
+        st, cfg, {"cli_a": primary, "cli_b": spare, "mod_api": mod},
+    )
+    assert st.get_meta("status") == "terminated", _types_in_order(st)
+    return st, tdir
+
+
+# ——————————————————————————————————————————————————————————————
+# major-1 · §13 两项指标的汇总出口（CLI + web）
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_major1_cli_metrics_shows_two_section13_rows(tmp_dir):
+    """§13：`orch metrics` 必须输出"降级切换次数"与"自动跳闸次数"两行，且可复算。
+
+    可复算 = 输出数值与该线程 metrics 表的现查行数逐一相等（禁止编造/近似）。
+    """
+    _st, tdir = _run_degraded_for_metrics(tmp_dir)
+    switch_n = len(_metric_rows(tdir, "fallback_switch"))
+    trip_n = len(_metric_rows(tdir, "adapter_trip"))
+    assert (switch_n, trip_n) == (2, 1), (switch_n, trip_n)
+
+    r = _runner().invoke(orch.cli.app, ["metrics", "--workspace", str(tmp_dir)])
+    assert r.exit_code == 0, r.output
+    assert "降级切换次数" in r.output, r.output
+    assert "自动跳闸次数" in r.output, r.output
+    assert _metrics_line_value(r.output, "降级切换次数") == float(switch_n)
+    assert _metrics_line_value(r.output, "自动跳闸次数") == float(trip_n)
+
+
+def test_r5_major1_web_metrics_shows_two_section13_rows(tmp_dir):
+    """§13：GET /api/metrics 同样必须给出两行，且与 metrics 表现查一致。"""
+    _st, tdir = _run_degraded_for_metrics(tmp_dir)
+    switch_n = len(_metric_rows(tdir, "fallback_switch"))
+    trip_n = len(_metric_rows(tdir, "adapter_trip"))
+
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, "/api/metrics")
+        assert code == 200, (code, body)
+        rows = body["rows"]
+        labels = [str(r["label"]) for r in rows]
+        sw = [r for r in rows if "降级切换次数" in str(r["label"])]
+        tp = [r for r in rows if "自动跳闸次数" in str(r["label"])]
+        assert len(sw) == 1, labels
+        assert len(tp) == 1, labels
+        assert _last_number(str(sw[0]["value"])) == float(switch_n)
+        assert _last_number(str(tp[0]["value"])) == float(trip_n)
+
+
+# ——————————————————————————————————————————————————————————————
+# major-2 · 装配复合键 + 调度取实例兜底链
+# ——————————————————————————————————————————————————————————————
+
+def _spec_1111_config(target_repo: Path | None = None) -> dict:
+    """spec §11.1 范例形状：pm=kimi_cli(+fallback claude_cli)、backend=claude_cli。
+
+    两个 adapter 均 kind=cli 假命令（本组是**装配层单测**，零真实 CLI 调用）；
+    两角色的 tools/write_scope 刻意不同 —— 这正是"一个实例无法同时承载两套
+    worktree/tools"的根因，也是复合键必须按 (role, name) 建实例的理由。
+    """
+    cfg: dict = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "adapters": {
+            "kimi_cli": {"kind": "cli", "start_cmd": "kimi-fake -p", "timeout_s": 600},
+            "claude_cli": {"kind": "cli", "start_cmd": "claude-fake -p", "timeout_s": 600},
+        },
+        "roles": {
+            "pm": {"adapter": "kimi_cli", "fallback": ["claude_cli"],
+                   "can_decide": True, "write_scope": ["docs/"],
+                   "tools": ["Edit", "Write"]},
+            "backend": {"adapter": "claude_cli", "can_decide": False,
+                        "write_scope": ["server/"],
+                        "tools": ["Edit", "Write", "Bash(pytest:*)"]},
+        },
+    }
+    if target_repo is not None:
+        cfg["target_repo"] = str(target_repo)
+    return cfg
+
+
+def _init_target_repo(root: Path) -> Path:
+    """本地真 git 仓库（同 tests/test_permissions.py 口径），供 ensure_worktrees 拉分支。"""
+    import subprocess
+
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=str(root), capture_output=True,
+                       text=True, check=True)
+
+    root.mkdir(parents=True, exist_ok=True)
+    _git("init", "-b", "main")
+    _git("config", "user.email", "t@example.com")
+    _git("config", "user.name", "t")
+    for d in ("docs", "server"):
+        (root / d).mkdir()
+        (root / d / ".gitkeep").write_text("", encoding="utf-8")
+    (root / "README.md").write_text("readme\n", encoding="utf-8")
+    _git("add", "-A")
+    _git("commit", "-m", "init")
+    return root
+
+
+def test_r5_major2_build_adapters_registers_composite_keys(tmp_dir):
+    """major-2：§11.1 范例配置过装配层，必须注册 f"{role}::{name}" 复合键。
+
+    评审论证：pm 的 fallback claude_cli 与 backend 的主绑定同名但**配置不同**
+    （tools/write_scope 各异），旧实现因"不可共用"而干脆不建实例 → 降级即 KeyError
+    （静默停滞）。冻结修复：每角色×(主绑定+各 fallback) 各建一实例，绑该角色配置。
+    """
+    from orch.cli.main import _build_adapters_from_config
+
+    cfg = _spec_1111_config()
+    ads = _build_adapters_from_config(["pm", "backend"], cfg, tmp_dir / "t-001")
+
+    # 复合键三把（pm 主绑定 + pm 备胎 + backend 主绑定）都必须在。
+    for key in ("pm::kimi_cli", "pm::claude_cli", "backend::claude_cli"):
+        assert key in ads, f"装配缺复合键 {key!r}；实得 {sorted(ads)}"
+    # 既有角色名键保持（兜底链最后一环，保 M0–M4 全部调用方与测试绿）。
+    assert "pm" in ads and "backend" in ads, sorted(ads)
+
+    # pm 的 claude_cli 实例与 backend 的必须是**不同对象**（一实例扛不了两套配置）。
+    assert ads["pm::claude_cli"] is not ads["backend"]
+    assert ads["pm::claude_cli"] is not ads["backend::claude_cli"]
+
+    # 该实例归 pm：role 与 tools 都是 pm 的，不是 backend 的。
+    inst = ads["pm::claude_cli"]
+    assert inst.role == "pm"
+    assert list(inst.caps["tools"]) == ["Edit", "Write"], inst.caps["tools"]
+    assert list(ads["backend::claude_cli"].caps["tools"]) == [
+        "Edit", "Write", "Bash(pytest:*)",
+    ]
+
+
+def test_r5_major2_composite_instance_uses_owner_role_worktree(tmp_dir):
+    """major-2 续：pm 的备胎实例 cwd/worktree 必须归 pm，不得串到 backend 的 worktree。
+
+    §8.1 落代码隔离：拿错 worktree 是权限缺陷（不是可用性降级），必须可证伪。
+    用本地真 git 仓库让 ensure_worktrees 真建两个 worktree（零真实 CLI 调用）。
+    """
+    from orch.cli.main import _build_adapters_from_config
+
+    target = _init_target_repo(tmp_dir / "target")
+    cfg = _spec_1111_config(target_repo=target)
+    ads = _build_adapters_from_config(["pm", "backend"], cfg, tmp_dir / "t-001")
+
+    wts = cfg.get("worktrees") or {}
+    assert "pm" in wts and "backend" in wts, wts
+    assert Path(wts["pm"]) != Path(wts["backend"])
+
+    assert "pm::claude_cli" in ads, sorted(ads)
+    assert Path(ads["pm::claude_cli"].worktree) == Path(wts["pm"])
+    assert Path(ads["pm::claude_cli"].worktree) != Path(wts["backend"])
+    assert Path(ads["backend::claude_cli"].worktree) == Path(wts["backend"])
+
+
+def test_r5_major2_adapter_instance_prefers_composite_key():
+    """major-2 调度侧：adapter_instance 兜底链 = f"{role}::{effective}" → effective → role。"""
+    from orch.scheduler import availability as av
+
+    by_composite, by_name, by_role = object(), object(), object()
+
+    # ① 复合键在场时**优先**（同名不同角色的实例必须各归各的）。
+    ads = {"pm::claude_cli": by_composite, "claude_cli": by_name, "pm": by_role}
+    assert av.adapter_instance(ads, "pm", "claude_cli", "kimi_cli") is by_composite
+
+    # ② 无复合键 → 退到 adapter 名键（M5 既有分支）。
+    ads = {"claude_cli": by_name, "pm": by_role}
+    assert av.adapter_instance(ads, "pm", "claude_cli", "kimi_cli") is by_name
+
+    # ③ 两者皆无且生效绑定 == 主绑定 → 退到角色名键（M0–M4 既有映射兼容）。
+    ads = {"pm": by_role}
+    assert av.adapter_instance(ads, "pm", "pm", "pm") is by_role
+
+
+# ——————————————————————————————————————————————————————————————
+# major-4 · adapter_recovered 通告 + 切换通告的断链重记
+# ——————————————————————————————————————————————————————————————
+
+def _gate_env(corr: str) -> dict:
+    return {"to": ["human"], "type": "gate_request", "body": "请批准", "corr": corr}
+
+
+def test_r5_major4_recovered_notice_rearms_switch_notice(thread_dir, tmp_dir):
+    """major-4：回归主绑定须落 adapter_recovered（免派发行、连续回归只记一次），
+    并把 fallback_switch 的"连续"链**打断**——再次降级必须重新通告。
+
+    四次派发编排（每次回复 gate_request 挂起，人工 approve 后续跑，以便在两次派发
+    之间改状态文件）：
+      ① disable(cli_a) → 备胎接手（switch #1）
+      ② enable(cli_a)  → 回归主绑定（recovered #1）
+      ③ 再派发一次仍是主绑定（recovered 不重复记）
+      ④ 再 disable(cli_a) → 备胎接手（switch #2：链已被 ② 打断）
+    """
+    cfg, state_path = _sched_config(tmp_dir)
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+
+    primary = _fake("pm", {1: _gate_env("g2"), 2: _gate_env("g3")})
+    spare = _fake("pm", {1: _gate_env("g1"), 2: _gate_env("g4")})
+    mod = _fake("moderator", {})       # 不应被派发；若被派发则 KeyError → 红
+    adapters = {"cli_a": primary, "cli_b": spare, "mod_api": mod}
+
+    # ① 主绑定停用 → 备胎接手。
+    _availability(state_path).disable("cli_a", reason="额度耗尽", by="human")
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert st.get_meta("status") == "suspended", _types_in_order(st)
+    assert (spare.call_no, primary.call_no) == (1, 0)
+
+    # ② 人工 enable → 下一次派发回归主绑定。
+    _availability(state_path).enable("cli_a")
+    orch.scheduler.apply_gate_decision(
+        st, cfg, adapters, corr="g1", approve=True, sender="human")
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert (spare.call_no, primary.call_no) == (1, 1)
+
+    # ③ 连续回归：再派发一次，recovered 不得重复记。
+    orch.scheduler.apply_gate_decision(
+        st, cfg, adapters, corr="g2", approve=True, sender="human")
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert (spare.call_no, primary.call_no) == (1, 2)
+
+    # ④ 再次停用 → 备胎接手；切换通告必须重新记（链已被 recovered 打断）。
+    _availability(state_path).disable("cli_a", reason="再次额度耗尽", by="human")
+    orch.scheduler.apply_gate_decision(
+        st, cfg, adapters, corr="g3", approve=True, sender="human")
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert (spare.call_no, primary.call_no) == (2, 2)
+
+    recovered = _audit_events(st, "adapter_recovered")
+    assert len(recovered) == 1, [e["body"] for e in recovered]
+    assert recovered[0]["from"] == "system" and recovered[0]["type"] == "system"
+    assert recovered[0]["meta"]["role"] == "pm"
+    assert _dispatch_count_for_event(thread_dir, recovered[0]["id"]) == 0, \
+        "adapter_recovered 是通告不是待办：不得生成派发行"
+
+    switches = _audit_events(st, "fallback_switch")
+    assert len(switches) == 2, [e["body"] for e in switches]
+
+
+# ——————————————————————————————————————————————————————————————
+# major-5 · 阻塞通告的断链重记
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_major5_blocked_notice_rearmed_after_recovery(thread_dir, tmp_dir):
+    """major-5：全不可用 → 恢复并成功回复 → 再次全不可用，必须**重新**通告一次。
+
+    spec §5.6.2 的"首次"是"连续状态的首次"；中断后重新进入即新的首次，
+    否则运维在第二次阻塞时盘上无锚（通告断链）。
+    """
+    cfg, state_path = _sched_config(tmp_dir)
+    av = _availability(state_path)
+    av.disable("cli_a", reason="额度耗尽", by="human")
+    av.disable("cli_b", reason="额度耗尽", by="human")
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+
+    primary = _fake("pm", {1: _gate_env("g1")})
+    spare = _fake("pm", {})
+    mod = _fake("moderator", {})
+    adapters = {"cli_a": primary, "cli_b": spare, "mod_api": mod}
+
+    # ① 全不可用 → 阻塞通告 #1，派发行保持 pending，零 invoke。
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert len(_audit_events(st, "adapter_blocked")) == 1
+    assert (primary.call_no, spare.call_no) == (0, 0)
+    assert _dispatch_row(thread_dir, e1, "pm")["status"] == "pending"
+
+    # ② enable 主绑定 → 续跑出一次真实回复（成功回复 = 阻塞态结束的盘上锚）。
+    _availability(state_path).enable("cli_a")
+    orch.scheduler.run_thread(st, cfg, adapters)
+    assert primary.call_no == 1
+    assert st.get_meta("status") == "suspended", _types_in_order(st)
+
+    # ③ 再次全不可用 → 新一轮阻塞必须重新通告。
+    av2 = _availability(state_path)
+    av2.disable("cli_a", reason="再次额度耗尽", by="human")
+    assert av2.is_enabled("cli_b") is False
+    orch.scheduler.apply_gate_decision(
+        st, cfg, adapters, corr="g1", approve=True, sender="human")
+    orch.scheduler.run_thread(st, cfg, adapters)
+
+    blocked = _audit_events(st, "adapter_blocked")
+    assert len(blocked) == 2, [e["body"] for e in blocked]
+    for ev in blocked:
+        assert _dispatch_count_for_event(thread_dir, ev["id"]) == 0
+
+
+# ——————————————————————————————————————————————————————————————
+# major-6 · attempts 归零不得被"有无 sessions 行"把门
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_major6_attempts_reset_without_session_row(thread_dir, tmp_dir):
+    """major-6 §5.6.2："换绑重派时该派发行 attempts 归零"，spec 原文无 sessions 前提。
+
+    mock/API 型角色本就没有 sessions 行（无会话概念），旧实现把归零挂在"有 sessions
+    行且 backend 变了"上 → 这类角色降级后仍背着旧后端消耗掉的重试预算。
+    """
+    cfg, state_path = _sched_config(tmp_dir)
+    _availability(state_path).disable("cli_a", reason="额度耗尽", by="human")
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    st.bump_attempt(e1, "pm")
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == 1
+    assert _session_row(thread_dir, "pm") is None, "本用例前提：该角色无 sessions 行"
+
+    primary = _fake("pm", {})
+    spare = _fake("pm", {1: _handoff(["moderator"])})
+    mod = _fake("moderator", {1: _terminate()})
+    orch.scheduler.run_thread(
+        st, cfg, {"cli_a": primary, "cli_b": spare, "mod_api": mod})
+
+    assert st.get_meta("status") == "terminated", _types_in_order(st)
+    assert spare.call_no == 1 and primary.call_no == 0
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == 0, \
+        "换绑重派后 attempts 必须归零（新后端享有完整重试预算，§5.6.2）"
+
+
+# ——————————————————————————————————————————————————————————————
+# minor-1 · 裸 `orch status --workspace` 也呈现可用性
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_minor1_status_without_config_uses_workspace_config(tmp_dir):
+    """minor-1 §12：`orch status <t> --workspace <ws>`（不带 --config）也须呈现生效绑定。
+
+    ws 内已有 config.yaml —— 与 `orch run` 同一约定，用户没有理由为看一眼状态
+    再手输一遍配置路径；不派生就等于"默认姿势下看不见降级"。
+    """
+    cfg_path = _cli_config(tmp_dir)
+    tid = _cli_new_thread(tmp_dir)
+
+    r0 = _runner().invoke(orch.cli.app, [
+        "adapter", "disable", "cli_a", "--reason", "额度耗尽", "--config", str(cfg_path)])
+    assert r0.exit_code == 0, r0.output
+
+    r = _runner().invoke(orch.cli.app, ["status", tid, "--workspace", str(tmp_dir)])
+    assert r.exit_code == 0, r.output
+    assert "⛔" in r.output, r.output
+    assert "cli_b" in r.output, f"应显示生效备胎名 cli_b\n{r.output}"
+
+    r1 = _runner().invoke(orch.cli.app, [
+        "adapter", "disable", "cli_b", "--reason", "额度耗尽", "--config", str(cfg_path)])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = _runner().invoke(orch.cli.app, ["status", tid, "--workspace", str(tmp_dir)])
+    assert r2.exit_code == 0, r2.output
+    assert "无可用" in r2.output, r2.output
+
+
+# ——————————————————————————————————————————————————————————————
+# minor-2 · web status 端点的角色绑定投影
+# ——————————————————————————————————————————————————————————————
+
+def _role_projection(body: dict) -> list[dict]:
+    """从 status 响应里按**结构**定位角色投影（容器键名未冻结，建议 "roles"）。
+
+    判据：某个顶层值是"非空的 dict 列表且每项含 role 键"。既有 dispatches 列表的
+    键是 event_id/target/status/attempts，不含 role，不会误命中。
+    """
+    for value in body.values():
+        if (isinstance(value, list) and value
+                and all(isinstance(x, dict) and "role" in x for x in value)):
+            return value
+    raise AssertionError(
+        f"status 响应缺角色投影（每项须含 role/primary/effective/blocked）：{body}"
+    )
+
+
+def test_r5_minor2_web_status_exposes_role_binding_projection(tmp_dir):
+    """minor-2 §12：控制台角色行要能显示生效绑定与点名警示 → status 端点须给投影。"""
+    cfg_path = _cli_config(tmp_dir)
+    tid = _cli_new_thread(tmp_dir)
+    m = _state_mod()
+    state_path = Path(m.state_path_for(cfg_path))
+
+    av = m.AdapterAvailability.load(state_path)
+    av.disable("cli_a", reason="额度耗尽", by="human")
+
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        rows = _role_projection(body)
+        pm = next(r for r in rows if r["role"] == "pm")
+        for key in ("primary", "effective", "blocked"):
+            assert key in pm, pm
+        assert pm["primary"] == "cli_a"
+        assert pm["effective"] == "cli_b"
+        assert pm["blocked"] is False
+
+    # 全链不可用 → blocked 点名该角色。
+    m.AdapterAvailability.load(state_path).disable(
+        "cli_b", reason="额度耗尽", by="human")
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        pm = next(r for r in _role_projection(body) if r["role"] == "pm")
+        assert pm["effective"] is None, pm
+        assert pm["blocked"] is True, pm
+
+
+# ——————————————————————————————————————————————————————————————
+# minor-3 · 状态文件损坏 → 装配启动即一行人话报错退出
+# ——————————————————————————————————————————————————————————————
+
+def _cli_only_config(tmp_dir: Path) -> Path:
+    """全 cli 型的 workspace 配置（`orch run` 真实装配只支持 kind=cli）。"""
+    cfg = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "adapters": {
+            "cli_a": {"kind": "cli", "start_cmd": "fake-a -p", "timeout_s": 5},
+            "cli_b": {"kind": "cli", "start_cmd": "fake-b -p", "timeout_s": 5},
+        },
+        "roles": {
+            "pm": {"adapter": "cli_a", "fallback": ["cli_b"], "can_decide": True,
+                   "write_scope": [], "tools": []},
+            "moderator": {"adapter": "cli_b", "can_decide": True,
+                          "write_scope": [], "tools": []},
+        },
+    }
+    p = tmp_dir / "config.yaml"
+    p.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    return p
+
+
+def test_r5_minor3_corrupt_state_file_aborts_run_with_one_line(tmp_dir):
+    """minor-3 §5.6.1"文件损坏 → 启动报错，禁止猜测"：装配期探载 + exit 1 + 无 Traceback。
+
+    旧行为：损坏在 run_thread 内才炸，被 cmd_run 的 per-thread 兜底吞成一行 repr、
+    退出码仍 0 —— 既非"启动报错"，也让运维以为跑过了。
+    """
+    cfg_path = _cli_only_config(tmp_dir)
+    _tid = _cli_new_thread(tmp_dir)
+    state_path = Path(_state_mod().state_path_for(cfg_path))
+    state_path.write_text("{ this is not json", encoding="utf-8")
+
+    r = _runner().invoke(orch.cli.app, ["run", "--workspace", str(tmp_dir), "--once"])
+    assert r.exit_code == 1, f"损坏状态文件必须 exit 1，实得 {r.exit_code}\n{r.output}"
+    assert "Traceback" not in r.output, r.output
+    assert "adapter_state.json" in r.output, r.output
+
+
+# ——————————————————————————————————————————————————————————————
+# minor-4 · 看门狗超时（活循环 kill 路径）计入 fail_streak
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_minor4_watchdog_timeout_counts_fail_streak(thread_dir, tmp_dir):
+    """minor-4 §5.6.4："超时既走看门狗路径也计入 fail_streak"。
+
+    构造一条过期的 dispatching 行（沿 M1 test_watchdog 姿势：落盘绝对时间戳 +
+    注入假时钟 now，绝不 sleep），跑看门狗，断言状态文件里该 adapter 的
+    fail_streak 从 0 变 1（既有 attempts+1 语义同时保持）。
+    """
+    cfg, state_path = _sched_config(tmp_dir, pm_fallback=(), trip_after=5)
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    deadline = 1_000_000.0
+    st.mark_dispatching(e1, "pm", deadline)
+
+    actions = orch.scheduler.check_watchdogs(st, cfg, now=deadline + 1.0)
+
+    assert any(a.get("level") == 1 for a in actions), actions
+    assert _dispatch_row(thread_dir, e1, "pm")["attempts"] == 1, "既有 attempts 语义不变"
+
+    entry = _availability(state_path).snapshot().get("cli_a")
+    assert entry is not None, "看门狗超时应在状态文件里给 cli_a 记一次失败"
+    assert entry["fail_streak"] == 1, entry
+    assert entry["status"] == "enabled", "trip_after=5 时一次超时不应跳闸"
+
+
+# ——————————————————————————————————————————————————————————————
+# info-1 · 异步环取证补两条（与同步环 d4b / d3 对等）
+# ——————————————————————————————————————————————————————————————
+
+def test_r5_info1_async_trip_then_fallback_takes_over(thread_dir, tmp_dir):
+    """info-1：异步环的"特征命中跳闸 → 备胎接手"取证（同步环 d4b 的 async 版）。"""
+    cfg, state_path = _sched_config(tmp_dir)
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+
+    primary = orch.adapters.MockAdapter(
+        role="pm", script={}, ledger_path=tmp_dir / "ledger.txt", unavailable_after=1,
+    )
+    spare = _fake("pm", {1: _handoff(["moderator"])})
+    mod = _fake("moderator", {1: _terminate()})
+
+    asyncio.run(orch.scheduler.run_thread_async(
+        st, cfg, {"cli_a": primary, "cli_b": spare, "mod_api": mod}))
+
+    assert st.get_meta("status") == "terminated", _types_in_order(st)
+    assert spare.call_no == 1
+    assert _availability(state_path).is_enabled("cli_a") is False
+    trips = _audit_events(st, "adapter_trip")
+    assert len(trips) == 1 and trips[0]["meta"]["trigger"] == "pattern", trips
+    assert len(_audit_events(st, "fallback_switch")) == 1
+
+
+def test_r5_info1_async_all_unavailable_keeps_pending(thread_dir, tmp_dir):
+    """info-1：异步环的"全不可用 → 保持 pending、不耗 attempts、线程不挂起"取证。"""
+    cfg, state_path = _sched_config(tmp_dir)
+    av = _availability(state_path)
+    av.disable("cli_a", reason="额度耗尽", by="human")
+    av.disable("cli_b", reason="额度耗尽", by="human")
+
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    e1 = st.append_event(sender="human", type="assign", body="开工", to=["pm"])
+    st.bump_attempt(e1, "pm")
+
+    primary = _fake("pm", {})
+    spare = _fake("pm", {})
+    mod = _fake("moderator", {})
+
+    asyncio.run(orch.scheduler.run_thread_async(
+        st, cfg, {"cli_a": primary, "cli_b": spare, "mod_api": mod}))
+
+    row = _dispatch_row(thread_dir, e1, "pm")
+    assert row["status"] == "pending", row
+    assert row["attempts"] == 1, row
+    assert st.get_meta("status") == "running", "阻塞角色不得挂起线程（§5.6.2）"
+    assert (primary.call_no, spare.call_no) == (0, 0)
+    blocked = _audit_events(st, "adapter_blocked")
+    assert len(blocked) == 1, [e["body"] for e in blocked]
+    assert _dispatch_count_for_event(thread_dir, blocked[0]["id"]) == 0
