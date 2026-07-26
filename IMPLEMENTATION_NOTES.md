@@ -562,6 +562,15 @@ acceptance 也过不了钩子——两层故障叠着。
   UnicodeDecodeError 死在 reader 线程,调用点拿 rc=0+stdout=''(不抛错)。已验
   §8.2 审计方向 fail-closed(quotepath 转义,非空串)不漏放,但每轮 stderr 刷
   traceback+静默空结果是真缺陷。
+  → 已修(2026-07-26,销卡):全仓排查 src 下 subprocess 文本模式共 5 处,
+  除 adapters Q1 样板原带 encoding 外,同病四处——permissions._git /
+  core._run_verify / systemexec._run_gate_op / async_core.register_async_job
+  (Popen)——均补 encoding='utf-8'+errors='replace'(与样板同款;replace 保
+  rc 与 ASCII 诊断不丢,cp936 子进程输出最多乱码不再断读)。真实每轮炸点是
+  `worktree list --porcelain` 输出的中文绝对路径(本仓路径即中文)→复用判定
+  失明。tests/test_subprocess_encoding.py 五用例钉死(cp936 环境修前 5 红/
+  修后全绿 422 passed;UTF-8 locale 机器天然绿,文件头有注)。tests 里三个
+  _git setup helper 不动(输出不解析或 quotepath 转义后纯 ASCII)。
 - 遗留 minor(评审报告在案未修):test_cli_adapter.py 的 fail-closed 用例用进程
   cwd 标记文件断言(回归时污染+粘滞);无写权角色的 {cwd} 解析为线程状态目录
   (纵深防御口子,建议指空沙箱);8 条调度语义用例寄存 test_cli_adapter.py 待迁;

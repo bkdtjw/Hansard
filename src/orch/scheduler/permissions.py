@@ -34,6 +34,8 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        encoding="utf-8",  # git 输出恒 UTF-8；Windows 默认 cp936 解码会死在 reader 线程→rc=0+stdout=''
+        errors="replace",
         check=check,
     )
 
