@@ -478,7 +478,18 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 ### 落代码演示(code-ws)联跑:两个真实缺口确诊(2026-07-26,Lead 亲做)
 - 目标:grok 当 coder 在隔离 worktree 写罗马数字转换 + tester 系统侧验收。四轮尝试
   全部未产出可验收代码,但确诊两处真缺口(均已挂后台任务卡,不混入 M5):
-- **缺口A(task_bbff7655):长 CJK prompt 走 argv 喂 grok 必失败**。同一份编排器
+- **⚠ 更正(2026-07-26 稍后,用户告知 grok 走第三方中转站后复查)**:缺口A 的
+  "argv vs prompt-file"归因**证据不足,降级为待验**。查 ~/.grok/config.toml:
+  default 模型 grok-4.5 指向中转站(base_url=new-sub2api.…,api_backend=responses,
+  context_window 500000);而实测发现 —— `-m grok-4.5`(走中转站)当场
+  `rate_limit_error: Upstream rate limit exceeded` exit 1;不带 -m 时用量字段是
+  **grok-4.5-build-free**(内置免费档)且可用。即本轮全部"成功"探针走的都是免费档,
+  失败样本可能是中转站限流/免费档退避所致,与 argv 传参未做到单变量隔离。
+  白名单参数被取值型 flag(-p)顶掉那条**仍然成立**(纯参数拼接,与后端无关)。
+  待中转站额度恢复后按单变量重测(同一 prompt × argv/prompt-file × 同一模型档)
+  再定论;task_bbff7655 卡内已有的两个修复方向(prompt_via=file / 参数位置)
+  在任一归因下都是有益的健壮性改进。
+- **缺口A(task_bbff7655,归因待验,见上):长 CJK prompt 走 argv 喂 grok 失败**。同一份编排器
   渲染视图(3103 字符),经 `--prompt-file` 直喂 grok → 4 轮写出 src/roman.py +
   tests/test_roman.py 并吐合法信封;经编排器 argv(`-p <TEXT>`)→ 恒"no json
   block"、两次耗尽 attempts、触发 M5 streak 跳闸。另发现同族问题:白名单参数
