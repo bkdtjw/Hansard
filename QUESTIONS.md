@@ -93,3 +93,37 @@ Q3 [UI/web] web events 端点需扩展返回 re/ts/meta/artifacts（console-ui-r
   选项: A 扩展 events 端点返回这些已有列（只读投影，不改 DDL/协议/调度、不加功能）——推荐，
         符合"UI 是持久层只读投影"(§E1)精神；B 不做 D12-D14（信息损失，违 spec §8.3 verify 可视化）。
   裁决: 采 A（第三处后端改动，仅投影既有库字段，属 §7 输出规范化/投影职责）；记录备查。
+
+Q6 [M5后/adapters] start_cmd 新增 `{cwd}` 占位是 spec 未定义的配置面，是否入宪、用哪种方言
+  背景: opencode 无视进程 cwd 自寻项目根（§8.1 围栏被绕）。修法需在 argv 里显式注入工作目录，
+        而 start_cmd 是静态串，动态值只能靠占位。§11.1 未定义 start_cmd 任何占位；§17 十项
+        开放决策均不覆盖。实现已落地（commit 2cbffad，_start_cmd_argv：split 后逐 token 替换，
+        含空格路径恒单 argv 元素；无占位逐字节回归；不作用于 tools_args 与视图正文）。
+        另 spec 已有两套占位方言：§8.3 用 {worktree:role}/{target_repo}，gate_ops 用
+        {target_repo}/{branch}；本增补若用 {cwd} 即第三种。
+  选项: A 采纳 {cwd}，一句话入 §11.1（拟稿见 NOTES"意外问题修复"节）——推荐（start_cmd 场景
+        恒指本角色自己的工作目录，无需 role 参数化，与 Popen cwd 同名直白）；
+        B 复用 §8.3 方言写 {worktree:self}（少一种方言，多一层解释）；
+        C 不入宪，回退占位、改为各 adapter 硬编码 --dir（把供应商细节焊死进编排器，最差）。
+  裁决: （待人类）
+
+Q7 [M5后/verify] §8.3 行450 写 `cwd_template`、§11.1 行541 示例写 `cwd`——同一字段两种拼写（spec 内部矛盾）
+  背景: 本轮修 verify 钩子 cwd 占位渲染（此前完全缺失：按 §11.1 示例配置恒 NotADirectoryError
+        →acceptance 永降级；按 §8.3 拼写则键名不被读→静默在编排器自身目录跑出假绿）。
+        实现临时双键都认（core.py _run_verify），配置面比 spec 宽，哪个拼写正统无落盘记录。
+  选项: A 统一为 cwd，修 §8.3 那一行文字——推荐（全部既有配置与 §11.1 示例都用 cwd，
+        无任何存量用 cwd_template）；B 统一为 cwd_template，修 §11.1 示例；
+        C 双键都认写进 spec（把兜底转正，代价是永久双拼写）。
+  裁决: （待人类）
+
+Q8 [M5后/verify] 未配置 verify 的角色发 acceptance 是否原样放行
+  背景: §8.3 行450"**可为**角色配置 verify"（可选）与行452"meta.verify.exit_code==0 是
+        acceptance 生效的**必要条件**"（无条件措辞）互相矛盾。现实现：未配 verify → acceptance
+        原样放行且 meta 无 verify 键（等于放行"我测过了"，§16.5 反模式方向）；但按字面收紧会
+        打红 tests/test_m2_e2e.py（其 tester 未配 verify 而断言 acceptance 必现，源自 M2 验收）。
+        演示床已在配置层堵口（oc-ws/code-ws 给所有可发 acceptance 的角色补 verify）。
+  选项: A 维持放行 + spec 澄清措辞（452 的必要条件限定于"配置了 verify 的角色"）——推荐
+        （与 M2 验收标准自洽；验收强度交给配置，部署侧给关键角色配 verify 即可）；
+        B 收紧：未配 verify 一律降级 report（最安全，但须改 spec 行450 与 M2 测试，波及大）；
+        C 加全局开关 require_verify_for_acceptance（多一个配置面，§16 臃肿方向）。
+  裁决: （待人类）

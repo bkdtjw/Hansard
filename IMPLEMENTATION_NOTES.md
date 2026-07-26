@@ -506,3 +506,62 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 - 演示配置暂以"grok_coder 不声明 tools、靠 --permission-mode acceptEdits"绕过
   缺口A的白名单部分;缺口A的 argv 部分与缺口B 未绕过,故 code-ws **尚不可用于
   对外演示**,已如实告知用户。
+
+### 意外问题修复:{cwd} 占位 + verify 钩子 cwd 渲染(2026-07-26,workflow wf_e274b8b8,opus 工人×7)
+
+用户指令"派 opus 解决意外问题"。两个 commit:2cbffad(start_cmd {cwd} 占位+verify
+cwd 渲染)、6a10825(评审回环:verify 走 to_thread+降级追加 system 提示)。全量
+417 passed, 5 skipped(Lead 亲跑,含混沌门 --chaos-m5 14 passed)。
+
+**比预想深一层的雷(裁决agent只读体检挖出)**:§8.3 verify 钩子的 cwd 占位渲染
+**从未实现过**——core.py 原 `cwd = verify.get("cwd") or "."`,docstring 却自称
+"M2 落地"。后果两态:按 §11.1 示例配 `{worktree:backend}` → NotADirectoryError
+→ exit_code=1 → acceptance 永降级;按 §8.3 拼写 cwd_template → 键不被读 → 静默
+在编排器自身目录跑出 exit_code=0 = **假绿**。即上一场演示就算 tester 发了
+acceptance 也过不了钩子——两层故障叠着。
+
+修复要点(工人实现,Lead 复核):
+- `_start_cmd_argv`:split 后逐 token replace('{cwd}', worktree)。先分词后替换
+  → 含空格路径恒单 argv 元素;无占位逐字节回归;不作用于 tools_args 与视图正文
+  (正文参与替换=给 agent 开模板注入面)。真身与 Fake 孪生共用同一 helper。
+- verify cwd 渲染:{worktree:role}/{target_repo} 按 config[worktrees]/[target_repo]
+  渲染;cwd/cwd_template 双键都认(临时兜底,正统拼写待 Q7);占位解析不出 →
+  fail-closed 不执行命令+可诊断报错(原静默 '.' 是假绿方向)。
+- 回环修复:async_core 的 _finalize_envelope 原裸跑在事件循环上(实测停摆 1.58s),
+  改 await asyncio.to_thread;verify 降级原静默,现双环 append_system_event
+  给 moderator,正文带 exit_code+输出尾(meta 不进视图,不搬进 body 下游看不见)。
+- 待用户裁决三条已录 QUESTIONS.md Q6({cwd} 入宪+方言)/Q7(cwd 拼写)/Q8(未配
+  verify 的 acceptance 放行否)。Q6 拟稿:"start_cmd/resume_cmd 支持 {cwd} 占位:
+  argv 分词之后逐 token 字面替换为该角色 worktree 绝对路径;含空格路径恒单
+  argv 元素;未出现占位时 argv 逐字节不变;不作用于自动注入的工具参数与视图正文"。
+
+**联跑取证(oc-ws 主床 t-19eefb7c,不依赖中转站;Lead 逐项亲查 events.db/文件系统)**:
+- E3 acceptance meta.verify.exit_code=0("12 passed");E6 人为负控:往测试里插错断言
+  → tester 发 acceptance 落盘成 **report**、exit_code=1 带 FAILED 明细(§8.3 降级
+  链路实证);E9 修复后 acceptance exit_code=0("13 passed",与 Lead 在 worktree
+  亲跑逐字一致)。围栏三点全过:worktree 内两文件+wip 提交只碰 write_scope;
+  工作区根/线程目录零泄漏 .py;目标仓 master 未被写。code-ws 加餐 t-086313f0:
+  E4 acceptance exit=0,且 tester/moderator 真实降级到 opencode 接力,异构接力下
+  钩子照常盖章。注意:oc-ws 联跑发生在回环修复**之前**,故该线程降级无 system
+  提示行属预期;修复后语义由 6 条先红后绿用例钉死。
+- **重要经验(第一次联跑失败换来的)**:把协议措辞写进 assign 正文,对非收件角色
+  会被 §6.3 背景层压缩吃掉(t-8ab284bd 实证:tester 视图里协议整段没了→又发
+  handoff 假绿)。**协议必须写 roles[*].prompt 文件**(进系统层,每轮全文必发)。
+  oc-ws/code-ws 已建 prompts/{backend,tester,moderator}.md。
+- 演示床配置加固:opencode start_cmd 追加 --dir {cwd}(oc/code/hetero 三份);
+  给所有可发 acceptance 的角色补 verify(编排器侧通用口子待 Q8)。
+
+**联跑捎出的新缺陷(各挂卡)**:
+- unavailable_patterns 朴素子串匹配误判:code-ws 旧跳闸 reason"命中 '429'"实为
+  sessionId(UUIDv7 …e429)尾巴;真因是 stopReason=Cancelled(max-turns 用尽)。
+  且 pattern 命中=立即停用不走 trip_after 连败计数,语义差异建议 §5.6.3 挑明。
+- permissions._git 缺 encoding:text=True 在 Windows 退 cp936,中文提交信息→
+  UnicodeDecodeError 死在 reader 线程,调用点拿 rc=0+stdout=''(不抛错)。已验
+  §8.2 审计方向 fail-closed(quotepath 转义,非空串)不漏放,但每轮 stderr 刷
+  traceback+静默空结果是真缺陷。
+- 遗留 minor(评审报告在案未修):test_cli_adapter.py 的 fail-closed 用例用进程
+  cwd 标记文件断言(回归时污染+粘滞);无写权角色的 {cwd} 解析为线程状态目录
+  (纵深防御口子,建议指空沙箱);8 条调度语义用例寄存 test_cli_adapter.py 待迁;
+  code-ws 注释"隔离仍由 worktree+审计兜底"说满(审计看不见 worktree 外写入)。
+- 销卡:task_1584e720(opencode --dir 注入)由本轮修复达成。task_bbff7655(tools
+  注入位置)仍在用户另一会话,本轮明令工人未碰其领地。
