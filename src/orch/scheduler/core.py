@@ -538,15 +538,11 @@ def _run_verify(config: dict, role: str) -> dict | None:
 
     返回 {'exit_code': int, 'output': str}；未配置 verify 时返回 None。
 
-    工作目录字段名：spec 自身两处不一致——§8.3(行450) 写 `cwd_template`，§11.1 示例
-    (行541) 写 `cwd`。二者指同一字段，故**两个键名都认**（cwd_template 优先），
-    否则按其中一种写法配置就会被静默忽略。
+    工作目录字段名：`cwd`（Q7 裁决 2026-07-26 采 A，§8.3 行450 已统一为 {cmd, cwd}）。
+    已废弃键 `cwd_template` fail-closed：报错且不执行，不静默按"未配 cwd"处理——
+    否则旧拼写存量配置会退回兜底 '.'，在编排器自身目录跑出假绿验收证据
+    （与 _render_verify_cwd 对未解析占位的取舍同构：宁可红，不可跑错目录）。
     占位渲染见 _render_verify_cwd；不含占位的取值（M0 fixture 的 '.'）行为逐字不变。
-
-    ⚠ 待人类裁定（**尚未**写入 QUESTIONS.md——T-FIX 卡的可写路径不含该文件，已在本卡
-    汇报正文中把待录条目原文交给 Lead；在裁定落地前，别把下面这段读成"已有定论"）：
-    统一拼写为哪一个键名。当前"双键都认"是**兜底**而非裁决——它让两种写法都能跑，
-    代价是配置面比 spec 宽，且哪个才是正统仍无记录。
     """
     verify = _role_conf(config, role).get("verify")
     if not verify:
@@ -554,9 +550,12 @@ def _run_verify(config: dict, role: str) -> dict | None:
     cmd = verify.get("cmd")
     if not cmd:
         return None
-    cwd, err = _render_verify_cwd(
-        config, verify.get("cwd_template") or verify.get("cwd") or "."
-    )
+    if "cwd_template" in verify:
+        return {"exit_code": 1, "output": (
+            "verify 配置含已废弃键 'cwd_template'（Q7 裁决：字段拼写统一为 'cwd'，"
+            "spec §8.3）；已跳过执行（fail-closed，避免静默兜底在错误目录产出验收证据）"
+        )}
+    cwd, err = _render_verify_cwd(config, verify.get("cwd") or ".")
     if err is not None:
         # 渲染失败即验证失败：acceptance 按 §8.3 降级 report，且命令绝不执行。
         return {"exit_code": 1, "output": err[:2000]}

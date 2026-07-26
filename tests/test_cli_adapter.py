@@ -780,8 +780,12 @@ def test_cwd_placeholder_supports_equals_form(tmp_dir):
 # 于是：
 #   - 按 §11.1:541 原文写 cwd:"{worktree:backend}" → 占位被当成真实目录名 →
 #     NotADirectoryError → exit_code=1 → acceptance 100% 恒降级 report；
-#   - 按 §8.3:450 原文写 cwd_template → 该键根本不被读取 → 兜底 cwd="." →
+#   - 按 §8.3:450 当时原文写 cwd_template → 该键根本不被读取 → 兜底 cwd="." →
 #     验证在编排器自身进程目录里跑、可能返回 0 → **假绿**（更危险）。
+#
+# Q7 裁决（2026-07-26 采 A）后：字段拼写统一为 cwd（§8.3:450 已改 {cmd, cwd}），
+# cwd_template 成 spec 外配置面、兜底键已撤——配置写了该键 → fail-closed 报错
+# 不执行（见 test_run_verify_rejects_removed_cwd_template_key）。
 # ——————————————————————————————————————————————————————————————
 
 # 无害且跨平台的验证命令：在**当前工作目录**留下一个标记文件。
@@ -807,8 +811,13 @@ def test_run_verify_renders_worktree_role_placeholder_in_cwd(tmp_dir):
     assert (wt / _MARK).exists(), f"verify 未在 {wt} 执行：{res}"
 
 
-def test_run_verify_accepts_spec_8_3_cwd_template_field(tmp_dir):
-    """§8.3:450 原文字段名 cwd_template 必须被读取（否则静默兜底 '.' → 假绿）。"""
+def test_run_verify_rejects_removed_cwd_template_key(tmp_dir):
+    """Q7 裁决落地：已废弃键 cwd_template 不再被读——fail-closed 报错且不执行命令。
+
+    值故意给"本可解析"的 {worktree:backend}：钉死红的原因是**键本身被拒**，
+    而非占位解析失败。静默按未配 cwd 处理是反面教材——旧拼写存量配置会
+    退回兜底 '.'，在编排器自身目录跑出假绿验收证据（§16.5 方向）。
+    """
     from orch.scheduler.core import _run_verify
     wt = tmp_dir / "wt-backend"
     wt.mkdir()
@@ -819,8 +828,12 @@ def test_run_verify_accepts_spec_8_3_cwd_template_field(tmp_dir):
     }
     res = _run_verify(config, "tester")
     assert res is not None
-    assert res["exit_code"] == 0, res
-    assert (wt / _MARK).exists(), f"cwd_template 被忽略，verify 跑错目录：{res}"
+    assert res["exit_code"] != 0, f"废键 cwd_template 仍被认作 cwd：{res}"
+    # 报错要可诊断：点名废键本身，配置作者一眼定位。
+    assert "cwd_template" in res["output"], res["output"]
+    # 命令不得被执行——worktree 与编排器自身 cwd 都不该出现标记文件。
+    assert not (wt / _MARK).exists(), "fail-closed 却仍在 worktree 执行了命令"
+    assert not (Path.cwd() / _MARK).exists(), "废键被静默忽略后兜底 '.' 执行了命令"
 
 
 def test_run_verify_renders_target_repo_placeholder(tmp_dir):
@@ -831,7 +844,7 @@ def test_run_verify_renders_target_repo_placeholder(tmp_dir):
     config = {
         "target_repo": str(repo),
         "roles": {"tester": {"verify": {
-            "cmd": _MARK_CMD, "cwd_template": "{target_repo}"}}},
+            "cmd": _MARK_CMD, "cwd": "{target_repo}"}}},
     }
     res = _run_verify(config, "tester")
     assert res is not None
@@ -846,7 +859,7 @@ def test_run_verify_unresolved_placeholder_fails_closed_with_diagnosable_output(
     """
     from orch.scheduler.core import _run_verify
     config = {"roles": {"tester": {"verify": {
-        "cmd": _MARK_CMD, "cwd_template": "{worktree:nosuch}"}}}}
+        "cmd": _MARK_CMD, "cwd": "{worktree:nosuch}"}}}}
     res = _run_verify(config, "tester")
     assert res is not None
     assert res["exit_code"] != 0
@@ -896,7 +909,7 @@ def test_finalize_envelope_acceptance_degrades_when_verify_fails(tmp_dir):
         "worktrees": {"backend": str(wt)},
         "roles": {"tester": {"verify": {
             "cmd": 'python -c "raise SystemExit(3)"',
-            "cwd_template": "{worktree:backend}"}}},
+            "cwd": "{worktree:backend}"}}},
     }
     env = {"to": ["moderator"], "type": "acceptance", "body": "我测过了"}
     out = _finalize_envelope(None, config, "tester", env)
