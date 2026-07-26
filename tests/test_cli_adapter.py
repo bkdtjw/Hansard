@@ -595,3 +595,307 @@ def test_build_adapters_from_config_rejects_non_cli():
     config = {"adapters": {"a": {"kind": "api"}}, "roles": {"m": {"adapter": "a"}}}
     with pytest.raises(ValueError):
         _build_adapters_from_config(["m"], config, Path("."))
+
+
+# ——————————————————————————————————————————————————————————————
+# T-CWD：start_cmd 支持字面量 {cwd} 占位（token 级替换为本次调用 worktree）
+#
+# 动机（陪跑实测 2026-07-25）：opencode 无视进程 cwd、自寻项目根，必须靠
+# `--dir <worktree>` 显式压制；而 worktree 路径只有编排器在运行期才知道，
+# 配置里写不出来。故 start_cmd 允许写 `oc run --dir {cwd}`。
+#
+# 冻结设计（三条硬约束，测试逐条钉死）：
+#   1) 先 .split() 再逐 token 做 str.replace —— 含空格路径天然仍是**单个** argv
+#      元素，无需任何引号/转义逻辑；
+#   2) 无占位时逐字节回归原状（str.replace 未命中返回等值原串）；
+#   3) 作用域仅限 start_cmd 分词产物：不碰 tools_args，更不碰 view['text']
+#      （正文参与替换 = 给 agent 开模板注入面）。
+# 两处孪生（CliAdapter / FakeCliAdapter）必须同修同字，否则 last_argv 假绿。
+# ——————————————————————————————————————————————————————————————
+
+def test_fake_cli_adapter_start_cmd_cwd_placeholder_replaced_with_worktree(tmp_dir):
+    """{cwd} 被替换为该次调用的 worktree 绝对路径（argv 里不得残留字面占位）。"""
+    wt = tmp_dir / "wt-tester"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(
+            start_cmd="oc run --dir {cwd} --format json"),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    # (a) 任何元素都不得残留字面 "{cwd}"。
+    assert not any("{cwd}" in a for a in argv), f"argv 残留未替换占位: {argv}"
+    # (b) --dir 的取值就是 worktree。
+    assert argv[argv.index("--dir") + 1] == str(wt)
+
+
+def test_fake_cli_adapter_no_placeholder_argv_byte_identical_regression(tmp_dir):
+    """回归护栏：start_cmd 不含占位时，argv 与改造前逐元素逐字节一致。"""
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend",
+        config=_cfg_no_hardcoded_tools(tools=["Edit", "Write"]),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+    )
+    ad.invoke(_view(text="hello view"), None)
+    assert ad.last_argv == [
+        "fake-claude", "-p", "--allowedTools", "Edit", "Write", "hello view",
+    ]
+
+
+def test_fake_cli_adapter_cwd_with_spaces_stays_single_argv_element(tmp_dir):
+    """本卡核心防裂断言：含空格路径替换后仍是**单个** argv 元素，token 数不增。"""
+    wt = tmp_dir / "有 空 格" / "wt-tester"
+    wt.mkdir(parents=True)
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(start_cmd="oc run --dir {cwd}"),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    # (a) token 数与替换前相同：oc / run / --dir / <路径> / view_text。
+    assert len(argv) == 5, f"含空格路径被拆裂: {argv}"
+    # (b) --dir 取值 == 完整路径且确实含空格。
+    val = argv[argv.index("--dir") + 1]
+    assert val == str(wt)
+    assert " " in val
+
+
+def test_cli_adapter_real_class_replaces_cwd_placeholder(tmp_dir, monkeypatch):
+    """防"只改孪生不改真身"：真实 CliAdapter 同样替换 {cwd}，且 Popen 的 cwd kwarg 不变。"""
+    wt = tmp_dir / "wt-real"
+    wt.mkdir()
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = list(argv)
+            captured["cwd"] = kw.get("cwd")
+
+        def communicate(self, timeout=None):
+            return ('```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```', "")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _FakeProc)
+    inst = orch.adapters.CliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(start_cmd="oc run --dir {cwd} --format json"),
+        worktree=wt,
+    )
+    inst.invoke(_view("tester"), None)
+    argv = captured.get("argv")
+    assert argv is not None
+    assert not any("{cwd}" in a for a in argv), f"真身 argv 残留未替换占位: {argv}"
+    assert argv[argv.index("--dir") + 1] == str(wt)
+    # 新增替换不得改动既有 cwd 行为（§7.2：子进程 cwd 仍是 worktree）。
+    assert captured.get("cwd") == str(wt)
+
+
+def test_fake_and_real_argv_twins_agree_on_cwd_placeholder(tmp_dir, monkeypatch):
+    """孪生一致性护栏：同 config + 同 worktree 下两处 argv 逐元素相等。"""
+    wt = tmp_dir / "wt-twin"
+    wt.mkdir()
+    cfg = _cfg_no_hardcoded_tools(
+        start_cmd="oc run --dir {cwd}", tools=["Edit", "Write"])
+    view = _view("tester", text="twin view")
+    reply = '```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```'
+
+    fake = orch.adapters.FakeCliAdapter(
+        role="tester", config=cfg, worktree=wt, scripted_output=reply)
+    fake.invoke(view, None)
+
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = list(argv)
+
+        def communicate(self, timeout=None):
+            return (reply, "")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _FakeProc)
+    orch.adapters.CliAdapter(
+        role="tester", config=cfg, worktree=wt).invoke(view, None)
+
+    assert fake.last_argv == captured.get("argv")
+
+
+def test_cwd_placeholder_not_applied_to_view_text(tmp_dir):
+    """作用域最小化：view['text'] 正文里的 {cwd} 原样保留（不给 agent 开模板注入面）。"""
+    wt = tmp_dir / "wt-noinject"
+    wt.mkdir()
+    text = "请解释配置里 {cwd} 这个占位的含义"
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(),  # start_cmd 无占位
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```',
+    )
+    ad.invoke(_view("tester", text=text), None)
+    assert ad.last_argv[-1] == text
+    assert "{cwd}" in ad.last_argv[-1]
+
+
+def test_cwd_placeholder_supports_equals_form(tmp_dir):
+    """等号式 `--dir={cwd}` 与分离式同样支持，且仍是单 token。"""
+    wt = tmp_dir / "wt-eq"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(start_cmd="oc run --dir={cwd}"),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    assert argv.count("--dir=" + str(wt)) == 1
+    assert not any("{cwd}" in a for a in argv)
+
+
+# ——————————————————————————————————————————————————————————————
+# T-CWD 附带缺口：§8.3 verify 钩子的 cwd 占位渲染（{worktree:role} / {target_repo}）
+#
+# 本组测的是 orch.scheduler.core，本应另起测试文件；受本卡可写路径白名单
+# （只含 tests/test_cli_adapter.py）限制暂寄存于此，Lead 可后续搬迁。
+#
+# 缺口现状（裁决实测）：core._run_verify 只读 verify['cwd'] 且**不做任何占位渲染**，
+# 于是：
+#   - 按 §11.1:541 原文写 cwd:"{worktree:backend}" → 占位被当成真实目录名 →
+#     NotADirectoryError → exit_code=1 → acceptance 100% 恒降级 report；
+#   - 按 §8.3:450 原文写 cwd_template → 该键根本不被读取 → 兜底 cwd="." →
+#     验证在编排器自身进程目录里跑、可能返回 0 → **假绿**（更危险）。
+# ——————————————————————————————————————————————————————————————
+
+# 无害且跨平台的验证命令：在**当前工作目录**留下一个标记文件。
+# 用落盘标记而非打印 cwd 做断言，避开 Windows cp936 管道解码 CJK 路径的噪声。
+_MARK = "verify_ran.txt"
+_MARK_CMD = 'python -c "open(\'%s\',\'w\').close()"' % _MARK
+
+
+def test_run_verify_renders_worktree_role_placeholder_in_cwd(tmp_dir):
+    """§11.1:541 原文形态 cwd:"{worktree:backend}" → 渲染为该角色 worktree 并在其中执行。"""
+    from orch.scheduler.core import _run_verify
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    config = {
+        "worktrees": {"backend": str(wt)},
+        "roles": {"tester": {"verify": {
+            "cmd": _MARK_CMD, "cwd": "{worktree:backend}"}}},
+    }
+    res = _run_verify(config, "tester")
+    assert res is not None
+    assert res["exit_code"] == 0, res
+    # 硬证据：命令确实在渲染后的 worktree 里执行（而非编排器自身 cwd）。
+    assert (wt / _MARK).exists(), f"verify 未在 {wt} 执行：{res}"
+
+
+def test_run_verify_accepts_spec_8_3_cwd_template_field(tmp_dir):
+    """§8.3:450 原文字段名 cwd_template 必须被读取（否则静默兜底 '.' → 假绿）。"""
+    from orch.scheduler.core import _run_verify
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    config = {
+        "worktrees": {"backend": str(wt)},
+        "roles": {"tester": {"verify": {
+            "cmd": _MARK_CMD, "cwd_template": "{worktree:backend}"}}},
+    }
+    res = _run_verify(config, "tester")
+    assert res is not None
+    assert res["exit_code"] == 0, res
+    assert (wt / _MARK).exists(), f"cwd_template 被忽略，verify 跑错目录：{res}"
+
+
+def test_run_verify_renders_target_repo_placeholder(tmp_dir):
+    """§8.3:450 第二个占位 {target_repo} 同样渲染。"""
+    from orch.scheduler.core import _run_verify
+    repo = tmp_dir / "repo"
+    repo.mkdir()
+    config = {
+        "target_repo": str(repo),
+        "roles": {"tester": {"verify": {
+            "cmd": _MARK_CMD, "cwd_template": "{target_repo}"}}},
+    }
+    res = _run_verify(config, "tester")
+    assert res is not None
+    assert res["exit_code"] == 0, res
+    assert (repo / _MARK).exists(), f"{{target_repo}} 未渲染：{res}"
+
+
+def test_run_verify_unresolved_placeholder_fails_closed_with_diagnosable_output(tmp_dir):
+    """占位解析不了必须 fail-closed：非 0 退出码 + 输出点名那个占位，且不执行命令。
+
+    反面教材是静默兜底 '.'——那会让验收证据来自错误目录。
+    """
+    from orch.scheduler.core import _run_verify
+    config = {"roles": {"tester": {"verify": {
+        "cmd": _MARK_CMD, "cwd_template": "{worktree:nosuch}"}}}}
+    res = _run_verify(config, "tester")
+    assert res is not None
+    assert res["exit_code"] != 0
+    # 报错要可诊断：点名未解析的占位本身，而不是一句 NotADirectoryError。
+    assert "{worktree:nosuch}" in res["output"], res["output"]
+    # 命令不得被执行（编排器自身 cwd 不该多出标记文件）。
+    assert not (Path.cwd() / _MARK).exists()
+
+
+def test_run_verify_plain_cwd_unchanged_regression(tmp_dir):
+    """回归护栏：不含占位的 cwd（M0 fixture 形态 '.'）行为逐字不变。"""
+    from orch.scheduler.core import _run_verify
+    config = {"roles": {"tester": {"verify": {
+        "cmd": 'python -c "print(1)"', "cwd": "."}}}}
+    res = _run_verify(config, "tester")
+    assert res is not None
+    assert res["exit_code"] == 0
+    assert "1" in res["output"]
+
+
+def test_finalize_envelope_acceptance_survives_spec_11_1_config(tmp_dir):
+    """演示链端到端：按 §11.1:541 原文配置发 acceptance，type 必须**保持** acceptance。
+
+    这是"验收钩子看起来没生效"的真正判据——占位渲染缺失时本用例恒红（被降级为 report）。
+    """
+    from orch.scheduler.core import _finalize_envelope
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    config = {
+        "worktrees": {"backend": str(wt)},
+        "roles": {"tester": {"verify": {
+            "cmd": 'python -c "raise SystemExit(0)"',
+            "cwd": "{worktree:backend}"}}},
+    }
+    env = {"to": ["moderator"], "type": "acceptance", "body": "我测过了"}
+    out = _finalize_envelope(None, config, "tester", env)
+    assert out["meta"]["verify"]["exit_code"] == 0, out
+    assert out["type"] == "acceptance", out
+
+
+def test_finalize_envelope_acceptance_degrades_when_verify_fails(tmp_dir):
+    """§8.3 反向护栏：渲染成功但命令退出码非 0 → 仍降级 report（不得被本卡改坏）。"""
+    from orch.scheduler.core import _finalize_envelope
+    wt = tmp_dir / "wt-backend"
+    wt.mkdir()
+    config = {
+        "worktrees": {"backend": str(wt)},
+        "roles": {"tester": {"verify": {
+            "cmd": 'python -c "raise SystemExit(3)"',
+            "cwd_template": "{worktree:backend}"}}},
+    }
+    env = {"to": ["moderator"], "type": "acceptance", "body": "我测过了"}
+    out = _finalize_envelope(None, config, "tester", env)
+    assert out["meta"]["verify"]["exit_code"] == 3, out
+    assert out["type"] == "report", out

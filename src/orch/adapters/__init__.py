@@ -406,6 +406,28 @@ def _build_allowed_tools_args(config: dict, tools: list[str]) -> list[str]:
     return [flag, *[str(t) for t in tools]]
 
 
+def _start_cmd_argv(start_cmd, worktree) -> list[str]:
+    """把 start_cmd 分词为 argv 前缀，并把字面量 ``{cwd}`` 替换为本次调用的 worktree。
+
+    背景：opencode 无视进程 cwd、自寻项目根（陪跑实测 2026-07-25），必须靠
+    ``--dir <worktree>`` 显式压制；而 worktree 路径只有运行期才知道，配置里写不出来。
+
+    三条约束（改动前先读，别照搬"整串 replace 再 split"）：
+      1) **先 split 再逐 token replace**。整串替换后再 ``.split()`` 会把含空格的
+         Windows 路径裂成多个 argv 元素，且无法靠引号补救（``str.split`` 不解析引号）。
+         在单个 token 内部做子串替换，产物天然仍是一个 argv 元素，零转义逻辑。
+      2) 无占位时逐字节回归：``str.replace`` 未命中返回等值原串，故整条 argv 与
+         改造前完全一致（既有 config / 测试零影响）。
+      3) 作用域只到 start_cmd 的分词产物——不含 tools_args（flag 与工具名，无 cwd
+         语义），更不含 ``view['text']``（正文是 agent 可写的，若参与替换等于开一条
+         模板注入面）。分离式 ``--dir {cwd}`` 与等号式 ``--dir={cwd}`` 天然都支持。
+
+    CliAdapter 与 FakeCliAdapter 两处 argv 组装**必须**共用本函数：孪生单边漂移会让
+    基于 last_argv 的断言给出假绿。
+    """
+    return [tok.replace("{cwd}", str(worktree)) for tok in str(start_cmd).split()]
+
+
 class CliAdapter:
     """CLI 型适配器骨架（spec §7.2）。
 
@@ -459,7 +481,8 @@ class CliAdapter:
         tools_args = _build_allowed_tools_args(
             self.config, list(self.caps.get("tools", []) or [])
         )
-        cmd = start_cmd.split() + tools_args + [str(view["text"])]
+        # start_cmd 里的字面量 {cwd} → 本次调用的 worktree（token 级替换，见 _start_cmd_argv）。
+        cmd = _start_cmd_argv(start_cmd, self.worktree) + tools_args + [str(view["text"])]
         timeout_s = int(self.config.get("timeout_s", self.caps.get("timeout_s", 0)) or 0)
         proc = subprocess.Popen(  # noqa: S603 — 冷启动子进程是 §7.2 明列职责
             cmd,
@@ -664,7 +687,9 @@ class FakeCliAdapter:
             self.config, list(self.caps.get("tools", []) or [])
         )
         self.last_argv = (
-            start_cmd.split() + tools_args + [str(view.get("text", ""))]
+            _start_cmd_argv(start_cmd, self.worktree)
+            + tools_args
+            + [str(view.get("text", ""))]
         )
 
         # —— 越权/合规注入：在返回信封前执行一次（§8.2）—— #

@@ -13,6 +13,7 @@ mock 角色无 worktree → 跳过 autocommit 与越权审计（§4.5，契约 �
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
 from itertools import groupby
@@ -490,11 +491,57 @@ def _render_for_dispatch(store, config: dict, role: str, event_ids: list[int],
     return delta, resume_sess
 
 
+# §8.3 verify 工作目录占位：{worktree:<role>} 与 {target_repo} 两种（spec 行450）。
+_VERIFY_CWD_PLACEHOLDER = re.compile(r"\{(target_repo|worktree:[^{}]+)\}")
+
+
+def _render_verify_cwd(config: dict, raw: str) -> tuple[str | None, str | None]:
+    """渲染 §8.3 的 verify 工作目录占位。返回 (cwd, err)，二者恰有一个非 None。
+
+    - `{worktree:<role>}` → config['worktrees'][<role>]（由 cli.main 在建 worktree 后写回）；
+    - `{target_repo}`     → config['target_repo']。
+
+    **fail-closed**：任何占位解析不出（或渲染后仍残留花括号）→ 返回 err，调用方
+    直接判失败、**不执行命令**。理由：静默兜底 '.' 会让 verify 在编排器自己的进程
+    目录里跑出 exit_code=0，acceptance 据此生效——"验收硬证据"最不该有的失效模式
+    （§8.3 末句 / §16.5）。宁可红，不可跑错目录。
+    """
+    unresolved: list[str] = []
+
+    def _repl(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        if key == "target_repo":
+            val = (config or {}).get("target_repo")
+        else:
+            wt = _role_worktree(config, key.split(":", 1)[1].strip())
+            val = str(wt) if wt is not None else None
+        if not val:
+            unresolved.append(m.group(0))
+            return m.group(0)
+        return str(val)
+
+    out = _VERIFY_CWD_PLACEHOLDER.sub(_repl, str(raw))
+    # 残留花括号 = 未识别的占位方言（如 {worktree} / {branch}），同样按未解析处理。
+    leftovers = unresolved + (
+        [] if ("{" not in out and "}" not in out) else [out]
+    )
+    if leftovers:
+        return None, (
+            f"verify cwd 占位无法解析: {raw!r}（未解析: {'、'.join(dict.fromkeys(leftovers))}）"
+            "；已跳过执行（§8.3 fail-closed，避免在错误目录产出假绿验收证据）"
+        )
+    return out, None
+
+
 def _run_verify(config: dict, role: str) -> dict | None:
     """§8.3 验证钩子：回复为 acceptance 时编排器亲自执行 role.verify.cmd。
 
     返回 {'exit_code': int, 'output': str}；未配置 verify 时返回 None。
-    cwd 占位（{worktree:role}/{target_repo}）在 M2 落地；M0 fixture 用无害命令 + cwd='.'。
+
+    工作目录字段名：spec 自身两处不一致——§8.3(行450) 写 `cwd_template`，§11.1 示例
+    (行541) 写 `cwd`。二者指同一字段，故**两个键名都认**（cwd_template 优先），
+    否则按其中一种写法配置就会被静默忽略。已升级人类裁定统一拼写（见 QUESTIONS）。
+    占位渲染见 _render_verify_cwd；不含占位的取值（M0 fixture 的 '.'）行为逐字不变。
     """
     verify = _role_conf(config, role).get("verify")
     if not verify:
@@ -502,7 +549,12 @@ def _run_verify(config: dict, role: str) -> dict | None:
     cmd = verify.get("cmd")
     if not cmd:
         return None
-    cwd = verify.get("cwd") or "."
+    cwd, err = _render_verify_cwd(
+        config, verify.get("cwd_template") or verify.get("cwd") or "."
+    )
+    if err is not None:
+        # 渲染失败即验证失败：acceptance 按 §8.3 降级 report，且命令绝不执行。
+        return {"exit_code": 1, "output": err[:2000]}
     try:
         proc = subprocess.run(
             cmd, shell=True, cwd=cwd, capture_output=True, text=True,
