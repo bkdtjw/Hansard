@@ -612,3 +612,15 @@ acceptance 也过不了钩子——两层故障叠着。
 - Cancelled 类输出修后走"无 json 块"ValueError → §5.1 原地重调 + §5.6.3 第 2 条
   连败计数,连续 3 次照样跳闸——分层恰好是 spec 想要的:取消/截断是质量或瞬时
   问题,重试;真额度报错(stderr)即时跳闸。
+
+### 三缺陷卡集成(2026-07-26,Lead 收卡)
+
+三张 chip 卡各自独立 worktree 施工,Lead 逐卡三步收卡(diff 白名单审计零越权/
+各自 worktree 亲跑 pytest 全绿 420/422/417/commit 已在卡内),按依赖序 --no-ff
+合入 main:编码修复(e6dd286)→ cwd_template 撤除(6a908f3)→ 429 误判修复
+(0fe011c)。Lead 集成胶水仅两处:①NOTES 三家同点追加的合并冲突,保序缝合
+(Q7 收尾在前、429 修复在后),并把 429 节标题级别从 ## 归一为本文件惯例 ###;
+②core.py _run_verify 被编码卡与撤键卡同函数改动,ort 自动缝合,Lead 亲读确认
+废键拒收与 encoding 参数共存无损。集成门:全量 425 passed, 5 skipped +
+混沌门 --chaos-m5 429 passed, 1 skipped,均 exit 0。
+新增待决:Q9(§5.6.3 子串口径对十六进制串撞击,429 卡升级,推荐 A 维持)。
