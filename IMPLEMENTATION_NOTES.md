@@ -624,3 +624,5 @@ acceptance 也过不了钩子——两层故障叠着。
 废键拒收与 encoding 参数共存无损。集成门:全量 425 passed, 5 skipped +
 混沌门 --chaos-m5 429 passed, 1 skipped,均 exit 0。
 新增待决:Q9(§5.6.3 子串口径对十六进制串撞击,429 卡升级,推荐 A 维持)。
+→ Q9 同日获用户裁决采 A:维持子串口径,spec 与实现零改动;残留 stderr 撞击
+风险接受(有 enable 恢复路径),中文 pattern 兼容性为决定性论据。当前待决归零。
