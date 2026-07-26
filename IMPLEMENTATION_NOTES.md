@@ -588,3 +588,27 @@ acceptance 也过不了钩子——两层故障叠着。
 - 先红后绿:test_run_verify_rejects_removed_cwd_template_key(红于旧实现 exit=0);
   3 条既有承载用例({target_repo}/fail-closed/降级)同步改写为 cwd 键。全仓 grep
   cwd_template 配置读点归零(余者皆为拒收实现、拒收测试与 NOTES/QUESTIONS 史料)。
+
+### unavailable_patterns 误判修复(2026-07-26,缺陷修复会话)
+
+- 实证:code-ws adapter_state ts=1785037196,grok_chat 被记"命中特征 '429'",
+  reason 摘要就是 stdout 全文——stopReason=Cancelled 正常输出里 sessionId
+  (UUIDv7 尾 "…0758bd76e429")撞 '429' 子串。
+- 根因定性:**实现越界,非 spec 缺陷**。spec §5.6.3 第 1 条与 m5-contract §2
+  列举的分类输入只有 stderr / 进程退出信息 / 无输出错误;实现却把 stdout 正文
+  塞进了两个调用点(无 json 块路径 `stderr, _exit_info, stdout`;超时排空路径
+  `exc.stderr, exc.output, drained_err, drained_out`)。修法=收窄回字面列举,
+  移除两处 stdout 侧输入(adapters/__init__.py);ApiAdapter 路径传的异常消息
+  属"错误文本",不动。测试先行 3 用例(2 红 1 守卫,test_m5_adapters.py ⑨ 区块):
+  stdout UUID 不跳闸 ×2、stderr 真 429 仍跳闸 ×1;既有超时用例的特征文本本就在
+  stderr 侧,零回归。
+- 澄清(更正上节"语义差异建议 §5.6.3 挑明"):经查 spec 原文**已明文挑明**——
+  §5.6.3"满足其一即置 disabled",第 1 条特征命中"→ 立即跳闸"且"不计 attempts",
+  第 2 条才是 fail_streak ≥ trip_after。pattern 命中绕过连败计数是 spec 字面
+  语义,现状实现与 spec 一致,无矛盾无缺口,不入 QUESTIONS。
+- 残留升级:列举之内的文本(stderr/异常消息)含十六进制串仍可撞子串;"子串"是
+  spec 明文口径,修订属修宪 → QUESTIONS.md Q9(推荐 A 维持:实测 `\b额度\b`
+  不命中"本月额度已用尽",词边界方案必打红中文 pattern 用例)。
+- Cancelled 类输出修后走"无 json 块"ValueError → §5.1 原地重调 + §5.6.3 第 2 条
+  连败计数,连续 3 次照样跳闸——分层恰好是 spec 想要的:取消/截断是质量或瞬时
+  问题,重试;真额度报错(stderr)即时跳闸。

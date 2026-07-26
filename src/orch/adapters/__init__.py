@@ -110,6 +110,10 @@ def _classify_unavailable(config: dict, *texts: object) -> str | None:
     """传输级报错文本命中特征 → 返回 detail 摘要；未命中 / 无文本 → None。
 
     匹配口径（§5.6.3 第 1 条 + §17 裁决）：**大小写不敏感子串**。
+    输入边界（§5.6.3 第 1 条字面列举）：只接受 stderr / 进程退出信息 / 错误文本
+    （异常消息）三类；**禁止**传 stdout 正文——正常输出里的十六进制串
+    （sessionId/UUID）会撞上 '429' 这类子串清单（code-ws 误跳闸实证，
+    ts=1785037196：UUIDv7 尾 "…0758bd76e429" 被记"命中特征 '429'"）。
     "无文本"（如超时且管道空）→ 不分类，走既有失败路径（契约 §2："未命中 → 既有
     失败路径不变"，无文本自然也无从命中）。
     """
@@ -132,7 +136,7 @@ def _exit_info(proc: object) -> str:
 
 
 def _drain_after_kill(proc: object) -> tuple[str, str]:
-    """kill 后排空管道（既有行为，调用次数不变），把读到的文本交给分类器。"""
+    """kill 后排空管道（既有行为，调用次数不变）；仅 stderr 侧交给分类器。"""
     drained = proc.communicate()  # type: ignore[attr-defined]
     if isinstance(drained, tuple) and len(drained) == 2:
         return _as_text(drained[0]), _as_text(drained[1])
@@ -497,15 +501,15 @@ class CliAdapter:
             stdout, stderr = proc.communicate(timeout=timeout_s or None)
         except subprocess.TimeoutExpired as exc:
             proc.kill()
-            drained_out, drained_err = _drain_after_kill(proc)
-            # 超时属传输级失败：kill 后能读到的报错文本仍要过一遍特征匹配（§5.6.3-1）；
+            _drained_out, drained_err = _drain_after_kill(proc)
+            # 超时属传输级失败：kill 后能读到的 stderr 仍要过一遍特征匹配（§5.6.3-1）。
+            # stdout 侧（exc.output / 排空读到的正文）不进分类——不属 §5.6.3 列举的
+            # 三类报错文本，且正常输出里的 UUID 会撞子串清单（见 _classify_unavailable）。
             # 无文本可判 → 不分类，既有 TimeoutError 路径逐字不变。
             detail = _classify_unavailable(
                 self.config,
                 getattr(exc, "stderr", None),
-                getattr(exc, "output", None),
                 drained_err,
-                drained_out,
             )
             if detail is not None:
                 raise AdapterUnavailableError(self.adapter_name, detail) from exc
@@ -517,8 +521,10 @@ class CliAdapter:
         block = _extract_last_json_block(agent_text or "")
         if block is None:
             # 无输出 / 进程失败（拿不到信封块）——传输级失败，先分类后回落既有路径。
+            # 分类输入只有 stderr 与退出信息（§5.6.3 列举）；stdout 正文不进分类
+            # ——stopReason=Cancelled 之类正常输出里的 sessionId 会撞 '429' 误跳闸。
             detail = _classify_unavailable(
-                self.config, stderr, _exit_info(proc), stdout,
+                self.config, stderr, _exit_info(proc),
             )
             if detail is not None:
                 raise AdapterUnavailableError(self.adapter_name, detail)

@@ -507,3 +507,65 @@ def test_mock_rejects_unknown_key_by(tmp_dir):
     """key_by 只允许 'event' | 'call'；其它值构造即报错（不猜测、不静默降级）。"""
     with pytest.raises(ValueError):
         _mock(tmp_dir, {}, key_by="role")
+
+
+# ——————————————————————————————————————————————————————————————
+# ⑨ 匹配范围＝spec §5.6.3 第 1 条字面列举（stderr / 进程退出信息 / 无输出错误）
+#    ——stdout 正文不进特征分类（code-ws 误跳闸实证回归）
+# ——————————————————————————————————————————————————————————————
+
+# 实证样本（orch-demos/code-ws/adapter_state.json，ts=1785037196 那次误跳闸）：
+# grok stopReason=Cancelled 的**正常 stdout**，sessionId（UUIDv7）尾部
+# "…0758bd76e429" 撞上默认清单 '429' 子串，grok_chat 被记
+# "命中特征 '429'" 跳闸。该文本不属 §5.6.3 列举的三类传输级报错文本，
+# 只该走"无 json 块"的既有 ValueError 路径（§5.1 原地重调 + 第 2 条连败计数）。
+_CANCELLED_JSON_STDOUT = (
+    '{ "text": "I\'ll run the roman numeral tests and report results in the '
+    'required JSON envelope.", "stopReason": "Cancelled", '
+    '"sessionId": "019f9c81-e60e-7fb3-b36c-0758bd76e429", "requestId": "req-1" }'
+)
+
+
+def test_cli_stdout_uuid_hex_must_not_trip(tmp_dir, monkeypatch):
+    """stdout 正文里 UUID 撞 '429' 子串 → 不得跳闸；既有 ValueError 路径逐字不变。"""
+    wt = tmp_dir / "wt"
+    wt.mkdir()
+    _install_fake_popen(
+        monkeypatch, stdout=_CANCELLED_JSON_STDOUT, stderr="", returncode=0,
+    )
+    ad = orch.adapters.CliAdapter(role="backend", config=_cli_cfg(), worktree=wt)
+    with pytest.raises(ValueError) as ei:
+        ad.invoke(_view(), None)
+    assert not isinstance(ei.value, orch.adapters.AdapterUnavailableError)
+    assert "no ```json block in stdout" in str(ei.value)
+
+
+def test_cli_timeout_drained_stdout_uuid_must_not_trip(tmp_dir, monkeypatch):
+    """超时 kill 后排空：stdout 侧 UUID 不分类；stderr 无特征 → 既有 TimeoutError。"""
+    wt = tmp_dir / "wt"
+    wt.mkdir()
+    cap = _install_fake_popen(
+        monkeypatch, simulate_timeout=True,
+        after_kill=(_CANCELLED_JSON_STDOUT, ""),
+    )
+    ad = orch.adapters.CliAdapter(role="backend", config=_cli_cfg(), worktree=wt)
+    with pytest.raises(TimeoutError) as ei:
+        ad.invoke(_view(), None)
+    assert not isinstance(ei.value, orch.adapters.AdapterUnavailableError)
+    assert cap["killed"] is True, "§7.2 超时必须 kill 子进程"
+
+
+def test_cli_stderr_real_429_still_trips_even_with_uuid_stdout(tmp_dir, monkeypatch):
+    """对照守卫：stderr 真 429 报错仍须跳闸——收窄的是扫描范围，不是清单效力。"""
+    wt = tmp_dir / "wt"
+    wt.mkdir()
+    _install_fake_popen(
+        monkeypatch,
+        stdout=_CANCELLED_JSON_STDOUT,
+        stderr="HTTP 429 Too Many Requests: rate limit exceeded",
+        returncode=1,
+    )
+    ad = orch.adapters.CliAdapter(role="backend", config=_cli_cfg(), worktree=wt)
+    with pytest.raises(orch.adapters.AdapterUnavailableError) as ei:
+        ad.invoke(_view(), None)
+    assert "429" in ei.value.detail, ei.value.detail
