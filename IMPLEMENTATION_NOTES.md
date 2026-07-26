@@ -577,3 +577,14 @@ acceptance 也过不了钩子——两层故障叠着。
   code-ws 注释"隔离仍由 worktree+审计兜底"说满(审计看不见 worktree 外写入)。
 - 销卡:task_1584e720(opencode --dir 注入)由本轮修复达成。task_bbff7655(tools
   注入位置)仍在用户另一会话,本轮明令工人未碰其领地。
+
+### Q7 落地收尾:撤 _run_verify 的 cwd_template 兜底键(2026-07-26,测试先行)
+
+- 决定:配置写了废键 cwd_template → **执行期 fail-closed**(exit_code=1、输出点名
+  废键与正统拼写 cwd、不执行命令),不选"按未配 cwd 走缺省语义"。理由:静默忽略
+  会让旧拼写存量配置退回兜底 '.',在编排器自身目录跑出假绿验收证据(§16.5 方向),
+  与 _render_verify_cwd 对未解析占位的取舍同构;且检查落在 _run_verify 执行期,
+  不越 core.py 触碰面(装载期报错须碰配置装载层)。
+- 先红后绿:test_run_verify_rejects_removed_cwd_template_key(红于旧实现 exit=0);
+  3 条既有承载用例({target_repo}/fail-closed/降级)同步改写为 cwd 键。全仓 grep
+  cwd_template 配置读点归零(余者皆为拒收实现、拒收测试与 NOTES/QUESTIONS 史料)。
