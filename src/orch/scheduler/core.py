@@ -540,8 +540,13 @@ def _run_verify(config: dict, role: str) -> dict | None:
 
     工作目录字段名：spec 自身两处不一致——§8.3(行450) 写 `cwd_template`，§11.1 示例
     (行541) 写 `cwd`。二者指同一字段，故**两个键名都认**（cwd_template 优先），
-    否则按其中一种写法配置就会被静默忽略。已升级人类裁定统一拼写（见 QUESTIONS）。
+    否则按其中一种写法配置就会被静默忽略。
     占位渲染见 _render_verify_cwd；不含占位的取值（M0 fixture 的 '.'）行为逐字不变。
+
+    ⚠ 待人类裁定（**尚未**写入 QUESTIONS.md——T-FIX 卡的可写路径不含该文件，已在本卡
+    汇报正文中把待录条目原文交给 Lead；在裁定落地前，别把下面这段读成"已有定论"）：
+    统一拼写为哪一个键名。当前"双键都认"是**兜底**而非裁决——它让两种写法都能跑，
+    代价是配置面比 spec 宽，且哪个才是正统仍无记录。
     """
     verify = _role_conf(config, role).get("verify")
     if not verify:
@@ -572,6 +577,24 @@ def _finalize_envelope(store, config: dict, role: str, env: dict) -> dict:
 
     - 系统字段（§16.11）：from=role（不信 mock 自称）；re 由调用方在 reply 里赋 event_ids。
     - §8.3：type==acceptance → 执行 verify，写 meta.verify；exit_code!=0 → 降级为 report。
+
+    **本函数不碰 store**（store 形参只为与调用点签名对齐）：它内部经 _run_verify 起
+    阻塞 subprocess，异步环因此把整个调用丢进 asyncio.to_thread（async_core），而
+    to_thread 里的 sqlite 写入会跨线程用同一连接。若日后要在此处写盘，**必须**同步
+    改掉 async_core 的 to_thread 包裹，否则就是一个静默的跨线程连接误用。
+    降级需要追加的 system 提示因此不在此发出，改由调用方按 _verify_downgrade_note
+    在锁内追加（与 §3.2 降级审计同一姿势）。
+
+    ⚠ 未配 verify 的角色：acceptance 原样放行（meta 里连 verify 键都没有）。这处
+    "可选性"来自 §8.3 行450"config **可为**角色配置"，而同节行452 写"meta.verify.
+    exit_code == 0 是 acceptance 生效的必要条件"——按字面，没有 meta.verify 就不满足
+    必要条件、应当降级。两句张力的解法（是"没配就不能发生效 acceptance"，还是
+    "没配就免检"）属**须人类裁定**，本函数**有意不做单方裁决**：
+      - 按字面收紧会把既有绿基线打红（tests/test_m2_e2e.py 的 tester 未配 verify，
+        该用例断言 acceptance 必须出现在 types_seen），那是改语义而非修 bug；
+      - 保持现状则等于放行"我测过了"，正是 §16.5 点名的反模式。
+    在裁定落地前的**可行缓解**在配置层：凡可能发 acceptance 的角色都配上 verify
+    （演示床 orch-demos/{oc,code}-ws/config.yaml 已按此补齐）。
     """
     out = dict(env)
     out["from"] = role  # 权威赋值，覆盖 mock 任何自称（§3.1/§16.11）。
@@ -586,6 +609,37 @@ def _finalize_envelope(store, config: dict, role: str, env: dict) -> dict:
                 out["type"] = "report"
     out["meta"] = meta
     return out
+
+
+# system 提示里搬运的 verify 输出上限（取**尾部**：pytest -q 的 short summary、多数
+# CLI 的报错行都落在末尾；meta.verify.output 本身已被 _run_verify 截成前 2000 字）。
+_VERIFY_NOTE_TAIL = 1000
+
+
+def _verify_downgrade_note(role: str, env: dict, reply: dict) -> str | None:
+    """§8.3 行452 后半句"降级为 report **并追加 system 提示**"的提示正文。
+
+    返回 None = 本次没有发生 verify 降级。判据三重锁死，避免与 §3.2 发送者约束降级
+    混淆：作者原 type == acceptance、定稿 type == report、meta.verify.exit_code != 0。
+
+    为什么提示里**必须**带 verify 输出：verify 结果只落在事件的 meta_json，而渲染层
+    从不把 meta 投影进任何角色视图（§6.2/§6.3 只出 from/to/type/body）。不把失败详情
+    搬进 body，下游 moderator 就看不到究竟哪条用例红了，只能照 agent 正文措辞泛泛开
+    defect——系统侧证据拿到了却送不到需要它的人手上，等于绕回 §16.5。
+    """
+    if (env or {}).get("type") != "acceptance" or reply.get("type") != "report":
+        return None
+    vres = (reply.get("meta") or {}).get("verify")
+    if not isinstance(vres, dict) or vres.get("exit_code") == 0:
+        return None
+    output = str(vres.get("output") or "")
+    tail = output[-_VERIFY_NOTE_TAIL:]
+    elided = "（前略）" if len(output) > _VERIFY_NOTE_TAIL else ""
+    return (
+        f"§8.3 验收降级：role={role} 的 acceptance 未通过编排器执行的 verify"
+        f"（exit_code={vres.get('exit_code')}），已降级为 report。"
+        f"\nverify 输出{elided}：\n{tail}"
+    )
 
 
 def _enforce_sender_constraint(config: dict, reply: dict) -> str | None:
@@ -1181,6 +1235,10 @@ def _dispatch_group_once(
 
     # 定稿信封：系统字段 from + §8.3 verify 钩子（含 acceptance 降级）。
     reply = _finalize_envelope(store, config, target, env)
+    # §8.3 行452 后半句：verify 降级要**追加 system 提示**。在此**紧接定稿**推导提示
+    # 正文（此时 reply['type'] 还没被 §3.2 动过，判据不会串味），事件本身与 §3.2 那条
+    # 一样在回复落盘之后追加（同 §3.3 bb_ops 越权处理的次序）。
+    verify_note = _verify_downgrade_note(target, env, reply)
     # 权威赋值 re = 本批全部 event_ids（§3.1/§16.11）。
     reply["re"] = list(event_ids)
 
@@ -1221,6 +1279,12 @@ def _dispatch_group_once(
     # 持久化——mock 无会话 → 不落基线 → 下轮仍冷启动（零扰动）。
     if session_upsert is not None:
         _persist_resume_state(store, config, target, event_ids, sess)
+
+    # §8.3 行452：verify 未过导致的降级 → 追加 system 提示，正文带退出码 + 输出摘要
+    # （meta 不进任何角色视图，不搬进 body 下游就看不见失败详情）。to=moderator，与
+    # §3.2 降级审计同一投递约定：由它决定回环给谁修。
+    if verify_note is not None:
+        append_system_event(store, body=verify_note, to=["moderator"])
 
     # §3.2：越权已降级 report 落盘 → 追加一条 system 审计事件（编排器权威 from=system，§16.11）。
     if downgraded_from is not None:

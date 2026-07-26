@@ -82,6 +82,7 @@ from orch.scheduler.core import (
     _session_row,
     _timeout_for,
     _transport_failure_fallout,
+    _verify_downgrade_note,
     _view_with_retry_note,
     _write_scope,
 )
@@ -440,8 +441,17 @@ async def _dispatch_group_async_once(
     # worktree、autocommit 为 no-op 时位置依然存在，照样触发。
     orch.store.fault_check("autocommit_post")
 
-    # 定稿信封 + 系统字段 + verify 钩子
-    reply = _finalize_envelope(store, config, target, env)
+    # 定稿信封 + 系统字段 + verify 钩子。
+    # **必须走 to_thread**：_finalize_envelope 内的 §8.3 verify 是阻塞 subprocess.run
+    # （上限 verify.timeout_s，缺省 120s）。裸调会把整个事件循环焊死那么久——§5.1 写域
+    # 并行批内的其它角色协程、§9.3 run_workspace 里 gather 的其余线程全部陪跑。本文件
+    # 其余阻塞调用（invoke / autocommit / audit_write_scope / reset_hard）已一律 to_thread，
+    # 此处同源。前提见 core._finalize_envelope 文档：它不碰 store（否则跨线程用同一
+    # sqlite 连接），改那边要同步改这里。
+    reply = await asyncio.to_thread(_finalize_envelope, store, config, target, env)
+    # §8.3 行452 后半句（与 core._dispatch_group 同源同修）：紧接定稿推导降级提示正文，
+    # 此时 reply['type'] 尚未被 §3.2 改动，判据不会与发送者约束降级串味。
+    verify_note = _verify_downgrade_note(target, env, reply)
     reply["re"] = list(event_ids)
 
     # §3.2 发送者约束
@@ -470,6 +480,11 @@ async def _dispatch_group_async_once(
         # R-T3（§16.9）：会话 upsert 后持久化本轮热续判据基线（last_evt/bb_version/gen）。
         if session_upsert is not None:
             _persist_resume_state(store, config, target, event_ids, sess)
+
+        # §8.3 行452：verify 降级 → 追加 system 提示（与 core._dispatch_group 同源同修；
+        # 两条环缺一边 = 并发路径上静默失明）。
+        if verify_note is not None:
+            append_system_event(store, body=verify_note, to=["moderator"])
 
         if downgraded_from is not None:
             append_system_event(

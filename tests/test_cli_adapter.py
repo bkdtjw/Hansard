@@ -20,6 +20,9 @@ M2 边界（任务卡红线）：
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -899,3 +902,256 @@ def test_finalize_envelope_acceptance_degrades_when_verify_fails(tmp_dir):
     out = _finalize_envelope(None, config, "tester", env)
     assert out["meta"]["verify"]["exit_code"] == 3, out
     assert out["type"] == "report", out
+
+
+# ——————————————————————————————————————————————————————————————
+# T-FIX（评审回环）：§8.3 verify 钩子的两处真缺口
+#
+#   F1  async_core:444 把 _finalize_envelope（内含阻塞 subprocess.run）**裸调**在
+#       事件循环上——同文件其余每个阻塞调用（invoke/autocommit/audit/reset_hard）
+#       都包了 asyncio.to_thread，唯独这一处没有。上一卡把该命令从"秒退
+#       NotADirectoryError"改成"真跑一遍 pytest"，于是把一个此前不显形的事件循环
+#       停摆变成了实活：并行批内任一角色发 acceptance → 整个 loop 卡最长 timeout_s。
+#   F2  §8.3 行452 原文是"降级为 report **并追加 system 提示**"，实现只做了前半句。
+#       而 meta 从不进任何角色视图（渲染层只投影 from/to/type/body），于是失败详情
+#       烂在 meta_json 里，下游 moderator 只能靠 agent 正文措辞猜——退回 §16.5。
+#
+# 本组同样属 orch.scheduler，受本卡白名单（tests 侧仅 test_cli_adapter.py）限制
+# 寄存于此，Lead 可后续搬迁至 tests/test_async_scheduler.py。
+# ——————————————————————————————————————————————————————————————
+
+def _verify_cfg(verify: dict | None = None) -> dict:
+    """最小可跑线程配置：tester（可选配 verify）+ moderator（收尾 terminate）。"""
+    roles: dict = {
+        "tester": {"can_decide": False, "write_scope": []},
+        "moderator": {"can_decide": True, "write_scope": []},
+    }
+    if verify is not None:
+        roles["tester"]["verify"] = verify
+    return {
+        "thread_defaults": {"max_rounds": 50, "loop_limit": 5, "chat_ttl": 10},
+        "gate_ops": {},
+        "roles": roles,
+    }
+
+
+def _verify_adapters() -> dict:
+    """tester 恒发 acceptance（"我测过了"）；moderator 恒 terminate 收尾。"""
+    return {
+        "tester": orch.adapters.FakeApiAdapter(
+            role="tester", config={"kind": "api"},
+            scripted_reply={"to": ["moderator"], "type": "acceptance",
+                            "body": "我本地跑过了，10/10 全绿"},
+        ),
+        "moderator": orch.adapters.FakeApiAdapter(
+            role="moderator", config={"kind": "api"},
+            scripted_reply={"to": [], "type": "terminate", "body": "done"},
+        ),
+    }
+
+
+def _seed_thread(thread_dir):
+    """建线程 + 铺一条 human→tester 的 assign（派发起点）。"""
+    import orch.store
+    st = orch.store.Store(thread_dir)
+    st.set_meta("status", "running")
+    st.append_event(sender="human", type="assign", body="验收一下", to=["tester"])
+    return st
+
+
+def _sys_verify_events(st) -> list[dict]:
+    """取所有"verify 降级"system 事件。
+
+    双重筛：from=='system'（§16.11 编排器权威赋值）+ body 含 §8.3 标记词——后者用于
+    避开同为 system 的 §5.4 终止清单与 §3.2 发送者约束降级审计。
+    """
+    return [e for e in st.events()
+            if e.get("from") == "system" and "§8.3" in (e.get("body") or "")]
+
+
+def _events_from(st, role: str) -> list[dict]:
+    """取某角色落盘的事件（事件行的发送者字段名是 `from`，非 `sender`）。"""
+    return [e for e in st.events() if e.get("from") == role]
+
+
+# —— F1：异步派发路径不得把 verify 跑在事件循环上 ————————————————————
+
+def test_async_finalize_envelope_runs_off_event_loop(thread_dir, monkeypatch):
+    """§9.3 异步环：_finalize_envelope（内含阻塞 subprocess.run）必须走 to_thread。
+
+    判据是**确定性**的，不靠计时：探针在 _finalize_envelope 内部记录
+      (a) 当前线程 ident；(b) 此处能否取到 running loop。
+    裸调在协程里 → 取得到 loop 且线程 == 主线程；包 to_thread → 工作线程内无
+    running loop（get_running_loop 抛 RuntimeError）且 ident 与主线程不同。
+    """
+    import orch.scheduler
+    import orch.scheduler.async_core as async_core
+
+    seen: dict = {}
+    real = async_core._finalize_envelope
+
+    def _probe(store, config, role, env):
+        if (env or {}).get("type") == "acceptance":
+            seen["ident"] = threading.get_ident()
+            try:
+                asyncio.get_running_loop()
+                seen["on_loop"] = True
+            except RuntimeError:
+                seen["on_loop"] = False
+        return real(store, config, role, env)
+
+    monkeypatch.setattr(async_core, "_finalize_envelope", _probe)
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({"cmd": 'python -c "raise SystemExit(0)"', "cwd": "."})
+    main_ident = threading.get_ident()
+    asyncio.run(orch.scheduler.run_thread_async(st, cfg, _verify_adapters()))
+
+    assert "on_loop" in seen, "tester 的 acceptance 未走到 _finalize_envelope"
+    assert seen["on_loop"] is False, \
+        "§9.3：_finalize_envelope 仍在事件循环上裸调（verify 的阻塞 subprocess 会停摆整个 loop）"
+    assert seen["ident"] != main_ident, \
+        f"§9.3：_finalize_envelope 跑在主线程（ident={seen['ident']}），未走 asyncio.to_thread"
+
+
+def test_async_verify_does_not_stall_event_loop(thread_dir):
+    """实活证据：verify 真阻塞 1.5s 期间，事件循环上的心跳协程不得出现同量级空档。
+
+    心跳每 20ms 一跳，记录相邻跳的最大间隔。裸调路径下 loop 被 subprocess 卡满
+    1.5s → 最大间隔 ≥1.5s；to_thread 路径下心跳照常 → 远小于阈值。
+    阈值取 0.75s（= 阻塞时长的一半），对 Windows 定时器抖动留足两倍余量。
+    """
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({
+        "cmd": 'python -c "import time; time.sleep(1.5)"', "cwd": ".",
+    })
+
+    async def _run() -> list[float]:
+        stamps: list[float] = []
+        stop = asyncio.Event()
+
+        async def _heartbeat():
+            while not stop.is_set():
+                stamps.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        hb = asyncio.create_task(_heartbeat())
+        await orch.scheduler.run_thread_async(st, cfg, _verify_adapters())
+        stop.set()
+        await hb
+        return stamps
+
+    stamps = asyncio.run(_run())
+    assert len(stamps) >= 2, "心跳协程没跑起来，测试失效"
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    worst = max(gaps)
+    assert worst < 0.75, (
+        f"§9.3：verify 阻塞期间事件循环停摆 {worst:.2f}s"
+        "（_finalize_envelope 未包 asyncio.to_thread）"
+    )
+
+
+# —— F2：verify 降级必须追加 system 提示，且带上失败详情 ————————————————
+
+def test_verify_downgrade_appends_system_event_sync(thread_dir):
+    """§8.3 行452 后半句：acceptance 因 verify 非 0 降级 → 必须追加 system 提示。"""
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({"cmd": 'python -c "raise SystemExit(7)"', "cwd": "."})
+    orch.scheduler.run_thread(st, cfg, _verify_adapters())
+
+    # 前置：tester 那条确实被降级了（落盘 type=report，meta 里留着退出码）。
+    tester_evs = _events_from(st, "tester")
+    assert tester_evs, "tester 未落盘任何事件"
+    assert tester_evs[0]["type"] == "report", tester_evs[0]
+    assert (tester_evs[0].get("meta") or {}).get("verify", {}).get("exit_code") == 7
+
+    notes = _sys_verify_events(st)
+    assert notes, (
+        "§8.3 行452：verify 降级是**静默**发生的——没有任何 system 提示，"
+        "而 meta 不进任何角色视图，下游只能靠 agent 自述措辞猜"
+    )
+    body = notes[0]["body"]
+    assert "tester" in body, body
+    assert "7" in body, f"提示里没有退出码：{body}"
+
+
+def test_verify_downgrade_system_event_carries_failure_detail(thread_dir):
+    """提示必须搬运 verify 输出摘要——只写"降级了"等于把失败详情继续锁在 meta_json 里。
+
+    这正是联跑里 moderator 只能写四条泛化 defect、说不出失败用例名的根因。
+    """
+    import orch.scheduler
+
+    marker = "FAILED tests/test_calc.py::test_deliberate_red"
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({
+        "cmd": 'python -c "print(\'%s\'); raise SystemExit(1)"' % marker,
+        "cwd": ".",
+    })
+    orch.scheduler.run_thread(st, cfg, _verify_adapters())
+
+    notes = _sys_verify_events(st)
+    assert notes, "verify 降级未追加 system 提示"
+    assert marker in notes[0]["body"], (
+        f"system 提示未搬运 verify 输出，失败用例名仍不可见：{notes[0]['body']!r}"
+    )
+
+
+def test_verify_downgrade_system_event_reaches_moderator(thread_dir):
+    """提示要送到"需要它的人"手上：to 含 moderator（与 §3.2 降级审计同一投递约定）。"""
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({"cmd": 'python -c "raise SystemExit(1)"', "cwd": "."})
+    orch.scheduler.run_thread(st, cfg, _verify_adapters())
+
+    notes = _sys_verify_events(st)
+    assert notes, "verify 降级未追加 system 提示"
+    assert "moderator" in (notes[0].get("to") or []), notes[0]
+
+
+def test_verify_downgrade_appends_system_event_async(thread_dir):
+    """两条环对等：异步环同样追加提示（孪生单边漂移 = 并发路径上静默失明）。"""
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({"cmd": 'python -c "raise SystemExit(9)"', "cwd": "."})
+    asyncio.run(orch.scheduler.run_thread_async(st, cfg, _verify_adapters()))
+
+    notes = _sys_verify_events(st)
+    assert notes, "§9.3 异步环缺 verify 降级提示（与同步环不对等）"
+    assert "9" in notes[0]["body"], notes[0]["body"]
+
+
+def test_verify_pass_appends_no_downgrade_note(thread_dir):
+    """反向护栏：verify 通过 → acceptance 保持生效，且不得凭空多出降级提示。"""
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    cfg = _verify_cfg({"cmd": 'python -c "raise SystemExit(0)"', "cwd": "."})
+    orch.scheduler.run_thread(st, cfg, _verify_adapters())
+
+    tester_evs = _events_from(st, "tester")
+    assert tester_evs and tester_evs[0]["type"] == "acceptance", tester_evs
+    assert not _sys_verify_events(st), "verify 通过却追加了降级提示"
+
+
+def test_no_verify_configured_appends_no_downgrade_note(thread_dir):
+    """未配 verify 的角色行为逐字不变（本卡不擅自改这条语义，详见 _finalize_envelope 注释）。
+
+    §8.3 行450"可为角色配置"与行452"exit_code==0 是必要条件"的张力属**待人类裁定**，
+    本卡只负责不把它悄悄解到某一侧，并保证不产生假的降级提示。
+    """
+    import orch.scheduler
+
+    st = _seed_thread(thread_dir)
+    orch.scheduler.run_thread(st, _verify_cfg(None), _verify_adapters())
+
+    tester_evs = _events_from(st, "tester")
+    assert tester_evs and tester_evs[0]["type"] == "acceptance", tester_evs
+    assert (tester_evs[0].get("meta") or {}).get("verify") is None
+    assert not _sys_verify_events(st)
