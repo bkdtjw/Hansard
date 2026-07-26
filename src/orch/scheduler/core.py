@@ -563,6 +563,8 @@ def _run_verify(config: dict, role: str) -> dict | None:
     try:
         proc = subprocess.run(
             cmd, shell=True, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8",  # CLI 输出恒 UTF-8（adapters Q1 同款）；默认 cp936 会丢整段 output
+            errors="replace",
             timeout=float(verify.get("timeout_s", 120)),
         )
         out = (proc.stdout or "") + (proc.stderr or "")

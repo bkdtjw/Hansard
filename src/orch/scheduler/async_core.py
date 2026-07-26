@@ -703,6 +703,8 @@ def register_async_job(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",  # CLI 输出恒 UTF-8（adapters Q1 同款）；默认 cp936 会丢整段回调 output
+        errors="replace",
     )
 
     # 登记 jobs 表（M0 同步版直接 sync 调用；此处也保持同步，因为 store 单连接）。
