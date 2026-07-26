@@ -474,3 +474,24 @@ orchestrator-spec 全部里程碑（M0→M4）。执行框架不减步：分解�
 - 意义:①第 3/4 家供应商接入成本实测=配置一段+解包分支几十行(§13"从第 3 家
   起算"口径的实证);②Q2 遗留"≥2 家异构厂商"达成(grok+opencode 同线程混编);
   ③M5 降级路由首次在真实后端验证,跨厂商半途接手上下文零丢失。
+
+### 落代码演示(code-ws)联跑:两个真实缺口确诊(2026-07-26,Lead 亲做)
+- 目标:grok 当 coder 在隔离 worktree 写罗马数字转换 + tester 系统侧验收。四轮尝试
+  全部未产出可验收代码,但确诊两处真缺口(均已挂后台任务卡,不混入 M5):
+- **缺口A(task_bbff7655):长 CJK prompt 走 argv 喂 grok 必失败**。同一份编排器
+  渲染视图(3103 字符),经 `--prompt-file` 直喂 grok → 4 轮写出 src/roman.py +
+  tests/test_roman.py 并吐合法信封;经编排器 argv(`-p <TEXT>`)→ 恒"no json
+  block"、两次耗尽 attempts、触发 M5 streak 跳闸。另发现同族问题:白名单参数
+  被追加在 start_cmd **之后**,若 start_cmd 以取值型 flag(-p)结尾,实际变成
+  `-p --allow Edit …`,提示词被顶掉。修复方向:adapter config 增 prompt_via=file
+  或 tools_args_position/prompt_flag。
+- **缺口B(task_ef1a8021 的实战证据 + 新卡):opencode 不认进程 cwd**。CliAdapter
+  已设 cwd=worktree(实测 worktree 内容正确),opencode 却把 src/roman.py 写到
+  工作区根目录(线程目录上两级)。后果:§8.1 隔离失效、§8.2 审计审的是 worktree
+  故看不到改动=fail-open、agent 汇报"8 个测试全通过"且 tester 附和"pytest 9.0.2
+  全通过"——**全链路幻觉未被拆穿**。opencode 有 `--dir`,需适配器支持注入。
+- 连带印证:失败 invoke 不落日志(task_ef1a8021)在本次排障中直接致盲——只能靠
+  手工复现定位,这条从"卫生项"升级为"排障必需"。
+- 演示配置暂以"grok_coder 不声明 tools、靠 --permission-mode acceptEdits"绕过
+  缺口A的白名单部分;缺口A的 argv 部分与缺口B 未绕过,故 code-ws **尚不可用于
+  对外演示**,已如实告知用户。
