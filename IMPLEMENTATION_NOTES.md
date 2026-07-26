@@ -534,6 +534,9 @@ acceptance 也过不了钩子——两层故障叠着。
   verify 的 acceptance 放行否)。Q6 拟稿:"start_cmd/resume_cmd 支持 {cwd} 占位:
   argv 分词之后逐 token 字面替换为该角色 worktree 绝对路径;含空格路径恒单
   argv 元素;未出现占位时 argv 逐字节不变;不作用于自动注入的工具参数与视图正文"。
+  → 2026-07-26 三条均获用户裁决采 A,spec 修正案同日落地(§11.1 增 {cwd} 条款、
+  §8.3 行450 统一 cwd 拼写、行452 必要条件限定于配置了 verify 的角色);
+  遗留一件实现尾巴:core.py cwd_template 兜底键待撤(已挂卡,测试先行)。
 
 **联跑取证(oc-ws 主床 t-19eefb7c,不依赖中转站;Lead 逐项亲查 events.db/文件系统)**:
 - E3 acceptance meta.verify.exit_code=0("12 passed");E6 人为负控:往测试里插错断言

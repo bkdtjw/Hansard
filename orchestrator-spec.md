@@ -447,9 +447,9 @@ prompt 中的权限申报（§6.2）只是告知，不是防线。
 
 ### 8.3 验证钩子（acceptance 的硬证据）
 
-- config 可为角色配置 post-invoke verify：`{cmd, cwd_template}`（cwd_template 支持 `{worktree:role}` 与 `{target_repo}` 占位）。
+- config 可为角色配置 post-invoke verify：`{cmd, cwd}`（cwd 支持 `{worktree:role}` 与 `{target_repo}` 占位）。
 - 当该角色发出 acceptance 信封时，编排器**亲自执行** verify 命令，把退出码与输出摘要写入该信封 meta.verify。
-- **meta.verify.exit_code == 0 是 acceptance 生效的必要条件**；否则调度器将其降级为 report 并追加 system 提示。
+- 对配置了 verify 的角色，**meta.verify.exit_code == 0 是 acceptance 生效的必要条件**；否则调度器将其降级为 report 并追加 system 提示。未配置 verify 的角色 acceptance 原样放行——验收强度由配置层决定，关键验收角色应配置 verify。
 - 原则：agent 的"我测过了"只作路由信号；验收以编排器执行的可复现检查为准。
 
 ## 9. 崩溃恢复
@@ -541,6 +541,8 @@ roles:
               verify: {cmd: "pytest -q", cwd: "{worktree:backend}"},
               prompt: prompts/tester.md}
 ```
+
+start_cmd/resume_cmd 支持 `{cwd}` 占位：argv 分词之后逐 token 字面替换为该角色 worktree 绝对路径；含空格路径恒单 argv 元素；未出现占位时 argv 逐字节不变；不作用于自动注入的工具参数与视图正文。
 
 可用性与降级字段（§5.6）：`fallback` 为有序列表，缺省 `[]`（无备胎：不可用即等待人工处理）；`unavailable_patterns` / `trip_after` 为 adapter 级可选字段（缺省值属 §17）。装载时校验，违者启动报错：fallback 项必须是已声明的 adapter；tools 或 write_scope 非空的角色，其主绑定与 fallback 项**必须**为 cli 型（API 型不带工具循环，§7.3）。moderator **建议**配置非空 fallback（它不可用会阻塞兜底路由）。
 

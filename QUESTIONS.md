@@ -105,7 +105,8 @@ Q6 [M5后/adapters] start_cmd 新增 `{cwd}` 占位是 spec 未定义的配置�
         恒指本角色自己的工作目录，无需 role 参数化，与 Popen cwd 同名直白）；
         B 复用 §8.3 方言写 {worktree:self}（少一种方言，多一层解释）；
         C 不入宪，回退占位、改为各 adapter 硬编码 --dir（把供应商细节焊死进编排器，最差）。
-  裁决: （待人类）
+  裁决: 2026-07-26 用户裁决 → 采 A。{cwd} 条款已入 §11.1（adapters 示例块后正文一段，
+        按 NOTES 拟稿逐字）；实现（commit 2cbffad）与新条款一致，无需改动。
 
 Q7 [M5后/verify] §8.3 行450 写 `cwd_template`、§11.1 行541 示例写 `cwd`——同一字段两种拼写（spec 内部矛盾）
   背景: 本轮修 verify 钩子 cwd 占位渲染（此前完全缺失：按 §11.1 示例配置恒 NotADirectoryError
@@ -114,7 +115,9 @@ Q7 [M5后/verify] §8.3 行450 写 `cwd_template`、§11.1 行541 示例写 `cwd
   选项: A 统一为 cwd，修 §8.3 那一行文字——推荐（全部既有配置与 §11.1 示例都用 cwd，
         无任何存量用 cwd_template）；B 统一为 cwd_template，修 §11.1 示例；
         C 双键都认写进 spec（把兜底转正，代价是永久双拼写）。
-  裁决: （待人类）
+  裁决: 2026-07-26 用户裁决 → 采 A。§8.3 行450 已改 `{cmd, cwd}`；正统拼写确定后，
+        core.py _run_verify 的 cwd_template 兜底键成为 spec 外配置面，已挂卡撤除
+        （测试先行：cwd_template 键应不再被读）。
 
 Q8 [M5后/verify] 未配置 verify 的角色发 acceptance 是否原样放行
   背景: §8.3 行450"**可为**角色配置 verify"（可选）与行452"meta.verify.exit_code==0 是
@@ -126,4 +129,6 @@ Q8 [M5后/verify] 未配置 verify 的角色发 acceptance 是否原样放行
         （与 M2 验收标准自洽；验收强度交给配置，部署侧给关键角色配 verify 即可）；
         B 收紧：未配 verify 一律降级 report（最安全，但须改 spec 行450 与 M2 测试，波及大）；
         C 加全局开关 require_verify_for_acceptance（多一个配置面，§16 臃肿方向）。
-  裁决: （待人类）
+  裁决: 2026-07-26 用户裁决 → 采 A。§8.3 行452 已改"对配置了 verify 的角色…必要条件"，
+        并补一句"未配置 verify 的角色 acceptance 原样放行——验收强度由配置层决定"；
+        实现即现状，无需改动；tests/test_m2_e2e.py 保持绿。
