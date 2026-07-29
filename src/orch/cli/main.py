@@ -84,26 +84,71 @@ app.add_typer(adapter_app, name="adapter")
 # 内部工具
 # ——————————————————————————————————————————————————————————————
 
-def _read_config_file(cfg_path: Path) -> dict:
-    """读取任意路径的 config.yaml（不存在/不可解析 → 空 dict，M2 骨架宽松）。
+def _one_line(exc: BaseException) -> str:
+    """异常文本压成一行（yaml 的 MarkedYAMLError 自带多行 mark，原样塞进 JSON 很难读）。
 
-    `orch adapters` / `orch adapter …` / `orch status --config` 与 workspace 级
-    `_load_config` 共用这一份读取实现（M5-T5：不重复造第二份 yaml 装载）。
+    只压空白，**不**截断——mark 里的 "line 4, column 12" 正是运维要的定位信息。
+    """
+    return " ".join(str(exc).split())
+
+
+def _read_config_file_checked(cfg_path: Path) -> tuple[dict, str | None]:
+    """读 config.yaml，并**区分**"读不出来"与"本来就没有 / 本来就是空的"。
+
+    返回 (配置, 错误人话 或 None)：
+      · 文件不存在 / 空文件 / 合法 mapping → (配置, None)——None ⇔ "配置这侧没问题"；
+      · 语法错（YAMLError）、读不动（OSError）、顶层不是键值映射 → ({}, 一句人话)。
+
+    为什么要这层区分（本函数的存在理由，评审"应修3"）：``_read_config_file`` 把三种
+    失败一律降级成空 dict，调用方看不出"没配置"与"配置坏了"的差别。web 控制台 §12
+    角色行据此把 roles_cfg={} 的每个角色兜底成 primary=角色名，而 ``state.is_enabled``
+    对**未记录**的名字返回 True → 满屏 primary=pm/effective=pm/blocked=false 的**假
+    健康**，而真实主绑定可能正被人工停用；§12"存在无可用 adapter 的阻塞角色时必须显著
+    警示"在这条路径上恒不触发。看得见的坏配置 > 看不见的假绿。
+
+    顶层非 mapping（如整份写成 YAML 列表）同样算错误：它与语法错一样产出不可用配置，
+    放过它等于让同一个假健康缺陷换扇门再进来一次。
     """
     if not cfg_path.exists():
-        return {}
+        return {}, None
     import yaml  # pyyaml 已在 spec §14 白名单；MRO 见下，故须在 try 之外先拿到符号
+    # 【评审建议8】import 移出 try 带来的导入期语义变化：导入过程**自身**抛 OSError
+    # （如 site-packages 被删到一半）从"被吞成空配置"改为穿透。方向更正确——装不上
+    # pyyaml 是环境坏了，不是用户配置坏了，不该伪装成"这个 workspace 没配置"。
+    # 无用例：复现须破坏解释器 import 机制（篡改 sys.meta_path / 现场卸载 pyyaml），
+    # 其代价与对测试环境的污染风险都大于该分支的收益，故只留此注释说明不可测原因。
     try:
         with cfg_path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        return dict(data) if isinstance(data, dict) else {}
-    except (OSError, ValueError, yaml.YAMLError):
+            data = yaml.safe_load(f)
+    except OSError as exc:
+        return {}, f"config.yaml 读取失败（{cfg_path}）：{_one_line(exc)}"
+    except (ValueError, yaml.YAMLError) as exc:
         # yaml.YAMLError 的 MRO 是 (YAMLError, Exception, BaseException, object)——
         # **不是** ValueError 子类，这正是原缺陷根因：只写 (OSError, ValueError) 时，
         # 语法写错的 config.yaml（缩进错/冒号后少空格/括号不闭合）会让解析异常穿透，
         # CLI 带栈崩、web 控制台 status 端点被顶层兜底吞成 500（状态面板全黑）。
         # 只扩到这三类，**不**写裸 except Exception（§16：真 bug 不该被降级吞掉）。
-        return {}
+        return {}, f"config.yaml 解析失败（{cfg_path}）：{_one_line(exc)}"
+    if data is None:
+        return {}, None          # 空文件 / 只有注释：合法的"没配置"，不是错误
+    if not isinstance(data, dict):
+        return {}, (f"config.yaml 顶层不是键值映射（{cfg_path}，实为 "
+                    f"{type(data).__name__}）：无法据此判定角色绑定")
+    return dict(data), None
+
+
+def _read_config_file(cfg_path: Path) -> dict:
+    """读取任意路径的 config.yaml（不存在/不可解析 → 空 dict，M2 骨架宽松）。
+
+    `orch adapters` / `orch adapter …` / `orch status --config` 与 workspace 级
+    `_load_config` 共用这一份读取实现（M5-T5：不重复造第二份 yaml 装载）。
+
+    与 ``_read_config_file_checked`` 同一份解析实现（仍然只有一处 yaml 装载），
+    只是**丢掉**错误信息、维持"三种失败都降级成空 dict"的既有约定逐字不变。
+    需要区分"没配置"与"配置坏了"的调用方（web §12 角色行）改用 checked 版。
+    """
+    cfg, _err = _read_config_file_checked(cfg_path)
+    return cfg
 
 
 def _load_config(workspace: Path) -> dict:

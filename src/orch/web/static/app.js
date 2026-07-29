@@ -173,6 +173,7 @@ function switchWorkspace(name) {
   lastRoundStats = null;   // 跨工作区不沿用上一条线程的统计窗口
   lastStatus = null;
   lastRoles = [];
+  lastConfigError = "";   // 工作区换了，上一个工作区的 config 报错不该跟着走
   lastThreadRoles = [];
   lastActiveMember = null;
   renderMemberRoster();
@@ -286,6 +287,10 @@ function renderAdapters() {
 // 角色投影的**单一数据源**：status 端点的 roles[]（两条线都往这里写——事件轮询的
 // applyStatusPayload，与 N5 减负后只喂角色渲染的可用性心跳）。切线程/切工作区清空。
 let lastRoles = [];
+// config.yaml 读不出来时 status 端点给的一句人话（无错误则后端不给该键 → 恒为 ""）。
+// 它与 lastRoles 是**互斥**的两种事实：有 config_error 时后端一律给空投影，
+// 前端必须把"读不出来"说出来，否则"一枚 chip 都不渲染"与"一切正常"长得一模一样。
+let lastConfigError = "";
 
 function blockedRolesOf() {
   return lastRoles.filter((r) => r.blocked).map((r) => String(r.role));
@@ -294,6 +299,11 @@ function blockedRolesOf() {
 function renderRoleBindings() {
   const el = $("#role-bindings");
   if (!el) return;
+  if (lastConfigError) {
+    el.innerHTML = `<span class="rb-chip blocked" title="${escapeHtmlAttr(lastConfigError)}">` +
+                   "⚠ 配置读取失败·绑定未知</span>";
+    return;
+  }
   const rows = lastRoles;
   // 只渲染"有话要说"的角色（降级中或阻塞）：一切正常时一枚不渲染（恒态 chip = 噪音）。
   const notable = rows.filter((r) => r.blocked || r.effective !== r.primary);
@@ -313,28 +323,34 @@ function renderRoleBindings() {
 function updateAdapterAlerts() {
   const offNames = adapterRows.filter((r) => r.status !== "enabled").map((r) => r.name);
   const blocked = blockedRolesOf();
-  const text = blocked.length
-    ? `角色 ${blocked.join("、")} 无可用适配器（主绑定与全部备胎均已停用）：` +
-      "相关待办保持 pending 不消耗重试预算，需人工恢复后自动接手。"
-    : (offNames.length
-        ? `已停用 ${offNames.length} 个适配器：${offNames.join("、")}` +
-          "　—— 相关角色已降级到备胎，编排继续。"
-        : "");
+  // config 读不出来 → **最高优先级**警示。必须先判它：此时后端给空投影，blocked 恒空，
+  // 不先判就会掉进"无话可说"分支把警示条静默隐藏，正是评审"应修3"的假绿形态。
+  const text = lastConfigError
+    ? `${lastConfigError}　—— 角色绑定与可用性无法判定，控制台不显示绑定行；` +
+      "修好 config.yaml 后自动恢复。"
+    : (blocked.length
+        ? `角色 ${blocked.join("、")} 无可用适配器（主绑定与全部备胎均已停用）：` +
+          "相关待办保持 pending 不消耗重试预算，需人工恢复后自动接手。"
+        : (offNames.length
+            ? `已停用 ${offNames.length} 个适配器：${offNames.join("、")}` +
+              "　—— 相关角色已降级到备胎，编排继续。"
+            : ""));
   const show = Boolean(text);
+  const strong = Boolean(lastConfigError || blocked.length);   // 强档：红；否则温和档
   const bar = $("#adapter-warn");
   if (bar) {
     bar.classList.toggle("hidden", !show);
-    bar.classList.toggle("mild", show && !blocked.length);
+    bar.classList.toggle("mild", show && !strong);
     const t = $("#adapter-warn-text");
     if (t) t.textContent = text;
     const ic = $("#adapter-warn-icon");
-    if (ic) ic.textContent = blocked.length ? "⛔" : "⚠";
+    if (ic) ic.textContent = strong ? "⛔" : "⚠";
   }
   const alert = $("#adapters-alert");
   if (alert) {
     alert.classList.toggle("hidden", !show);
-    alert.classList.toggle("mild", show && !blocked.length);
-    alert.textContent = show ? (blocked.length ? "⛔ " : "⚠ ") + text : "";
+    alert.classList.toggle("mild", show && !strong);
+    alert.textContent = show ? (strong ? "⛔ " : "⚠ ") + text : "";
   }
   const dot = $("#tab-adp-dot");
   if (dot) dot.classList.toggle("hidden", !offNames.length);
@@ -500,8 +516,12 @@ function renderMemberRoster() {
     // （错标"可裁决"比不标更坏），故此处只出 moderator 一枚。
     const badge = role === "moderator"
       ? `<span class="mr-badge fallback">兜底路由</span>` : "";
-    const bindTip = (r.effective && r.primary && r.effective !== r.primary)
-      ? `；主绑定 ${r.primary} 已停用，本轮由 ${r.effective} 承接` : "";
+    // config 读不出来时名册走的是 lastThreadRoles 兜底（blocked 恒 false）——那个 false
+    // 是"不知道"而不是"没阻塞"，必须在 tip 里说清，否则名册会替坏配置背书成健康态。
+    const bindTip = lastConfigError
+      ? "；config.yaml 读取失败，绑定与可用性未知"
+      : ((r.effective && r.primary && r.effective !== r.primary)
+          ? `；主绑定 ${r.primary} 已停用，本轮由 ${r.effective} 承接` : "");
     const tip = (MEMBER_DOT_TITLE[st] || "") + bindTip +
       "；点击 = 只看与该成员相关的消息并把发送目标锁到他（再点一次取消）";
     return (
@@ -660,6 +680,7 @@ async function selectThread(tid) {
   lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
   lastRoundStats = null;  // 统计窗口是线程内概念，切线程即作废（loadEvents 立刻重填）
   lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
+  lastConfigError = "";   // 同理：config 报错是工作区级事实，下一拍 status 会重填
   lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
   // 切线程清掉角色筛选（含单聊态）：成员名单换了，留着旧成员的过滤只会显示空流。
@@ -1438,6 +1459,7 @@ function applyStatusPayload(s) {
   applyStatusMatrix(s.status);
   renderDispatchSummary(s);
   lastRoles = s.roles || [];  // M5 §12：角色投影单一数据源
+  lastConfigError = s.config_error || "";   // 坏 config 信号与投影同源同拍，不另起轮询
   renderRoleBindings();       // 角色行生效绑定
   renderMemberRoster();       // 常驻名册：角色投影 + 本次响应的全量派发行
   updateAdapterAlerts();      // 阻塞点名依赖角色投影，状态一变就重评警示档位
@@ -1760,6 +1782,7 @@ async function availabilityHeartbeat() {
       const s = await api(`/api/threads/${tid}/status`).catch(() => null);
       if (s && tid === selectedThread) {
         lastRoles = s.roles || [];
+        lastConfigError = s.config_error || "";   // 终态线程上改坏 config 也要亮警示
         renderRoleBindings();
         renderMemberRoster();   // 终态线程上名册的 ⛔ 档位也要跟着人工 enable/disable 走
       }

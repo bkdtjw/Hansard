@@ -174,26 +174,38 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
     return 200, {"events": out, "round_stats": _round_stats(out)}
 
 
-def _role_binding_projection(ws: Path, store: "orch.store.Store") -> list[dict]:
+def _role_binding_projection(
+    ws: Path, store: "orch.store.Store",
+) -> tuple[list[dict], str | None]:
     """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
 
-    键名冻结：{role, primary, effective, blocked}；effective=None ⇔ blocked=True
-    （该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用 state.resolve_effective_adapter，
-    与调度层同一判据；本函数**不写盘、不改配置**。
-    状态文件损坏 → 空投影（不猜测；run 端点会给出人话报错，读页面不该被打断）。
+    返回 (投影行, config 错误人话 或 None)。行的键名冻结：
+    {role, primary, effective, blocked}；effective=None ⇔ blocked=True（该角色主绑定
+    与全部备胎均已停用，§5.6.2）。解析复用 state.resolve_effective_adapter，与调度层
+    同一判据；本函数**不写盘、不改配置**。
+
+    两条"不猜测"的空投影出口，同向不同信号：
+      · 状态文件损坏 → 空投影 + 无 config 信号（run 端点会给人话报错，读页面不该被打断）；
+      · config.yaml 读不出来（语法错/顶层非映射/读不动）→ 空投影 + **错误信号**
+        （评审"应修3"）。绝不用"角色名当主绑定"兜底：``state.is_enabled`` 对未记录的
+        名字返回 True，兜底会让每一行都是 blocked=false 的**假健康**，而真实主绑定
+        可能正被人工停用，§12「阻塞角色必须显著警示」在该路径恒不触发。
     """
     from orch.adapters.state import AdapterStateError, resolve_effective_adapter
 
     cfg_path = clim._workspace_config_path(ws)
-    cfg = clim._read_config_file(cfg_path)
+    # checked 版：区分"没有 config"（合法，维持既有角色名兜底）与"config 坏了"（不臆造）。
+    cfg, cfg_error = clim._read_config_file_checked(cfg_path)
+    if cfg_error:
+        return [], cfg_error
     roles_cfg = cfg.get("roles") or {}
     roles = clim._thread_roles(store) or [str(r) for r in roles_cfg]
     if not roles:
-        return []
+        return [], None
     try:
         availability = clim._open_availability(cfg_path)
     except AdapterStateError:
-        return []
+        return [], None
     out = []
     for role in roles:
         rc = roles_cfg.get(role) or {}
@@ -205,7 +217,7 @@ def _role_binding_projection(ws: Path, store: "orch.store.Store") -> list[dict]:
             "effective": effective,
             "blocked": effective is None,
         })
-    return out
+    return out, None
 
 
 def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
@@ -218,7 +230,8 @@ def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
     # 顶层列表"结构探测 roles 投影，派发行一旦带 role 键会被误命中。
     # 每请求现查盘、零缓存（§16.9）。
     rows = store.dispatches_snapshot()
-    return 200, {
+    roles, cfg_error = _role_binding_projection(ws, store)
+    payload = {
         "status": store.get_meta("status") or "unknown",
         "dispatches": [
             {
@@ -229,8 +242,14 @@ def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
             for r in rows
         ],
         # M5 §12：角色行的生效绑定 / 阻塞点名（前端据此渲染，不再只看"有没有 disabled"）。
-        "roles": _role_binding_projection(ws, store),
+        "roles": roles,
     }
+    if cfg_error:
+        # 顶层新键，值是**字符串**而非列表：test_m5_availability 的 _role_projection
+        # 按"首个每项含 role 键的顶层列表"结构探测投影，字符串不可能被误命中。
+        # 无错误时该键**不出现** —— 健康路径（含"根本没有 config.yaml"）的响应逐字同旧。
+        payload["config_error"] = cfg_error
+    return 200, payload
 
 
 def _ep_thread_send(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
