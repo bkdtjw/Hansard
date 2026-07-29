@@ -260,6 +260,22 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def dispatches_snapshot(self) -> list[dict]:
+        """全部派发行（**不过滤 status**），按 event_id / target 升序——只读投影。
+
+        与 pending_dispatches() 分立而非给后者加过滤开关：后者的"只回 pending"语义
+        有 7 处调用点依赖（core.py:866 驱动主循环、core.py:1064 与 async_core.py:292
+        拿它做"本组尚未 mark_dispatching"的新鲜度判据），改其 SQL 即改调度语义。
+        本方法只供**展示层**（控制台 /status）看全五态与 deadline_ts，复用 self._con
+        （一线程一 db，§4.1），不新开连接。
+        """
+        rows = self._con.execute(
+            "SELECT event_id, target, status, deadline_ts, attempts"
+            " FROM dispatches"
+            " ORDER BY event_id ASC, target ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def mark_dispatching(self, event_id: int, target: str, deadline_ts: float) -> None:
         """§4.4 事务(2)：status→dispatching + 写绝对截止时间戳。"""
         self._begin()

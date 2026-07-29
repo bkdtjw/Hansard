@@ -755,6 +755,53 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
 .disp-chips .dc.gate { color: #fbbf24; }
 .disp-chips .dc.failed { color: #fca5a5; }
 
+/* ============================================================
+   常驻成员名册（F4/F2）：线程头下方横栏，每成员恒有一枚状态点 + 可点单聊。
+   —— 纯 rgba + border，无 blur；transition 只用 background-color/border-color
+      /color/transform（性能红线）。终态降饱和用**静态** filter，从不参与过渡。
+   ============================================================ */
+.member-roster {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid var(--glass-brd);
+  border-radius: var(--radius-card);
+}
+.member-roster:empty { display: none; }
+/* 终态（terminated/suspended）：整栏降饱和 —— 名册是终态快照，不是活状态。 */
+.member-roster.terminal { filter: saturate(0.3); opacity: 0.82; }
+.mr-label {
+  font-size: 11.5px; color: var(--txt-dim); letter-spacing: 0.06em; flex: 0 0 auto;
+}
+.mr-chip {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; line-height: 1;
+  padding: 4px 9px; border-radius: 999px;
+  color: var(--txt); background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-brd);
+  transition: background-color 0.15s, border-color 0.15s, transform 0.15s;
+}
+.mr-chip:hover { background: rgba(255, 255, 255, 0.1); transform: translateY(-1px); }
+.mr-chip.active { border-color: var(--blue-solid); background: rgba(96, 165, 250, 0.18); }
+.mr-name { font-weight: 600; }
+.mr-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--term); box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
+}
+.mr-dot.d-busy { background: var(--run); box-shadow: 0 0 7px var(--run); }
+.mr-dot.d-queued { background: var(--gate); box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18); }
+.mr-dot.d-idle { background: var(--term); }
+.mr-dot.d-blocked {
+  background: var(--danger-solid); box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.24);
+}
+.mr-badge {
+  font-size: 10.5px; padding: 1px 6px; border-radius: var(--radius-chip);
+  color: var(--txt-meta); background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--glass-brd); white-space: nowrap;
+}
+.mr-badge.fallback { color: #93c5fd; border-color: rgba(96, 165, 250, 0.4); }
+.mr-note { font-size: 11.5px; color: var(--txt-dim); margin-left: auto; }
+
 /* —— D19 门禁琥珀 banner —— */
 .gate-banner {
   flex: 0 0 auto;

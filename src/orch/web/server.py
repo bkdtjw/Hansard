@@ -170,15 +170,23 @@ def _role_binding_projection(ws: Path, store: "orch.store.Store") -> list[dict]:
 
 def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
     store = _require_thread(ws, tid)
-    pend = store.pending_dispatches()
+    # 全五态派发行（含 deadline_ts）：控制台的成员状态点/"正在响应"要区分"真的在跑"
+    # 与"崩溃后滞留在盘上的 dispatching 行"（watchdog.py:203-205：滞留行会被每一轮
+    # check 重新枚举），只给 pending 或给了 dispatching 却不给 deadline_ts 都会长亮假绿。
+    # 键名冻结 event_id/target/status/deadline_ts/attempts —— **不得**把 target 改名成
+    # role：tests/test_m5_availability.py 的 _role_projection 按"首个每项含 role 键的
+    # 顶层列表"结构探测 roles 投影，派发行一旦带 role 键会被误命中。
+    # 每请求现查盘、零缓存（§16.9）。
+    rows = store.dispatches_snapshot()
     return 200, {
         "status": store.get_meta("status") or "unknown",
         "dispatches": [
             {
                 "event_id": r["event_id"], "target": r["target"],
-                "status": r["status"], "attempts": r["attempts"],
+                "status": r["status"], "deadline_ts": r["deadline_ts"],
+                "attempts": r["attempts"],
             }
-            for r in pend
+            for r in rows
         ],
         # M5 §12：角色行的生效绑定 / 阻塞点名（前端据此渲染，不再只看"有没有 disabled"）。
         "roles": _role_binding_projection(ws, store),

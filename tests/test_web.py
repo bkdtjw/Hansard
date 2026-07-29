@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -321,6 +322,132 @@ def test_status_endpoint(tmp_dir):
         assert body.get("status") == "running"
         assert "dispatches" in body
         assert isinstance(body["dispatches"], list)
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-6b) F4 数据源复活：/status 的 dispatches 投影全五态 + deadline_ts
+# ——————————————————————————————————————————————————————————————
+
+def _dispatch_row(rows: list, event_id: int, target: str) -> dict:
+    for r in rows:
+        if r["event_id"] == event_id and r["target"] == target:
+            return r
+    raise AssertionError(f"派发行 (E{event_id}, {target}) 不在投影里：{rows}")
+
+
+def test_status_dispatches_expose_dispatching_with_deadline(tmp_dir):
+    """mark_dispatching 后 /status 必须回该行：status=='dispatching' 且带 deadline_ts。
+
+    旧行为只投影 pending 行（store.pending_dispatches），前端"正在响应"胶囊与角色
+    状态点因此是死代码；缺 deadline_ts 则崩溃后滞留的 dispatching 行会长亮假绿
+    （src/orch/scheduler/watchdog.py:203-205）。
+    """
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        store = orch.store.Store(tmp_dir / tid)
+        e1 = store.events()[0]["id"]
+        deadline = time.time() + 60
+        store.mark_dispatching(e1, "pm", deadline)
+
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        row = _dispatch_row(body["dispatches"], e1, "pm")
+        assert row["status"] == "dispatching", row
+        assert row["deadline_ts"] is not None, row
+        assert abs(float(row["deadline_ts"]) - deadline) < 1.0, row
+        assert "attempts" in row, row
+        # 键名冻结：target 不得改名成 role —— tests/test_m5_availability.py 的
+        # _role_projection 按"每项含 role 键的顶层列表"结构探测 roles 投影。
+        assert "role" not in row, row
+
+
+def test_status_dispatches_include_done_rows_and_pending_semantics_intact(tmp_dir):
+    """投影是全量快照（含 done）；同时 pending_dispatches() 的"只回 pending"语义不动。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        store = orch.store.Store(tmp_dir / tid)
+        e1 = store.events()[0]["id"]
+        store.mark_done(e1, "pm")
+
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert _dispatch_row(body["dispatches"], e1, "pm")["status"] == "done"
+        # 调度侧判据未被污染：pending 视图仍不含 done 行。
+        store2 = orch.store.Store(tmp_dir / tid)
+        assert all(d["status"] == "pending" for d in store2.pending_dispatches())
+        assert not any(d["event_id"] == e1 and d["target"] == "pm"
+                       for d in store2.pending_dispatches())
+
+
+def test_status_payload_feeds_member_roster(tmp_dir):
+    """名册数据源：同一个 /status 响应须同时给出 roles 投影与全量 dispatches。
+
+    前端纯用这两份算每成员的状态点（绿/琥珀/灰/⛔），不新增端点、服务端不留缓存。
+    """
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert isinstance(body.get("dispatches"), list), body
+        roles = body.get("roles")
+        assert isinstance(roles, list) and roles, body
+        names = {r["role"] for r in roles}
+        assert {"pm", "moderator"} <= names, roles
+        for r in roles:
+            for key in ("role", "primary", "effective", "blocked"):
+                assert key in r, r
+        # 名册"排队中"（琥珀）档的盘上依据：E1 给 pm 排了一条 pending 行。
+        pm_rows = [d for d in body["dispatches"] if d["target"] == "pm"]
+        assert pm_rows and any(d["status"] == "pending" for d in pm_rows), body
+
+
+def test_direct_send_carries_to_for_member_filter(tmp_dir):
+    """单聊过滤的服务端可测面：定向 send 后 /events 该事件的 to 含目标角色。
+
+    前端 isMemberRelated(ev, role) 的 `to` 分支据此命中（旧判据只看 sender，
+    "发给某成员"的消息看不到）。@ 成员只经 #send-to 下拉表达，不解析正文（§16.1）。
+    """
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        code, body = _req(
+            base, f"/api/threads/{tid}/send", "POST",
+            {"to": "pm", "type": "question", "body": "进度如何"},
+        )
+        assert code == 200, (code, body)
+        eid = body["event_id"]
+        code, body = _req(base, f"/api/threads/{tid}/events")
+        assert code == 200, (code, body)
+        ev = next(e for e in body["events"] if e["id"] == eid)
+        assert ev["sender"] == "human", ev
+        assert "pm" in (ev.get("to") or []), ev
+        # 正文原样落盘，未被任何 @ 解析改写。
+        assert ev["body"] == "进度如何", ev
+
+
+def test_app_js_member_roster_and_single_chat_predicates(tmp_dir):
+    """app.js 关键判据存在性（全仓无 JS 单测，沿 test_app_js_served 的字符串断言风格）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        # ① 单聊过滤具名判据：发出 ∪ 收到，且注释显式声明不是 §6.2 焦点窗、不回流调度。
+        assert "function isMemberRelated(ev, role)" in js
+        assert "ev.sender === role || (ev.to || []).includes(role)" in js
+        assert "§6.2" in js and "焦点窗" in js
+        assert "不得回流任何调度判定" in js
+        # ② 绿点/正在响应必须判 deadline_ts（崩溃滞留行不得假绿）。
+        assert "function isLiveDispatch(d)" in js
+        assert "d.deadline_ts" in js
+        assert "Date.now() / 1000" in js
+        assert ".filter(isLiveDispatch)" in js, "updateTypingBar 应复用同一 deadline 判据"
+        # ③ 名册四态 + 点击单聊。
+        assert "function memberDotState(role, dispatches, blocked)" in js
+        assert "function renderMemberRoster()" in js
+        assert "function toggleMemberChat(role)" in js
+        # ④ @ 成员语义只许写 #send-to.value，禁止解析正文（spec §16 第 1 条）。
+        assert "sel.value = role" in js
+        assert "禁止任何对消息正文的解析" in js
+        # ⑤ 属性位一律 escapeHtmlAttr。
+        assert 'data-member="${escapeHtmlAttr(role)}"' in js
 
 
 def test_replay_endpoint_markdown(tmp_dir):

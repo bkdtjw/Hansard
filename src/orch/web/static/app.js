@@ -169,6 +169,8 @@ function switchWorkspace(name) {
   currentEvents = [];
   lastStatus = null;
   lastRoles = [];
+  lastThreadRoles = [];
+  renderMemberRoster();
   unseenCount = 0;
   clearTimeout(pollTimer);
   pollActive = false;
@@ -368,6 +370,126 @@ async function setAdapter(name, act) {
 }
 
 // ————————————————————————————————————————————————
+// 常驻成员名册（F4/F2）：线程头下方一条横栏，**每成员恒有一枚状态点**。
+// 数据源 = /status 同一响应的 roles 投影（role/primary/effective/blocked）
+// + 全量 dispatches 行（五态 + deadline_ts），纯前端计算，不新增端点。
+// 点击成员 = 专人单聊：按该成员过滤消息流 + 把 #send-to 锁到该角色（再点取消）。
+// ————————————————————————————————————————————————
+// /api/threads 给的该线程 roles；仅作 lastRoles 为空（无 config / 状态文件不可读，
+// server.py:_role_binding_projection 会返回空投影）时的兜底名单，保证名册"常驻"。
+let lastThreadRoles = [];
+
+// dispatching 行是否**真的在跑**：必须判绝对截止时间戳。进程崩溃后 dispatching 行会
+// 滞留在盘上（src/orch/scheduler/watchdog.py:203-205："行留在盘上会被每一轮 check
+// 重新枚举"），只看 status 就会长亮假绿 / 假"正在响应"。
+function isLiveDispatch(d) {
+  if (!d || d.status !== "dispatching") return false;
+  const dl = Number(d.deadline_ts);
+  return isFinite(dl) && dl > Date.now() / 1000;
+}
+
+// 成员状态点：blocked=⛔无可用适配器 · busy=绿正在响应 · queued=琥珀排队中 ·
+// idle=灰待命。"有 dispatching 行但已过截止"（崩溃滞留）**不算绿**，落回灰并在
+// title 里如实说明——宁可显示待命，不许假绿。
+function memberDotState(role, dispatches, blocked) {
+  if (blocked) return "blocked";
+  let queued = false;
+  let stale = false;
+  for (const d of dispatches || []) {
+    if (String(d.target) !== role) continue;
+    if (isLiveDispatch(d)) return "busy";
+    if (d.status === "dispatching") stale = true;
+    else if (d.status === "pending") queued = true;
+  }
+  if (queued) return "queued";
+  return stale ? "stale" : "idle";
+}
+
+const MEMBER_DOT_TITLE = {
+  busy: "正在响应（dispatching 行未过截止时间）",
+  queued: "排队中（有 pending 派发行；要等下一次运行才真正 invoke，不是 IM 即时语义）",
+  idle: "待命（无派发行）",
+  stale: "待命（有已过截止的 dispatching 行：进程可能已崩溃，等看门狗对账）",
+  blocked: "无可用适配器：主绑定与全部备胎均已停用，待办保持 pending 等人工恢复",
+};
+
+// 单聊激活成员 = **派生量**（不另存一份状态）：角色筛选恰好锁定一名成员时即单聊态。
+function activeMemberRole() {
+  if (!filterState.roles || filterState.roles.size !== 1) return null;
+  return Array.from(filterState.roles)[0];
+}
+
+// 人类展示判据（成员名册单聊 / 角色筛选专用）：事件是否与该成员相关 =
+// **他发的，或发给他的**。
+// 它**不是** spec §6.2 的焦点窗（那是给模型的不对称视图渲染判据，实现在
+// src/orch/render/__init__.py）；二者有意分离，本函数只喂前端展示过滤，
+// **不得回流任何调度判定**（路由/重试/聚合/超时/保留策略一律与它无关）。
+function isMemberRelated(ev, role) {
+  return ev.sender === role || (ev.to || []).includes(role);
+}
+
+// 点击名册成员：激活/取消单聊。复用既有角色筛选通道（筛选 chips 行、"清除全部"照常生效）。
+function toggleMemberChat(role) {
+  if (!role) return;
+  const on = activeMemberRole() === role;
+  $$("#filter-roles input").forEach((c) => { c.checked = !on && c.value === role; });
+  if (!on) {
+    // @成员语义**只**通过写 #send-to.value 实现；禁止任何对消息正文的解析
+    // （spec §16 第 1 条：从正文解析 @ 做路由）。方向只能是信封 → 显示。
+    const sel = $("#send-to");
+    if (sel && Array.from(sel.options).some((o) => o.value === role)) sel.value = role;
+  }
+  readFilters();   // 重渲染事件流 + 筛选 chips + 名册高亮（readFilters 内已带上名册）
+}
+
+function renderMemberRoster() {
+  const box = $("#member-roster");
+  if (!box) return;
+  if (!selectedThread) { box.className = "member-roster"; box.innerHTML = ""; return; }
+  const rows = (lastRoles && lastRoles.length)
+    ? lastRoles
+    : lastThreadRoles.map((r) => ({ role: r, primary: null, effective: null, blocked: false }));
+  if (!rows.length) { box.className = "member-roster"; box.innerHTML = ""; return; }
+  const disp = (lastStatus && lastStatus.dispatches) || [];
+  const active = activeMemberRole();
+  const tstatus = (lastStatus && lastStatus.status) || "";
+  // 终态（terminated/suspended）：整栏降饱和 + 标注，避免把终态快照读成活状态。
+  const terminal = tstatus === "terminated" || tstatus === "suspended";
+  box.className = "member-roster" + (terminal ? " terminal" : "");
+  const chips = rows.map((r) => {
+    const role = String(r.role);
+    const st = memberDotState(role, disp, r.blocked === true);
+    const dotCls = st === "stale" ? "idle" : st;   // stale 视觉同灰，差别只在 title
+    const col = escapeHtmlAttr(roleColor(role));
+    // 「兜底路由」徽标：to 为空的信封一律落到 moderator（spec §5.2 / §4.4(1)）。
+    // 「可裁决」徽标本卡未做：can_decide 只在 config.yaml 的 roles 段里，而
+    // GET /api/config 回的是**原始 YAML 文本**（server.py:_ep_config_get），响应里
+    // 没有解析后的 roles；前端零依赖铁律下无 YAML 解析器，手搓子集解析会把徽标挂错
+    // （错标"可裁决"比不标更坏），故此处只出 moderator 一枚。
+    const badge = role === "moderator"
+      ? `<span class="mr-badge fallback">兜底路由</span>` : "";
+    const bindTip = (r.effective && r.primary && r.effective !== r.primary)
+      ? `；主绑定 ${r.primary} 已停用，本轮由 ${r.effective} 承接` : "";
+    const tip = (MEMBER_DOT_TITLE[st] || "") + bindTip +
+      "；点击 = 只看与该成员相关的消息并把发送目标锁到他（再点一次取消）";
+    return (
+      `<button class="mr-chip${active === role ? " active" : ""}"` +
+      ` data-member="${escapeHtmlAttr(role)}" title="${escapeHtmlAttr(tip)}">` +
+        `<span class="mr-dot d-${escapeHtmlAttr(dotCls)}"></span>` +
+        `<span class="mr-name" style="color:${col}">${escapeHtml(role)}</span>` +
+        badge +
+      `</button>`
+    );
+  }).join("");
+  const note = terminal
+    ? `<span class="mr-note">${escapeHtml(tstatus === "terminated"
+        ? "线程已终止 · 名册为终态快照" : "线程挂起中 · 待门禁裁决")}</span>`
+    : (active
+        ? `<span class="mr-note">单聊 ${escapeHtml(active)} · 再点该成员取消</span>` : "");
+  box.innerHTML = `<span class="mr-label">成员</span>` + chips + note;
+}
+
+// ————————————————————————————————————————————————
 // 线程列表 + 新建
 // ————————————————————————————————————————————————
 // D20：线程列表项增强——主标题=E1 正文前 20 字摘要；次要行=id（等宽）·
@@ -505,7 +627,13 @@ async function selectThread(tid) {
   selectedThread = tid;
   lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
   lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
+  lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
+  // 切线程清掉角色筛选（含单聊态）：成员名单换了，留着旧成员的过滤只会显示空流。
+  filterState.roles = null;
+  $$("#filter-roles input:checked").forEach((c) => { c.checked = false; });
+  updateFilterUI();
+  renderMemberRoster();
   $("#workspace-empty").classList.add("hidden");
   $("#workspace").classList.remove("hidden");
   $("#wk-title").textContent = tid;   // 占位；loadEvents 后由 E1 摘要替换
@@ -527,6 +655,7 @@ async function populateSendTo() {
     const threads = await api("/api/threads");
     const t = threads.find((x) => x.id === selectedThread);
     const roles = (t && t.roles) ? t.roles : [];
+    lastThreadRoles = roles.slice();   // 名册兜底名单（/status 的 roles 投影为空时用）
     sel.innerHTML = '<option value="">由 moderator 路由</option>';
     for (const r of roles) {
       if (r === "human") continue; // human 是自己，不作为发送目标项
@@ -536,6 +665,7 @@ async function populateSendTo() {
     }
     // D16：角色过滤下拉也随线程角色刷新。
     populateFilterRoles(roles);
+    renderMemberRoster();   // 名册先按线程 roles 出人（状态点等 /status 回来再精化）
   } catch (e) {
     /* 保底：下拉至少有默认项（HTML 内已含首项） */
   }
@@ -842,7 +972,13 @@ function buildBubble(ev) {
 function applyFilters(evs) {
   return evs.filter((ev) => {
     if (filterState.aOnly && !A_CLASS_TYPES.has(ev.type)) return false;
-    if (filterState.roles && filterState.roles.size && !filterState.roles.has(ev.sender)) return false;
+    if (filterState.roles && filterState.roles.size) {
+      // 角色维度走 isMemberRelated（发出 ∪ 收到）：旧判据只看 ev.sender，选中 backend
+      // 时看不到"发给 backend"的消息，单聊只有半边。events 端点早已回 to，纯前端可修。
+      let hit = false;
+      for (const r of filterState.roles) { if (isMemberRelated(ev, r)) { hit = true; break; } }
+      if (!hit) return false;
+    }
     if (filterState.types && filterState.types.size && !filterState.types.has(ev.type)) return false;
     return true;
   });
@@ -1104,6 +1240,7 @@ function readFilters() {
   filterState.aOnly = $("#filter-aonly")?.checked || false;
   renderStream();
   updateFilterUI();
+  renderMemberRoster();   // 单聊高亮是筛选态的派生量，筛选一变就跟着重算
 }
 
 // R5 D2：筛选弹出面板开关。
@@ -1171,6 +1308,7 @@ function applyStatusPayload(s) {
   renderDispatchSummary(s);
   lastRoles = s.roles || [];  // M5 §12：角色投影单一数据源
   renderRoleBindings();       // 角色行生效绑定
+  renderMemberRoster();       // 常驻名册：角色投影 + 本次响应的全量派发行
   updateAdapterAlerts();      // 阻塞点名依赖角色投影，状态一变就重评警示档位
   updateTypingBar(s);
   // D19：以 status 端点权威状态重评门禁 banner。
@@ -1195,8 +1333,10 @@ async function loadStatus() {
 function updateTypingBar(s) {
   const bar = $("#typing-bar");
   if (!bar) return;
+  // 数据源复活后本条自然点亮；但**必须**沿用 isLiveDispatch 判 deadline_ts——
+  // 崩溃滞留的 dispatching 行否则会让"正在响应"胶囊永久常亮（同一个假绿根因）。
   const roles = Array.from(new Set((s.dispatches || [])
-    .filter((d) => d.status === "dispatching").map((d) => String(d.target))));
+    .filter(isLiveDispatch).map((d) => String(d.target))));
   if (!roles.length) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
   bar.innerHTML =
     `<span class="typing-pill"><span class="typing-dots"><i></i><i></i><i></i></span>` +
@@ -1486,6 +1626,7 @@ async function availabilityHeartbeat() {
       if (s && tid === selectedThread) {
         lastRoles = s.roles || [];
         renderRoleBindings();
+        renderMemberRoster();   // 终态线程上名册的 ⛔ 档位也要跟着人工 enable/disable 走
       }
     }
     updateAdapterAlerts();
@@ -1621,7 +1762,8 @@ async function showStatusDetail() {
     let rows = (s.dispatches || []).map((d) =>
       `<tr><td>E${escapeHtml(String(d.event_id))}</td><td>${escapeHtml(String(d.target))}</td><td>${escapeHtml(String(d.status))}</td><td>${escapeHtml(String(d.attempts))}</td></tr>`
     ).join("");
-    if (!rows) rows = '<tr><td colspan="4">（无 pending 派发）</td></tr>';
+    // 投影已是全五态快照（含 done/gate_wait），空态文案随之改口径。
+    if (!rows) rows = '<tr><td colspan="4">（无派发行）</td></tr>';
     const html =
       `<table class="tbl"><thead><tr><th>事件</th><th>目标</th><th>状态</th><th>重试</th></tr></thead>` +
       `<tbody>${rows}</tbody></table>`;
@@ -1796,6 +1938,13 @@ function bind() {
   $("#btn-attach").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); showAttach(); });
   $("#btn-reopen").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); reopenThread(); });
   $("#btn-stop").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); stopWorkspace(); });
+
+  // 成员名册：点击某成员 = 专人单聊（过滤消息流 + 锁定 #send-to）；再点取消。
+  const roster = $("#member-roster");
+  if (roster) roster.addEventListener("click", (e) => {
+    const chip = e.target.closest(".mr-chip");
+    if (chip) toggleMemberChat(chip.dataset.member);
+  });
 
   $("#btn-send").addEventListener("click", sendMessage);
   $("#btn-approve").addEventListener("click", () => gateDecision("approve"));

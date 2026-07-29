@@ -78,6 +78,11 @@
               </div>
             </div>
 
+            <!-- 常驻成员名册：每成员恒有一枚状态点（绿=正在响应／琥珀=排队中／灰=待命／
+                 ⛔=无可用适配器）；点击 = 单聊（按该成员过滤消息流 + 锁定发送目标）。
+                 数据源 = /status 的 roles 投影 + 全量 dispatches 行，纯前端计算。 -->
+            <div id="member-roster" class="member-roster"></div>
+
             <!-- M5 §12：适配器停用/阻塞警示条（存在 disabled 时出现，点击直达适配器面板） -->
             <div id="adapter-warn" class="adapter-banner hidden">
               <span id="adapter-warn-icon" class="adp-warn-icon">⛔</span>

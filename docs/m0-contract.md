@@ -77,6 +77,11 @@ class Store:
         """全部 status='pending' 的派发行，按 event_id 升序（§5.1）。
         每行至少含 event_id/target/status/deadline_ts/attempts。"""
 
+    def dispatches_snapshot(self) -> list[dict]:
+        """（M5 后追加，只读原语）全部派发行**不过滤 status**，按 event_id/target 升序。
+        每行含 event_id/target/status/deadline_ts/attempts。仅供展示层（控制台
+        /status 全五态 + deadline_ts）；**禁改** pending_dispatches 的 SQL 与语义。"""
+
     def mark_dispatching(self, event_id: int, target: str, deadline_ts: float) -> None:
         """§4.4 事务(2)：status→dispatching + 写绝对截止时间戳。"""
 
