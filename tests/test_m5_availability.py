@@ -1792,7 +1792,7 @@ def _role_projection(body: dict) -> list[dict]:
     """从 status 响应里按**结构**定位角色投影（容器键名未冻结，建议 "roles"）。
 
     判据：某个顶层值是"非空的 dict 列表且每项含 role 键"。既有 dispatches 列表的
-    键是 event_id/target/status/attempts，不含 role，不会误命中。
+    键是 event_id/target/status/deadline_ts/attempts，不含 role，不会误命中。
     """
     for value in body.values():
         if (isinstance(value, list) and value

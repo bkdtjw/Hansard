@@ -446,8 +446,76 @@ def test_app_js_member_roster_and_single_chat_predicates(tmp_dir):
         # ④ @ 成员语义只许写 #send-to.value，禁止解析正文（spec §16 第 1 条）。
         assert "sel.value = role" in js
         assert "禁止任何对消息正文的解析" in js
-        # ⑤ 属性位一律 escapeHtmlAttr。
+        # ⑤ 属性位一律 escapeHtmlAttr —— 含筛选勾选框的 value（单聊匹配关键路径）。
         assert 'data-member="${escapeHtmlAttr(role)}"' in js
+        assert 'value="${escapeHtmlAttr(r)}" data-fkind="role"' in js
+
+
+def test_app_js_cancel_single_chat_releases_send_to(tmp_dir):
+    """R-应修1：取消单聊必须解锁 #send-to，否则下一条人类消息静默直发该成员。
+
+    对称语义（激活即锁、取消即解锁）在 readFilters 里统一实现，覆盖四条离开路径：
+    再点一次取消 / 清除全部 / chips 行 ✕ 移除 / 手动取消勾选。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        # 解锁判据本身：只在 value 恰为刚被取消的成员时回置兜底首项 ""。
+        assert "let lastActiveMember = null;" in js
+        assert "const nowActive = activeMemberRole();" in js
+        assert "if (lastActiveMember && lastActiveMember !== nowActive) {" in js
+        assert 'if (sel && sel.value === lastActiveMember) sel.value = "";' in js
+        assert "lastActiveMember = nowActive;" in js
+        # 放在 readFilters 内（"清除全部" / removeFilter 都经它）才覆盖得全。
+        head = js.split("function readFilters()", 1)
+        assert len(head) == 2, "readFilters 应存在"
+        tail = head[1].split("\n}", 1)[0]
+        assert "lastActiveMember" in tail, "解锁逻辑必须在 readFilters 内，否则清除全部不生效"
+        # 切线程 / 切工作区也清标记（send-to 由 populateSendTo 重建）。
+        assert js.count("lastActiveMember = null;") >= 3
+
+
+def test_app_js_dispatch_summary_counts_live_only(tmp_dir):
+    """R-应修2：线程头 dispatching chip 计数用 isLiveDispatch，崩溃滞留行不计入。
+
+    否则「dispatching N」长亮假绿，与已按同一判据熄灭的"正在响应"胶囊同屏矛盾。
+    明细表仍逐行显示盘上原始行，滞留行加标注。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert '["dispatching", disp.filter(isLiveDispatch).length]' in js
+        assert '["dispatching", count("dispatching")]' not in js, "旧的裸 status 计数须撤除"
+        # 明细表不做同样的过滤（盘上真相逐行可见），只加滞留标注。
+        assert 'const stale = d.status === "dispatching" && !isLiveDispatch(d);' in js
+        assert "滞留" in js
+
+
+def test_app_js_gray_dot_titles_match_disk_facts(tmp_dir):
+    """R-建议5：灰档细分——failed / gate_wait 行存在时 title 不得写"待命（无派发行）"。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert 'else if (d.status === "failed") failed = true;' in js
+        assert 'else if (d.status === "gate_wait") gateWait = true;' in js
+        assert 'if (gateWait) return "gate_wait";' in js
+        assert 'if (failed) return "failed";' in js
+        # 视觉仍是既有四色：灰档全部映射到同一个 d-idle 类，不加新色。
+        assert 'MEMBER_DOT_GRAY = new Set(["idle", "stale", "failed", "gate_wait"])' in js
+        assert 'MEMBER_DOT_GRAY.has(st) ? "idle" : st' in js
+        # 只有"真的一条派发行都没有"才叫待命。
+        assert 'idle: "待命（无派发行）"' in js
+
+
+def test_app_js_live_dispatch_has_clock_skew_tolerance(tmp_dir):
+    """R-建议：浏览器 Date.now 与服务端 time.time 可能不同源，绿灰互翻需容差。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "const DISPATCH_CLOCK_SKEW_S = 3;" in js
+        assert "dl > Date.now() / 1000 - DISPATCH_CLOCK_SKEW_S" in js
+        # 注释须写明理由，且声明不回流调度判定。
+        assert "不同源" in js and "不参与任何调度" in js
 
 
 def test_replay_endpoint_markdown(tmp_dir):

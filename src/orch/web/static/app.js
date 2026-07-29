@@ -174,6 +174,7 @@ function switchWorkspace(name) {
   lastStatus = null;
   lastRoles = [];
   lastThreadRoles = [];
+  lastActiveMember = null;
   renderMemberRoster();
   unseenCount = 0;
   clearTimeout(pollTimer);
@@ -383,37 +384,56 @@ async function setAdapter(name, act) {
 // server.py:_role_binding_projection 会返回空投影）时的兜底名单，保证名册"常驻"。
 let lastThreadRoles = [];
 
+// 展示侧时钟容差：浏览器 Date.now() 与服务端 time.time()（deadline_ts 的来源）可能
+// 不同源——控制台常开在另一台机器上，NTP 未必对齐。几秒漂移就会让绿↔灰在轮询间来回
+// 翻，故给 3 秒宽限。**只影响展示档位**，绝不参与任何调度/超时判定（那条线一律用
+// 服务端落盘的绝对时间戳，§16.2）。
+const DISPATCH_CLOCK_SKEW_S = 3;
+
 // dispatching 行是否**真的在跑**：必须判绝对截止时间戳。进程崩溃后 dispatching 行会
 // 滞留在盘上（src/orch/scheduler/watchdog.py:203-205："行留在盘上会被每一轮 check
 // 重新枚举"），只看 status 就会长亮假绿 / 假"正在响应"。
 function isLiveDispatch(d) {
   if (!d || d.status !== "dispatching") return false;
   const dl = Number(d.deadline_ts);
-  return isFinite(dl) && dl > Date.now() / 1000;
+  return isFinite(dl) && dl > Date.now() / 1000 - DISPATCH_CLOCK_SKEW_S;
 }
 
 // 成员状态点：blocked=⛔无可用适配器 · busy=绿正在响应 · queued=琥珀排队中 ·
-// idle=灰待命。"有 dispatching 行但已过截止"（崩溃滞留）**不算绿**，落回灰并在
-// title 里如实说明——宁可显示待命，不许假绿。
+// 其余一律灰。灰档**再细分**（视觉同色、不加新色，差别只在 title）：崩溃滞留的
+// dispatching 行 / failed 行 / gate_wait 行 / 真的一条派发行都没有——盘上有 failed
+// 或 gate_wait 行却写"无派发行"是撒谎，故各自如实成文。
 function memberDotState(role, dispatches, blocked) {
   if (blocked) return "blocked";
   let queued = false;
   let stale = false;
+  let failed = false;
+  let gateWait = false;
   for (const d of dispatches || []) {
     if (String(d.target) !== role) continue;
     if (isLiveDispatch(d)) return "busy";
     if (d.status === "dispatching") stale = true;
     else if (d.status === "pending") queued = true;
+    else if (d.status === "failed") failed = true;
+    else if (d.status === "gate_wait") gateWait = true;
   }
   if (queued) return "queued";
-  return stale ? "stale" : "idle";
+  if (gateWait) return "gate_wait";
+  if (failed) return "failed";
+  if (stale) return "stale";
+  return "idle";
 }
+
+// 归灰的全部档位（四色红线：只有 blocked/busy/queued 各占一色，其余共用灰）。
+const MEMBER_DOT_GRAY = new Set(["idle", "stale", "failed", "gate_wait"]);
 
 const MEMBER_DOT_TITLE = {
   busy: "正在响应（dispatching 行未过截止时间）",
   queued: "排队中（有 pending 派发行；要等下一次运行才真正 invoke，不是 IM 即时语义）",
+  gate_wait: "等待门禁（有 gate_wait 派发行：须人工批准/驳回后才继续）",
+  failed: "有 failed 派发行（该派发已判失败，不再自动重试）",
+  stale: "无在跑派发（有已过截止的 dispatching 行：进程可能已崩溃，等看门狗对账）",
   idle: "待命（无派发行）",
-  stale: "待命（有已过截止的 dispatching 行：进程可能已崩溃，等看门狗对账）",
   blocked: "无可用适配器：主绑定与全部备胎均已停用，待办保持 pending 等人工恢复",
 };
 
@@ -422,6 +442,12 @@ function activeMemberRole() {
   if (!filterState.roles || filterState.roles.size !== 1) return null;
   return Array.from(filterState.roles)[0];
 }
+
+// 上一拍的单聊成员。**唯一用途**：实现"取消即解锁 #send-to"的对称语义，不是状态源
+// （单聊态本身仍由 filterState 派生）。放在 readFilters 里比较，是为了让**所有**离开
+// 单聊的路径都覆盖到——再点一次取消、筛选面板"清除全部"、chips 行 ✕ 移除该角色、
+// 手动取消勾选，四条路都经 readFilters。
+let lastActiveMember = null;
 
 // 人类展示判据（成员名册单聊 / 角色筛选专用）：事件是否与该成员相关 =
 // **他发的，或发给他的**。
@@ -433,6 +459,8 @@ function isMemberRelated(ev, role) {
 }
 
 // 点击名册成员：激活/取消单聊。复用既有角色筛选通道（筛选 chips 行、"清除全部"照常生效）。
+// 对称承诺：激活时把 #send-to 锁到该成员，取消时**必须**解锁（解锁在 readFilters 内
+// 统一做，见 lastActiveMember）——否则下一条人类消息会静默直发他而非走 moderator 兜底。
 function toggleMemberChat(role) {
   if (!role) return;
   const on = activeMemberRole() === role;
@@ -463,7 +491,7 @@ function renderMemberRoster() {
   const chips = rows.map((r) => {
     const role = String(r.role);
     const st = memberDotState(role, disp, r.blocked === true);
-    const dotCls = st === "stale" ? "idle" : st;   // stale 视觉同灰，差别只在 title
+    const dotCls = MEMBER_DOT_GRAY.has(st) ? "idle" : st;   // 灰档细分只体现在 title
     const col = escapeHtmlAttr(roleColor(role));
     // 「兜底路由」徽标：to 为空的信封一律落到 moderator（spec §5.2 / §4.4(1)）。
     // 「可裁决」徽标本卡未做：can_decide 只在 config.yaml 的 roles 段里，而
@@ -635,7 +663,9 @@ async function selectThread(tid) {
   lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
   // 切线程清掉角色筛选（含单聊态）：成员名单换了，留着旧成员的过滤只会显示空流。
+  // #send-to 由 populateSendTo 重建 options（value 自然回到兜底首项），故此处只清标记。
   filterState.roles = null;
+  lastActiveMember = null;
   $$("#filter-roles input:checked").forEach((c) => { c.checked = false; });
   updateFilterUI();
   renderMemberRoster();
@@ -1308,7 +1338,9 @@ function populateFilterRoles(roles) {
   if (!uniq.includes("system")) uniq.push("system"); // system 事件可能出现
   box.innerHTML = uniq.map((r) => {
     const c = roleColor(r);
-    return `<label class="f-chip"><input type="checkbox" value="${escapeHtml(r)}" data-fkind="role"><span style="color:${c}">${escapeHtml(r)}</span></label>`;
+    // value 走 escapeHtmlAttr（escapeHtml 不转引号）：该属性值已是名册单聊的匹配关键
+    // 路径——toggleMemberChat 拿 c.value 与成员名比对，坏引号会静默切断整条单聊链。
+    return `<label class="f-chip"><input type="checkbox" value="${escapeHtmlAttr(r)}" data-fkind="role"><span style="color:${escapeHtmlAttr(c)}">${escapeHtml(r)}</span></label>`;
   }).join("");
 }
 
@@ -1327,6 +1359,16 @@ function readFilters() {
   filterState.roles = roleChecks.length ? new Set(roleChecks) : null;
   filterState.types = typeChecks.length ? new Set(typeChecks) : null;
   filterState.aOnly = $("#filter-aonly")?.checked || false;
+  // 离开某成员的单聊态（取消 / 清除全部 / 移除该 chip / 手动取消勾选）→ 解锁发送目标：
+  // 只在 value 恰好还锁在那个刚被取消的成员身上时回置为 ""（兜底首项 = to 为空 →
+  // moderator 路由）。不这么做的话 sendMessage 与 showAttach 会继续拿着旧目标跑；
+  // "恰好等于"这条限定保证不碰用户自己从下拉里挑的目标。
+  const nowActive = activeMemberRole();
+  if (lastActiveMember && lastActiveMember !== nowActive) {
+    const sel = $("#send-to");
+    if (sel && sel.value === lastActiveMember) sel.value = "";
+  }
+  lastActiveMember = nowActive;
   renderStream();
   updateFilterUI();
   renderMemberRoster();   // 单聊高亮是筛选态的派生量，筛选一变就跟着重算
@@ -1439,9 +1481,12 @@ function renderDispatchSummary(s) {
   if (!el) return;
   const disp = s.dispatches || [];
   const count = (st) => disp.filter((d) => d.status === st).length;
+  // dispatching 计数与"正在响应"胶囊、名册绿点走**同一** isLiveDispatch 判据：崩溃
+  // 滞留行不计入，否则线程头「dispatching N」长亮，与已熄灭的胶囊在同屏自相矛盾。
+  // 盘上原始行不因此消失——点开的派发明细表仍逐行如实显示并标注滞留。
   const items = [
     ["pending", count("pending")],
-    ["dispatching", count("dispatching")],
+    ["dispatching", disp.filter(isLiveDispatch).length],
     ["gate", s.status === "suspended" ? 1 : 0],
     ["failed", count("failed")],
   ].filter(([, n]) => n > 0);
@@ -1849,9 +1894,17 @@ async function showStatusDetail() {
   try {
     const s = await api(`/api/threads/${selectedThread}/status`);
     lastStatus = s;
-    let rows = (s.dispatches || []).map((d) =>
-      `<tr><td>E${escapeHtml(String(d.event_id))}</td><td>${escapeHtml(String(d.target))}</td><td>${escapeHtml(String(d.status))}</td><td>${escapeHtml(String(d.attempts))}</td></tr>`
-    ).join("");
+    // 明细表 = 盘上原始行，一行不删（与线程头 chips 的"只数在跑的"有意不同口径）；
+    // 已过截止的 dispatching 行加「滞留」标注，让两处口径的差额当场可解释。
+    let rows = (s.dispatches || []).map((d) => {
+      const stale = d.status === "dispatching" && !isLiveDispatch(d);
+      const st = escapeHtml(String(d.status)) +
+        // 行内 style 而非新 CSS 类：本回环卡白名单不含 styles.css，用 :root 已有的
+        // --gate 变量着色，零新增样式表改动。
+        (stale ? ' <span class="disp-stale" style="color:var(--gate)"' +
+                 ' title="已过截止时间：进程可能已崩溃，等看门狗对账">滞留</span>' : "");
+      return `<tr><td>E${escapeHtml(String(d.event_id))}</td><td>${escapeHtml(String(d.target))}</td><td>${st}</td><td>${escapeHtml(String(d.attempts))}</td></tr>`;
+    }).join("");
     // 投影已是全五态快照（含 done/gate_wait），空态文案随之改口径。
     if (!rows) rows = '<tr><td colspan="4">（无派发行）</td></tr>';
     const html =
