@@ -581,3 +581,197 @@ def test_method_not_allowed_405(tmp_dir):
         code, body = _req(base, "/api/health", "DELETE")
         assert code == 405, (code, body)
         assert "error" in body
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-12) 「本轮」统计：/events 同级键 round_stats
+#        窗口锚点 = 最后一条 sender=='human' 的事件（含该条）；无 human → 全量。
+#        服务端派生（纯函数、每请求现算、零缓存 §16.9），前端只渲染不重算。
+# ——————————————————————————————————————————————————————————————
+
+def _seed_thread(ws: Path, tid: str, rows: list[tuple]):
+    """按 (sender, type, ts) 顺序真落盘一条线程（ts 已知 → duration_s 可打真值）。
+
+    直接走 Store.append_event（同 CLI/web 的唯一落盘路径），不 mock；
+    线程目录由 Store.__init__ 建，故 /api/threads/{tid}/... 的存在性检查会通过。
+    """
+    store = orch.store.Store(ws / tid)
+    for sender, type_, ts in rows:
+        store.append_event(
+            sender=sender, type=type_, body=f"{sender}:{type_}",
+            to=["moderator"], ts=ts,
+        )
+    store.set_meta("status", "running")
+    return store
+
+
+def _round_stats_of(base: str, tid: str) -> dict:
+    code, body = _req(base, f"/api/threads/{tid}/events")
+    assert code == 200, (code, body)
+    assert "round_stats" in body, body
+    return body["round_stats"]
+
+
+def test_round_stats_window_is_all_events_when_no_human(tmp_dir):
+    """锚点边界①：零 human 事件 → 窗口 = 全部事件，anchor_event_id 为 None。"""
+    with _Serving(tmp_dir) as base:
+        _seed_thread(tmp_dir, "t-nohuman", [
+            ("pm", "chat", 1000.0),
+            ("backend", "report", 1010.0),
+            ("system", "system", 1015.0),
+        ])
+        rs = _round_stats_of(base, "t-nohuman")
+        assert rs["anchor_event_id"] is None, rs
+        assert rs["steps"] == 3, rs
+        assert rs["duration_s"] == pytest.approx(15.0), rs
+        # invoke = sender ∉ {human, system}：system 审计事件不算一次 invoke。
+        assert rs["invokes"] == 2, rs
+
+
+def test_round_stats_anchor_is_last_human_event(tmp_dir):
+    """锚点边界②：多条 human → 取**最后一条**（"自我上次说话以来"）。"""
+    with _Serving(tmp_dir) as base:
+        store = _seed_thread(tmp_dir, "t-multi", [
+            ("human", "assign", 100.0),
+            ("pm", "report", 110.0),
+            ("human", "question", 200.0),    # ← 锚点（含该条）
+            ("pm", "answer", 230.0),
+            ("backend", "report", 260.0),
+        ])
+        ids = [e["id"] for e in store.events()]
+        rs = _round_stats_of(base, "t-multi")
+        assert rs["anchor_event_id"] == ids[2], (rs, ids)
+        assert rs["steps"] == 3, rs
+        assert rs["duration_s"] == pytest.approx(60.0), rs
+        assert rs["invokes"] == 2, rs
+
+
+def test_round_stats_anchor_with_system_and_human_only(tmp_dir):
+    """锚点边界③：只有 system + human → 窗口含 human 锚点及其后 system，invokes=0。"""
+    with _Serving(tmp_dir) as base:
+        store = _seed_thread(tmp_dir, "t-sysonly", [
+            ("system", "system", 10.0),
+            ("human", "assign", 20.0),       # ← 锚点
+            ("system", "system", 25.0),
+        ])
+        ids = [e["id"] for e in store.events()]
+        rs = _round_stats_of(base, "t-sysonly")
+        assert rs["anchor_event_id"] == ids[1], (rs, ids)
+        assert rs["steps"] == 2, rs
+        assert rs["duration_s"] == pytest.approx(5.0), rs
+        assert rs["invokes"] == 0, rs
+
+
+def test_round_stats_single_event_window_and_empty_thread(tmp_dir):
+    """duration_s 数值边界：窗口 ≤ 1 条 → 0.0（不是 None、也不编造）。"""
+    with _Serving(tmp_dir) as base:
+        # 末条即人类消息 → 窗口只有 1 条。
+        store = _seed_thread(tmp_dir, "t-tail", [
+            ("pm", "report", 500.0),
+            ("human", "question", 900.0),    # ← 锚点即末条
+        ])
+        ids = [e["id"] for e in store.events()]
+        rs = _round_stats_of(base, "t-tail")
+        assert rs["anchor_event_id"] == ids[-1], (rs, ids)
+        assert rs["steps"] == 1, rs
+        assert rs["duration_s"] == 0.0, rs
+        assert rs["invokes"] == 0, rs
+
+        # 空线程（目录在、无事件）→ 全零 + anchor None。
+        orch.store.Store(tmp_dir / "t-empty")
+        rs2 = _round_stats_of(base, "t-empty")
+        assert rs2 == {
+            "anchor_event_id": None, "duration_s": 0.0, "steps": 0, "invokes": 0,
+        }, rs2
+
+
+def test_events_response_adds_round_stats_without_touching_event_shape(tmp_dir):
+    """round_stats 是 events 的**同级键**；events 元素结构一个键都不许动（冻结面）。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        code, body = _req(base, f"/api/threads/{tid}/events")
+        assert code == 200, (code, body)
+        assert set(body) == {"events", "round_stats"}, sorted(body)
+        assert set(body["round_stats"]) == {
+            "anchor_event_id", "duration_s", "steps", "invokes",
+        }, body["round_stats"]
+        assert set(body["events"][0]) == {
+            "id", "sender", "type", "to", "body", "corr", "re", "ts",
+            "meta", "artifacts", "bb_ops", "third_person",
+        }, sorted(body["events"][0])
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-13) 待办清单：首次声明序 + 展示层状态归一化（渲染在 app.js，判据两侧各打一半）
+# ——————————————————————————————————————————————————————————————
+
+def test_task_declaration_order_differs_from_lexicographic(tmp_dir):
+    """乱序声明两个 key（后声明者字典序更小）→ 两种排序结果必须相反。
+
+    渲染序本身在 app.js（全仓无 JS 运行时），这里打**服务端真值**：/events 按 id
+    升序直出 bb_ops，前端据"首次声明事件号"排序；同 key 后写只改 status 不改位次。
+    """
+    with _Serving(tmp_dir) as base:
+        store = orch.store.Store(tmp_dir / "t-order")
+        e1 = store.append_event(
+            sender="pm", type="decision", body="先声明 zzz", to=["moderator"],
+            blackboard_ops=[{"op": "set_task", "key": "zzz.first", "status": "doing"}])
+        e2 = store.append_event(
+            sender="pm", type="decision", body="后声明 aaa", to=["moderator"],
+            blackboard_ops=[{"op": "set_task", "key": "aaa.second", "status": "todo"}])
+        e3 = store.append_event(
+            sender="pm", type="decision", body="更新 zzz", to=["moderator"],
+            blackboard_ops=[{"op": "set_task", "key": "zzz.first", "status": "done"}])
+        store.set_meta("status", "running")
+
+        code, body = _req(base, "/api/threads/t-order/events")
+        assert code == 200, (code, body)
+        evs = body["events"]
+        assert [e["id"] for e in evs] == [e1, e2, e3], evs
+
+        first_seen: dict[str, int] = {}
+        latest: dict[str, str] = {}
+        for ev in evs:
+            for op in (ev["bb_ops"] or []):
+                if op.get("op") == "set_task":
+                    first_seen.setdefault(op["key"], ev["id"])
+                    latest[op["key"]] = op["status"]
+        decl_order = sorted(first_seen, key=lambda k: first_seen[k])
+        assert decl_order == ["zzz.first", "aaa.second"], first_seen
+        assert decl_order != sorted(first_seen), "fixture 无区分力：两种排序恰好同序"
+        # 同 key 后写只更新 status，首次声明事件号不变（位次不动）。
+        assert first_seen["zzz.first"] == e1, first_seen
+        assert latest["zzz.first"] == "done", latest
+        # 落盘 status 原文未被任何"规范化"改写（协议里 status 是自由字符串）。
+        assert latest["aaa.second"] == "todo", latest
+
+
+def test_app_js_task_checklist_order_and_status_glyphs(tmp_dir):
+    """app.js 关键判据存在性（沿 test_app_js_served 的字符串断言风格）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        # ① 排序改首次声明序：字典序那行必须消失，比较器按 firstSeen。
+        assert "Object.keys(tasks).sort()" not in js, "字典序排序必须被替换"
+        assert "firstSeen" in js
+        assert "tasks[a].firstSeen - tasks[b].firstSeen" in js
+        # ② 展示层归一化三档（只映射字形，不写回落盘、不改 protocol/schema.py）。
+        assert "function taskGlyph(status)" in js
+        assert "TASK_DONE_WORDS" in js and "TASK_DOING_WORDS" in js
+        for word in ("completed", "resolved", "已完成", "in_progress", "进行中"):
+            assert word in js, word
+        assert "✓" in js and "◐" in js and "○" in js
+        assert "不写回" in js, "须注明展示映射不是数据清洗"
+        # 未知值原文照排（不吞不改）。
+        assert "未识别状态" in js
+        # ③ 进度头「第 N/M 步」，M=0 不显示。
+        assert "bd-progress" in js
+        assert "步</span>" in js
+        # ④ 「本轮」统计卡：数据取自 /events 的 round_stats，前端不重算。
+        assert "lastRoundStats" in js
+        assert "data.round_stats" in js
+        assert "evData.round_stats" in js
+        assert "自最后一条人类消息起" in js
+        assert "工具数" in js, "缺栏理由须留注释（盘上无工具调用痕迹）"
+        # ⑤ 属性位一律 escapeHtmlAttr。
+        assert 'data-goto="${escapeHtmlAttr(String(t.evt))}"' in js

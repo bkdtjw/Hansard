@@ -21,6 +21,9 @@ const filterState = { roles: null, types: null, aOnly: false };
 let lastStatus = null;
 // 当前线程事件缓存（供过滤重渲染 / 跳转 / 黑板投影，均为库的只读投影）。
 let currentEvents = [];
+// 「本轮」统计：/events 响应的同级键 round_stats 原样存放（服务端每请求现算）。
+// 前端**不重算**任何一项——它只随事件变化，故随 renderBoard 一起重绘即可。
+let lastRoundStats = null;
 // R5：最近一次线程列表缓存（切换器/标题复用，仍是端点数据的只读投影）。
 let lastThreads = [];
 // R5 D3：每线程"首个 A 类自动展开一次"记忆 + A 类计数变化检测（新条目高亮）。
@@ -167,6 +170,7 @@ function switchWorkspace(name) {
   // 清干净线程态：停轮询、回空态首页，再拉新工作区数据。
   selectedThread = null;
   currentEvents = [];
+  lastRoundStats = null;   // 跨工作区不沿用上一条线程的统计窗口
   lastStatus = null;
   lastRoles = [];
   lastThreadRoles = [];
@@ -626,6 +630,7 @@ async function createThread() {
 async function selectThread(tid) {
   selectedThread = tid;
   lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
+  lastRoundStats = null;  // 统计窗口是线程内概念，切线程即作废（loadEvents 立刻重填）
   lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
   lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
@@ -1018,6 +1023,7 @@ async function loadEvents(force = true) {
   try {
     const data = await api(`/api/threads/${tid}/events`);
     if (tid !== selectedThread) return;   // 线程已切换：丢弃过期响应
+    lastRoundStats = data.round_stats || null;   // 供 renderBoard 的统计卡取用
     ingestEvents(data.events || [], force);
   } catch (e) {
     stream.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
@@ -1142,11 +1148,76 @@ function projectBoard(evs) {
       } else if (op.op === "set_decision") {
         decisions.push({ evt: ev.id, text: op.text });
       } else if (op.op === "set_task") {
-        tasks[op.key] = { status: op.status, evt: ev.id };
+        // firstSeen = 该 key **首次**被 set_task 声明时的事件号（evs 已按 id 升序，
+        // 故首次命中即最小者）。待办按它排序 = 声明序；同 key 后续更新只改
+        // status/evt，位次不动（字典序会让"后声明但名字靠前"的任务插队）。
+        const prev = tasks[op.key];
+        tasks[op.key] = {
+          status: op.status, evt: ev.id,
+          firstSeen: prev ? prev.firstSeen : ev.id,
+        };
       }
     }
   }
   return { contracts, decisions, tasks };
+}
+
+// 待办状态的**展示层**归一化：spec §3.3 里 set_task 的 status 是自由字符串
+// （protocol/schema.py 无枚举），这里只把常见写法映射到三档字形，**不写回**、
+// 不规范化任何落盘数据——是展示映射，不是数据清洗。未识别的值原文照排在字形后
+// （不吞不改），原始 status 另进 title。
+const TASK_DONE_WORDS = new Set(["done", "completed", "closed", "resolved", "完成", "已完成"]);
+const TASK_DOING_WORDS = new Set(["doing", "in_progress", "wip", "running", "进行中"]);
+
+function taskGlyph(status) {
+  const raw = String(status == null ? "" : status).trim();
+  const key = raw.toLowerCase();
+  if (TASK_DONE_WORDS.has(key)) return { glyph: "✓", cls: "done", text: "已完成", raw };
+  if (TASK_DOING_WORDS.has(key)) return { glyph: "◐", cls: "doing", text: "进行中", raw };
+  // 其余（含未知）归"未开始"：空值显示分类名，非空则原文照排。
+  return { glyph: "○", cls: "todo", text: raw || "未开始", raw, unknown: Boolean(raw) };
+}
+
+// 「本轮」统计卡：mm:ss（超一小时 h:mm:ss）。
+// ts 由 append 时 time.time() 赋值、库内递增；负值只可能来自人工造数，钳到 0
+// 免得显示成读不通的 -0:05（原始秒数仍在 title 里，不吞）。
+function fmtDuration(sec) {
+  const v = Number(sec);
+  if (!isFinite(v)) return "—";
+  const total = Math.max(0, Math.floor(v));
+  const p = (x) => String(x).padStart(2, "0");
+  const s = total % 60;
+  const m = Math.floor(total / 60) % 60;
+  const h = Math.floor(total / 3600);
+  return h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
+}
+
+// 统计卡三栏 = 耗时 / 步骤 / invoke 次数。数据**全部**取自 /events 响应的同级键
+// round_stats（服务端每请求现算），前端不重算——口径只留一处，避免两处漂移。
+// 「工具数」一栏有意**不做**：invoke 内部的工具调用在本系统盘上任何位置都无痕迹
+// （logs/ 落的是作者字段 dict repr 而非 stdout 原文），伪造口径比缺一栏更坏。
+function buildRoundStatsSection() {
+  const st = lastRoundStats;
+  if (!st) return "";
+  const anchor = st.anchor_event_id;
+  const tip = (anchor === null || anchor === undefined)
+    ? "本线程尚无人类消息：窗口 = 全部事件"
+    : `窗口 = 最后一条人类消息 #${anchor} 及其后的全部事件（含该条）`;
+  const cell = (val, lbl, title) =>
+    `<div class="rs-cell" title="${escapeHtmlAttr(title)}">` +
+      `<span class="rs-val mono">${escapeHtml(val)}</span>` +
+      `<span class="rs-lbl">${escapeHtml(lbl)}</span></div>`;
+  return (
+    `<section class="bd-sec rs-sec">` +
+      `<h4>本轮</h4>` +
+      `<div class="rs-grid">` +
+        cell(fmtDuration(st.duration_s), "耗时", `${st.duration_s} 秒（窗口内末条 ts − 首条 ts）`) +
+        cell(String(st.steps), "步骤", "窗口内事件数") +
+        cell(String(st.invokes), "invoke 次数", "窗口内 sender 非 human/system 的事件数") +
+      `</div>` +
+      `<p class="rs-note" title="${escapeHtmlAttr(tip)}">自最后一条人类消息起</p>` +
+    `</section>`
+  );
 }
 
 function renderBoard(evs) {
@@ -1154,7 +1225,10 @@ function renderBoard(evs) {
   if (!el) return;
   const { contracts, decisions, tasks } = projectBoard(evs);
   const names = Object.keys(contracts).sort();
-  const taskKeys = Object.keys(tasks).sort();
+  // 待办排序 = 首次声明的事件号升序（不是字典序）；同一条事件声明多个 key 时
+  // 按 key 名兜底，保证同一份数据每次渲染次序稳定。
+  const taskKeys = Object.keys(tasks).sort((a, b) =>
+    (tasks[a].firstSeen - tasks[b].firstSeen) || (a < b ? -1 : (a > b ? 1 : 0)));
 
   const contractRows = names.length
     ? names.map((n) => {
@@ -1176,16 +1250,31 @@ function renderBoard(evs) {
   const taskRows = taskKeys.length
     ? taskKeys.map((k) => {
         const t = tasks[k];
-        return `<tr><td class="mono">${escapeHtml(k)}</td>` +
-          `<td><span class="task-status ts-${escapeHtml(String(t.status || "").replace(/[^a-z0-9_-]/gi, ""))}">${escapeHtml(String(t.status))}</span></td>` +
-          `<td><button class="ln-chip bd-goto" data-goto="${escapeHtml(String(t.evt))}">#${escapeHtml(String(t.evt))}</button></td></tr>`;
+        const g = taskGlyph(t.status);
+        const stTip = g.unknown
+          ? `未识别状态「${g.raw}」：原文照排，归为未开始`
+          : `落盘 status=${g.raw || "（空）"}`;
+        return `<tr class="bd-task tk-${escapeHtmlAttr(g.cls)}">` +
+          `<td class="bd-task-key"><span class="task-glyph">${g.glyph}</span>` +
+          `<span class="mono">${escapeHtml(k)}</span></td>` +
+          `<td><span class="task-status ts-${escapeHtmlAttr(g.cls)}" title="${escapeHtmlAttr(stTip)}">${escapeHtml(g.text)}</span></td>` +
+          `<td><button class="ln-chip bd-goto" data-goto="${escapeHtmlAttr(String(t.evt))}">#${escapeHtml(String(t.evt))}</button></td></tr>`;
       }).join("")
     : '<tr><td colspan="3" class="bd-empty">PM 建立任务后显示状态</td></tr>';
+
+  // 进度头「第 N/M 步」：M=任务总数、N=已完成数（按上面同一套展示映射）。
+  // M=0 时不出进度头，保留现有空态文案。
+  const doneCount = taskKeys.filter((k) => taskGlyph(tasks[k].status).cls === "done").length;
+  const progress = taskKeys.length
+    ? `<span class="bd-progress" title="${escapeHtmlAttr(`已完成 ${doneCount} / 共 ${taskKeys.length} 项`)}">` +
+      `第 ${escapeHtml(String(doneCount))}/${escapeHtml(String(taskKeys.length))} 步</span>`
+    : "";
 
   el.innerHTML =
     `<section class="bd-sec"><h4>契约</h4><ul class="bd-list">${contractRows}</ul></section>` +
     `<section class="bd-sec"><h4>决策</h4><ul class="bd-list">${decisionRows}</ul></section>` +
-    `<section class="bd-sec"><h4>任务状态</h4><table class="bd-tasks"><thead><tr><th>任务</th><th>状态</th><th></th></tr></thead><tbody>${taskRows}</tbody></table></section>`;
+    buildRoundStatsSection() +
+    `<section class="bd-sec"><h4>任务状态${progress}</h4><table class="bd-tasks"><thead><tr><th>任务</th><th>状态</th><th></th></tr></thead><tbody>${taskRows}</tbody></table></section>`;
 
   // R5 D3：rail 图标条 A 类计数徽标。
   const aCount = evs.filter((e) => A_CLASS_TYPES.has(e.type)).length;
@@ -1552,6 +1641,7 @@ async function pollLoop() {
       api(`/api/threads/${tid}/status`),
     ]);
     if (tid !== selectedThread) { pollInFlight = false; return; }  // 已切线程：丢弃
+    lastRoundStats = evData.round_stats || null;
     ingestEvents(evData.events || [], false);
     applyStatusPayload(s);
   } catch (e) {

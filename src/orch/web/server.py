@@ -103,6 +103,45 @@ def _require_thread(ws: Path, tid: str) -> "orch.store.Store":
     return orch.store.Store(tdir)
 
 
+def _round_stats(events: list[dict]) -> dict:
+    """「本轮」统计（控制台右栏统计卡的唯一数据源）：自最后一条人类消息起的窗口。
+
+    「轮」在 spec 里零定义（run_thread 跑到终态才返回），故这里给出一个**可从盘上
+    重建**的口径：窗口锚点 = 最后一条 sender=='human' 的事件，窗口 = 锚点及其后的
+    全部事件（含锚点）；无 human 事件则窗口 = 全部事件、anchor_event_id=None。
+    语义即"自我上次说话以来"，刷新/换进程都不丢（§16.9：每请求现算，零缓存、
+    不留模块级可变状态）。
+
+    键名冻结 anchor_event_id/duration_s/steps/invokes：
+      · duration_s = 窗口内 last_ts − first_ts（窗口 ≤ 1 条 → 0.0，不编造）
+      · steps      = 窗口事件数
+      · invokes    = 窗口内 sender ∉ {human, system} 的事件数（system 是审计事件，
+                     不是一次模型调用）
+    **不出「工具数」一栏**：invoke 内部的工具调用在本系统盘上任何位置都无痕迹
+    （logs/ 今天落的是作者字段 dict repr 而非 stdout 原文），伪造口径比缺一栏更坏。
+
+    入参是 _ep_thread_events 的只读投影（含 sender/ts/id），不查库、不改数据。
+    """
+    evs = list(events or [])
+    anchor_idx = None
+    for i, ev in enumerate(evs):
+        if ev.get("sender") == "human":
+            anchor_idx = i          # 多条 human 取最后一条：不 break，扫到底
+    window = evs if anchor_idx is None else evs[anchor_idx:]
+    duration = 0.0
+    if len(window) > 1:
+        first_ts, last_ts = window[0].get("ts"), window[-1].get("ts")
+        if first_ts is not None and last_ts is not None:
+            duration = float(last_ts) - float(first_ts)
+    return {
+        "anchor_event_id": None if anchor_idx is None else evs[anchor_idx].get("id"),
+        "duration_s": duration,
+        "steps": len(window),
+        "invokes": sum(1 for ev in window
+                       if ev.get("sender") not in ("human", "system")),
+    }
+
+
 def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
     store = _require_thread(ws, tid)
     out = []
@@ -131,7 +170,8 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
             # 仅供 replay/审计口径参考；前端阅读列一律渲染 body 原文，绝不渲染此行（§16.7）。
             "third_person": orch.render.render_event_third_person(ev, viewer_role="human"),
         })
-    return 200, {"events": out}
+    # round_stats 是 events 的**同级键**（events 数组的元素结构是冻结面，一个键不动）。
+    return 200, {"events": out, "round_stats": _round_stats(out)}
 
 
 def _role_binding_projection(ws: Path, store: "orch.store.Store") -> list[dict]:
