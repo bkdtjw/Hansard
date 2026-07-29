@@ -92,12 +92,17 @@ def _read_config_file(cfg_path: Path) -> dict:
     """
     if not cfg_path.exists():
         return {}
+    import yaml  # pyyaml 已在 spec §14 白名单；MRO 见下，故须在 try 之外先拿到符号
     try:
-        import yaml  # pyyaml 已在 spec §14 白名单
         with cfg_path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         return dict(data) if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
+        # yaml.YAMLError 的 MRO 是 (YAMLError, Exception, BaseException, object)——
+        # **不是** ValueError 子类，这正是原缺陷根因：只写 (OSError, ValueError) 时，
+        # 语法写错的 config.yaml（缩进错/冒号后少空格/括号不闭合）会让解析异常穿透，
+        # CLI 带栈崩、web 控制台 status 端点被顶层兜底吞成 500（状态面板全黑）。
+        # 只扩到这三类，**不**写裸 except Exception（§16：真 bug 不该被降级吞掉）。
         return {}
 
 
