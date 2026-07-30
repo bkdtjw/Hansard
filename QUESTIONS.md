@@ -190,3 +190,26 @@ Q11 [console/§7.1×§14] invoke 内部执行过程（工具调用明细）可�
         自由（spec 未定义 serve），Lead 裁量采 A 的"解析摘要、原文不经 HTTP 直出"：
         §12 缺省绑 127.0.0.1 但无鉴权，Q9 档案已实证原文含 sessionId；残留风险与
         理由记 IMPLEMENTATION_NOTES。
+
+Q12 [store§4.6×§3.3×§9.1] rebuild_blackboard 重放不判 can_decide——崩溃恢复会把曾被
+    调度器拒绝的 bb_ops 应用进权威黑板（重放 ≠ 增量，违 §4.6"逐字段一致"）
+  背景: T2 回环卡（黑板权威化）施工中发现并实盘复现：真调度器跑完的线程（backend
+        can_decide=False 发 acceptance+set_task 被拒、有 system 审计事件）再调
+        rebuild_blackboard（§9.1 黑板缺失/损坏时的恢复路径），BEFORE/AFTER 的 tasks
+        与 decisions 不一致——被拒绝的 backend.selfclaim 与"自封的决策"被应用进去。
+        证据链（Lead 亲验 store 侧）：store/__init__.py:751 只按 _BB_OP_TYPES 过滤，
+        :746-747 docstring"落盘的这些 A 类事件即视为已通过门槛"对 acceptance 不成立
+        （protocol/rules.py 允许任意 sender 发 acceptance；scheduler/core.py
+        _apply_bb_if_eligible 才判 can_decide；store reply_and_done 无条件落
+        bb_ops_json）。展示层已改吃权威 state.json（T2 回环），故一旦发生 §9.1 恢复，
+        污染的是权威状态本身，控制台会如实显示被污染的结果。
+  选项: A rebuild 重放时按**当前 config** 的 can_decide 同判（实现最小、恢复语义与
+        调度层同源；但 config 在崩溃前后被改过时，恢复结果随 config 漂移——严格说
+        重放的是"现在的规则"而非"当时的事实"）；
+        B rebuild 跳过"存在对应拒绝审计事件"的 ops（不依赖 config；但需要从 system
+        审计事件机读定位被拒 op——若靠解析审计正文文案则踩 §16.1 方向，除非审计
+        事件本身结构化）；
+        C 落盘时在 A 类事件侧记录 applied/rejected 标志（重放最忠实；动信封字段或
+        落盘面，属 spec 修订，§3.1/§4.3/附录 A 需同改）；
+        D 维持现状并在文档写明恢复语义差异（§4.6 的 MUST 悬空，最差）。
+  裁决: （待人类）
