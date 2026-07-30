@@ -544,6 +544,8 @@ roles:
 
 start_cmd/resume_cmd 支持 `{cwd}` 占位：argv 分词之后逐 token 字面替换为该角色 worktree 绝对路径；含空格路径恒单 argv 元素；未出现占位时 argv 逐字节不变；不作用于自动注入的工具参数与视图正文。
 
+start_cmd/resume_cmd 另支持 `{model}` 占位：argv 分词之后逐 token 字面替换为该角色生效的模型名——取值 = roles 层 `model` 键，缺省回落 adapters 层 `model` 键（合并语义与其余键一致：role 层覆盖 adapter 层）；两层均未配置而命令含该占位 → 装载期报错（fail-closed，禁止空串替换或猜测缺省）；未出现占位时 argv 逐字节不变；不作用于自动注入的工具参数与视图正文。
+
 可用性与降级字段（§5.6）：`fallback` 为有序列表，缺省 `[]`（无备胎：不可用即等待人工处理）；`unavailable_patterns` / `trip_after` 为 adapter 级可选字段（缺省值属 §17）。装载时校验，违者启动报错：fallback 项必须是已声明的 adapter；tools 或 write_scope 非空的角色，其主绑定与 fallback 项**必须**为 cli 型（API 型不带工具循环，§7.3）。moderator **建议**配置非空 fallback（它不可用会阻塞兜底路由）。
 
 角色 = 配置。内置五角色只是预置文件；自定义角色即新增一段配置 + 提示词文件。**禁止**把任何角色逻辑写死进代码（moderator 的兜底地位除外——它是调度层机制的一部分）。同一角色可通过改一行 adapter 绑定在供应商之间热替换。

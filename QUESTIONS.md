@@ -213,3 +213,19 @@ Q12 [store§4.6×§3.3×§9.1] rebuild_blackboard 重放不判 can_decide——�
         落盘面，属 spec 修订，§3.1/§4.3/附录 A 需同改）；
         D 维持现状并在文档写明恢复语义差异（§4.6 的 MUST 悬空，最差）。
   裁决: （待人类）
+
+Q13 [adapters/§11.1] start_cmd 新增 `{model}` 占位 + roles/adapters 层 `model` 键
+    （每角色选模型，Q6 {cwd} 同构）
+  背景: 用户 2026-07-30 需求原话"每个负责人都可以选择使用什么cil，选择什么模型"。
+        调查确认：四家 CLI（grok/kimi/opencode -m、claude --model）实测均支持按次
+        指定模型；每模型抄一个 adapter 条目的替代路径会把供应商级额度拆成多份互不
+        知情的熔断状态（违 §5.6.1"额度是供应商级事实"），否决。占位语义与 {cwd}
+        同款：逐 token 字面替换、无占位逐字节不变、不作用于注入参数与正文；取值
+        role 层 model 覆盖 adapter 层 model，两层皆缺而命令含占位 → 装载期报错。
+  选项: A 采纳入 §11.1；B 每模型一条 adapter（额度碎片化，否决）；C 暂缓。
+  裁决: 2026-07-30 采 A。用户需求原话即实质授权；入宪确认问句被批"说人话"（用户
+        不关心治理流程，此类手续此后由 Lead 自办留痕，见 memory
+        plain-language-questions-only）。§11.1 行546 后已补 {model} 段。
+        配套裁决（同日）：控制台改写 config.yaml 采"行级外科手术替换"（只改目标行，
+        注释零损失；不认识的写法拒绝并提示手工编辑，不引入 ruamel.yaml，不整份
+        dump）——用户明选，记 NOTES 执行。
