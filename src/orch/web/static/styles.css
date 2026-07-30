@@ -947,10 +947,13 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
 }
 .mr-edit:hover { background: rgba(255, 255, 255, 0.12); color: var(--txt); }
 /* 底色/描边/投影一律复用 .glass-pop（与 ⋯ 菜单、筛选弹层同一档；无 blur）。 */
+/* 宽度**钳制**而非 min-width：min-width:268px 在窄视口（或折叠栏挤压时）会把弹层
+   顶出容器外，横向溢出整页。min() 让它在够宽时是 268，不够宽时贴着视口收（评审 建议8）。 */
 .mr-edit-pop {
   position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
   display: flex; flex-direction: column; gap: 7px;
-  min-width: 268px; padding: 11px 12px;
+  width: min(268px, calc(100vw - 24px)); max-width: calc(100vw - 24px);
+  padding: 11px 12px;
 }
 .mre-title { font-size: 12px; color: var(--txt-meta); }
 .mre-row { display: flex; align-items: center; gap: 8px; }
@@ -958,6 +961,9 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
 /* 覆盖 .inp 的 max-width:160px —— 面板里两个控件要撑满同一列，才对得齐。 */
 .mre-row .inp, .mre-row select.inp { flex: 1 1 auto; min-width: 0; max-width: none; }
 .mre-hint { font-size: 10.5px; color: var(--txt-dim); }
+/* 备胎提示：琥珀档（与 d-queued / .mr-sub.degraded 同源色，不新增色）——它是"看一眼"
+   级别的告知，不是错误，故不用 danger 红。 */
+.mre-warn { font-size: 10.5px; line-height: 1.45; color: var(--gate); }
 .mre-err { font-size: 11.5px; color: var(--danger-solid); white-space: pre-wrap; }
 .mre-btns { display: flex; gap: 8px; justify-content: flex-end; }
 

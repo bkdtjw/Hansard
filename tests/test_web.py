@@ -1986,6 +1986,16 @@ def _write_cfg(ws: Path, text: str) -> bytes:
     return (ws / "config.yaml").read_bytes()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return _sha256_bytes(text.encode("utf-8"))
+
+
 def _bind(base: str, **body):
     return _req(base, "/api/config/role-binding", "POST", body)
 
@@ -2306,3 +2316,317 @@ def test_app_js_typing_pill_uses_display_name(tmp_dir):
         bar = js.split("function updateTypingBar(s)", 1)[1].split("\n}\n", 1)[0]
         assert "const role = String(d.target);" in bar, bar
         assert "displayOf" not in bar, bar
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-15) C3 评审回环：两条配置写路的并发防线（进程内锁 + 跨源 CAS）、
+#        行级改写第二道闸的可单测化、GET/PUT 往返保真、⚙ 备胎提示
+# ——————————————————————————————————————————————————————————————
+
+def test_config_writes_serialize_under_lock_no_lost_update(tmp_dir):
+    """两个改**不同角色**的并发 POST 必须都落盘（应修1a）。
+
+    无锁时二者各自读到同一份旧全文、各改各的一行、后写者整份覆盖前者，而**两个请求
+    都回 ok:true** —— 静默丢更新（评审真并发实测 12 轮全中）。这里同样跑 12 轮，每轮
+    用 Barrier 把两个线程对齐到同一瞬间发车，再断言两条改动同时在盘上。
+    """
+    import threading as _th
+
+    with _Serving(tmp_dir) as base:
+        for i in range(12):
+            _write_cfg(tmp_dir, _BLOCK_CFG)
+            results = {}
+            gate = _th.Barrier(2, timeout=10)
+
+            def hit(role, value):
+                gate.wait()
+                results[role] = _bind(base, role=role, model=value)
+
+            threads = [_th.Thread(target=hit, args=("pm", f"pm-{i}")),
+                       _th.Thread(target=hit, args=("moderator", f"mod-{i}"))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=20)
+                assert not t.is_alive(), "并发请求卡死（锁用错了？）"
+
+            assert sorted(results) == ["moderator", "pm"], results
+            assert all(code == 200 for code, _ in results.values()), results
+            text = _cfg_text(tmp_dir)
+            # 两条都在 = 没有一条被对方整份覆盖掉。
+            assert f"model: pm-{i}" in text, f"第 {i} 轮丢了 pm 的改动：\n{text}"
+            assert f"model: mod-{i}" in text, f"第 {i} 轮丢了 moderator 的改动：\n{text}"
+            # 谁都没把对方的注释/结构带走。
+            assert "# 主绑定：这句注释必须活着" in text
+    assert not list(tmp_dir.glob(".config.yaml.*.tmp"))
+
+
+def test_config_put_cas_409_on_stale_full_text(tmp_dir):
+    """配置页载入 → ⚙ 改绑 → 再点保存：陈旧全文必须 409，不许整份盖掉 ⚙ 的改动（应修1b）。
+
+    这条路上两个请求**根本不并发**（人点的，隔着几分钟），进程内锁一点忙帮不上；
+    只有比较交换拦得住。
+    """
+    _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, got = _req(base, "/api/config")
+        assert code == 200, (code, got)
+        assert isinstance(got.get("fingerprint"), str) and got["fingerprint"], got
+        stale_text, stale_fp = got["yaml"], got["fingerprint"]
+
+        # 别处（名册 ⚙）改了绑 —— 盘上指纹随之变了。
+        code, _ = _bind(base, role="pm", adapter="cli_b")
+        assert code == 200
+        after_gear = _cfg_text(tmp_dir)
+        assert "adapter: cli_b" in after_gear
+
+        code, body = _req(base, "/api/config", "PUT",
+                          {"yaml": stale_text, "base_fingerprint": stale_fp})
+        assert code == 409, (code, body)
+        assert "已被别处修改" in body["error"], body
+        assert _cfg_text(tmp_dir) == after_gear, "409 必须一个字节都不写"
+
+        # 重新载入拿到新基线 → 同一份全文这次存得进去（人明确选择覆盖）。
+        code, fresh = _req(base, "/api/config")
+        assert code == 200
+        code, body = _req(base, "/api/config", "PUT",
+                          {"yaml": stale_text, "base_fingerprint": fresh["fingerprint"]})
+        assert code == 200, (code, body)
+        assert body["fingerprint"] == _sha256_text(stale_text), body
+    assert _cfg_text(tmp_dir) == stale_text
+
+
+def test_config_put_cas_treats_missing_file_as_a_real_baseline(tmp_dir):
+    """空串指纹 = "我载入时这里还没有文件"，也是**有效基线**：别人抢先建出来就得 409。"""
+    with _Serving(tmp_dir) as base:
+        code, got = _req(base, "/api/config")
+        assert code == 200 and got["exists"] is False, got
+        assert got["fingerprint"] == "", got
+
+        # 别处先建了一份。
+        _write_cfg(tmp_dir, _BLOCK_CFG)
+        code, body = _req(base, "/api/config", "PUT",
+                          {"yaml": "adapters: {}\nroles: {}\n", "base_fingerprint": ""})
+        assert code == 409, (code, body)
+        assert _cfg_text(tmp_dir) == _BLOCK_CFG
+
+
+def test_config_put_without_base_fingerprint_keeps_old_behavior(tmp_dir):
+    """不带 base_fingerprint（老前端 / 脚本）→ 行为逐字同旧：无条件覆盖，不 409。"""
+    _write_cfg(tmp_dir, _BLOCK_CFG)
+    good = "adapters: {}\nroles: {}\n"
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, "/api/config", "PUT", {"yaml": good})
+        assert code == 200, (code, body)
+        assert body.get("ok") is True, body
+    assert _cfg_text(tmp_dir) == good
+
+
+def test_config_get_put_roundtrip_preserves_crlf(tmp_dir):
+    """GET→PUT 往返逐字节保真（建议3）：GET 读字节解码，不做通用换行归一。
+
+    原缺陷：GET 走 read_text（\\r\\n → \\n）而 PUT 逐字节写，于是"看一眼配置再存回去"
+    就把盘上一份 CRLF 文件整份翻成 LF —— 全文 diff 噪音，且与行级手术的保真口径打架。
+    """
+    crlf = _BLOCK_CFG.replace("\n", "\r\n").encode("utf-8")
+    (tmp_dir / "config.yaml").write_bytes(crlf)
+    with _Serving(tmp_dir) as base:
+        code, got = _req(base, "/api/config")
+        assert code == 200, (code, got)
+        assert "\r\n" in got["yaml"], "GET 不得把盘上的 CRLF 归一成 LF"
+        assert got["fingerprint"] == _sha256_bytes(crlf), got
+        code, body = _req(base, "/api/config", "PUT",
+                          {"yaml": got["yaml"], "base_fingerprint": got["fingerprint"]})
+        assert code == 200, (code, body)
+    assert (tmp_dir / "config.yaml").read_bytes() == crlf, "往返必须逐字节不变"
+
+
+# —— 应修2：行级改写第二道闸抽成纯函数后的**真覆盖**（删闸必红）——
+
+_VERIFY_BEFORE = (
+    "roles:\n"
+    "  pm:\n"
+    "    adapter: cli_a\n"
+    "  moderator:\n"
+    "    adapter: cli_b\n"
+)
+
+
+def test_verify_surgical_rewrite_accepts_a_clean_rewrite():
+    """干净改写：只有目标键变了 → 放行，并把解析产物给调用方（省一次 safe_load）。"""
+    from orch.web.server import _verify_surgical_rewrite
+
+    after_raw = _VERIFY_BEFORE.replace("    adapter: cli_a\n", "    adapter: cli_b\n")
+    doc = _verify_surgical_rewrite(_VERIFY_BEFORE, after_raw, "pm", {"adapter": "cli_b"})
+    assert doc["roles"]["pm"]["adapter"] == "cli_b"
+    assert doc["roles"]["moderator"]["adapter"] == "cli_b"
+
+
+def test_verify_surgical_rewrite_rejects_collateral_change_on_another_role():
+    """模拟替换器定位错行：目标值改对了，却顺手把**另一个角色**的一行也改了。
+
+    字节层面这仍是"只改了两行"，diff 看着人畜无害——只有语义比对能把它抓出来。
+    """
+    from orch.web.server import _ApiError, _verify_surgical_rewrite
+
+    polluted = (
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_b\n"          # 目标：改对了
+        "  moderator:\n"
+        "    adapter: cli_zzz\n"        # 波及：这一行根本不该动
+    )
+    with pytest.raises(_ApiError) as ei:
+        _verify_surgical_rewrite(_VERIFY_BEFORE, polluted, "pm", {"adapter": "cli_b"})
+    assert ei.value.status == 400
+    assert "波及" in ei.value.message, ei.value.message
+
+
+def test_verify_surgical_rewrite_rejects_extra_key_in_target_role():
+    """波及面也包括**目标角色自己的别的键**：多插一个 can_decide 同样要拦。"""
+    from orch.web.server import _ApiError, _verify_surgical_rewrite
+
+    polluted = (
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_b\n"
+        "    can_decide: true\n"        # 原文没有这一行
+        "  moderator:\n"
+        "    adapter: cli_b\n"
+    )
+    with pytest.raises(_ApiError):
+        _verify_surgical_rewrite(_VERIFY_BEFORE, polluted, "pm", {"adapter": "cli_b"})
+
+
+def test_verify_surgical_rewrite_rejects_wrong_or_undeleted_target_value():
+    """目标键本身没变成想要的样子：值不对 / 该删的没删掉，两种都拦。"""
+    from orch.web.server import _ApiError, _verify_surgical_rewrite
+
+    wrong = _VERIFY_BEFORE.replace("    adapter: cli_a\n", "    adapter: cli_c\n")
+    with pytest.raises(_ApiError) as ei:
+        _verify_surgical_rewrite(_VERIFY_BEFORE, wrong, "pm", {"adapter": "cli_b"})
+    assert "与请求不符" in ei.value.message, ei.value.message
+
+    kept = (
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_a\n"
+        "    model: m1\n"
+        "  moderator:\n"
+        "    adapter: cli_b\n"
+    )
+    with pytest.raises(_ApiError) as ei:
+        _verify_surgical_rewrite(kept, kept, "pm", {"model": None})
+    assert "没能删掉" in ei.value.message, ei.value.message
+
+
+def test_role_binding_write_path_is_locked_and_verified():
+    """HTTP 写路径确实经过这两道闸（删掉任一道，本条即红）。"""
+    import inspect
+
+    from orch.web.server import (_apply_role_binding, _ep_config_put,
+                                 _ep_config_role_binding)
+
+    apply_src = inspect.getsource(_apply_role_binding)
+    assert "_verify_surgical_rewrite(" in apply_src, apply_src
+    # 自证在写盘**之前**（顺序错了等于没闸）。
+    assert (apply_src.index("_verify_surgical_rewrite(")
+            < apply_src.index("_atomic_write_bytes(")), apply_src
+    assert "with _CONFIG_WRITE_LOCK:" in inspect.getsource(_ep_config_role_binding)
+    assert "with _CONFIG_WRITE_LOCK:" in inspect.getsource(_ep_config_put)
+
+
+def test_status_roles_projection_carries_fallback(tmp_dir):
+    """/status 的 roles[] 带 fallback 原样名单（⚙ 面板的备胎提示要点名，建议4）。"""
+    (tmp_dir / "config.yaml").write_text(
+        "adapters:\n"
+        "  cli_a:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-a -p\n"
+        "  cli_b:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-b -p\n"
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_a\n"
+        "    fallback: [cli_b, cli_a]\n"
+        "  moderator:\n"
+        "    adapter: cli_b\n",
+        encoding="utf-8",
+    )
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert _roles_row(body, "pm")["fallback"] == ["cli_b", "cli_a"]
+        assert _roles_row(body, "moderator")["fallback"] == []
+
+
+def test_app_js_config_page_does_cas_with_fingerprint(tmp_dir):
+    """配置页：载入存指纹、保存带上、409 走"提示 + 重新载入"（应修1b 前端半边）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        load = js.split("async function loadConfig()", 1)[1].split("\n}\n", 1)[0]
+        assert "configFingerprint =" in load, load
+        save = js.split("async function saveConfig()", 1)[1].split("\n}\n", 1)[0]
+        assert "body.base_fingerprint = configFingerprint;" in save, save
+        assert "e.status === 409" in save, save
+        assert "await loadConfig();" in save, save
+        # 有未保存手改时**不**拿盘上版本覆盖它（刷新不能吃掉人正在写的东西）。
+        assert "configLoadedText" in save, save
+        # api() 把状态码带出来，调用方才分得清 409 与普通失败。
+        assert "err.status = resp.status;" in js
+
+
+def test_app_js_editor_warns_model_flows_into_fallbacks(tmp_dir):
+    """⚙ 面板：该角色 fallback 非空时点名提示"模型名同样用于备胎"（建议4，纯提示不拦截）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        panel = js.split("function memberEditPanel(row)", 1)[1].split("\n}\n", 1)[0]
+        assert "row.fallback" in panel, panel
+        assert "模型名将同样用于备胎" in panel, panel
+        assert "异构备胎可能不认识该名称" in panel, panel
+        # 名单是 config 可控文本 → 文本位必须转义。
+        assert "escapeHtml(fb.join" in panel, panel
+        # 空名单时一个字都不出（恒态提示 = 噪音）。
+        assert 'fb.length' in panel and '": ""' not in panel, panel
+        code, css = _req(base, "/styles.css")
+        assert ".mre-warn" in css
+
+
+def test_app_js_role_binding_chip_title_uses_attr_escape(tmp_dir):
+    """#role-bindings 的 title 是属性位 → escapeHtmlAttr（建议6：escapeHtml 不转引号）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        rb = js.split("function renderRoleBindings()", 1)[1].split("\n}\n", 1)[0]
+        assert "const primaryAttr = escapeHtmlAttr(String(r.primary));" in rb, rb
+        assert "title=\"主绑定 ${primaryAttr} 与全部备胎均已停用" in rb, rb
+        assert "title=\"主绑定 ${primaryAttr} 已停用" in rb, rb
+        # 文本位仍走 escapeHtml（两种位置各按各的口径，不是一刀切）。
+        assert "${role} ⛔${primary}→${escapeHtml(String(r.effective))}" in rb, rb
+
+
+def test_app_js_model_family_guess_does_not_overmatch_oc(tmp_dir):
+    """家族猜测：'oc' 只认独立分段，local_cli / mock_cli 不再被误判成 opencode（建议7）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        fn = js.split("function modelCandidates(adapterName)", 1)[1].split("\n}\n", 1)[0]
+        assert 'n.includes("oc")' not in fn, fn
+        assert 'segs.includes("oc")' in fn, fn
+        assert "n.split(" in fn, fn
+        assert "只影响候选提示" in js
+
+
+def test_styles_member_edit_pop_width_is_clamped(tmp_dir):
+    """⚙ 弹层宽度钳制到视口内，不再用 min-width 顶穿窄视口（建议8）。"""
+    with _Serving(tmp_dir) as base:
+        code, css = _req(base, "/styles.css")
+        assert code == 200, code
+        block = css.split(".mr-edit-pop {", 1)[1].split("}", 1)[0]
+        assert "min-width" not in block, block
+        assert "width: min(268px, calc(100vw - 24px));" in block, block
+        assert "backdrop-filter" not in block, block

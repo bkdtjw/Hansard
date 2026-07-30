@@ -13,9 +13,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import threading
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -290,9 +292,15 @@ def _role_binding_projection(
 ) -> list[dict]:
     """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
 
-    返回投影行，键名 {role, display_name, model, primary, effective, blocked}；
+    返回投影行，键名 {role, display_name, model, fallback, primary, effective, blocked}；
     effective=None ⇔ blocked=True（该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用
     state.resolve_effective_adapter，与调度层同一判据；本函数**不写盘、不改配置**。
+
+    fallback（C3 回环追加）= 该角色 config 里声明的备胎名单原样（没配 → 空表）。加它
+    **不是**为了让前端自己算降级链（那是 resolve_effective_adapter 的活，判据只留一处），
+    而是 ⚙ 改绑面板要说出一句实话：role 层的 model 会随合并语义**同样用到备胎身上**，
+    异构备胎多半不认识那个名字（评审实测 grok 的模型名流进 opencode 备胎）。这句提示
+    需要备胎**名单**，而控制台零依赖、没有 YAML 解析器，除了这条投影拿不到它。
 
     model（C3 追加的**纯呈现**键，同 display_name/started_ts 加键先例）= 该角色生效的
     模型名，取值链 role 层 model → 主绑定 adapter 层 model → None。两处细节：
@@ -354,10 +362,14 @@ def _role_binding_projection(
             raw_model = ac.get("model") if isinstance(ac, dict) else None
         model = (str(raw_model)
                  if (raw_model is not None and str(raw_model).strip()) else None)
+        raw_fb = rc.get("fallback")
+        fallback = ([str(x) for x in raw_fb]
+                    if isinstance(raw_fb, (list, tuple)) else [])
         out.append({
             "role": role,
             "display_name": display,
             "model": model,
+            "fallback": fallback,
             "primary": primary,
             "effective": effective,
             "blocked": effective is None,
@@ -715,21 +727,69 @@ def _ep_stop(ws: Path) -> tuple[int, dict]:
     return 200, {"ok": True}
 
 
-def _ep_config_get(ws: Path) -> tuple[int, dict]:
-    cfg = ws / "config.yaml"
-    if not cfg.exists():
-        return 200, {"yaml": "", "exists": False}
+# ——————————————————————————————————————————————————————————————
+# config.yaml 的两条写路（PUT 整存 / POST 行级改绑）的并发防线（评审 应修1）。
+#
+# 两层，缺一不可，各挡各的：
+#   a. **进程内互斥** —— 下面这把锁。ThreadingHTTPServer 每请求起一个线程，而两条写路
+#      都是"读盘-改-写"；无锁时两个改**不同角色**的并发 POST 会各自读到同一份旧全文、
+#      各改各的一行、后写者整份覆盖前者，**两个请求都回 ok:true**（评审真并发实测 12
+#      轮全部静默丢更新）。锁把整个临界区串行化，单进程内即正确。
+#      它**不是** §16.9 禁的那种模块级可变状态：不缓存任何业务事实、不跨请求携带信息、
+#      进程重启即归零，没有任何判定读它——只是把并发压回串行。
+#   b. **跨源 CAS** —— 锁管不到另一个 orch web 进程、CLI、编辑器，更管不到"配置页
+#      textarea 十分钟前载入的那份陈旧全文"（最常见的丢更新形态：载入 → ⚙ 改绑 →
+#      点保存，陈旧全文把 ⚙ 的改动整份盖掉；这条路上两个请求根本不并发，锁无从生效）。
+#      故 GET 给指纹、PUT 可带 base_fingerprint 做比较交换。
+# ——————————————————————————————————————————————————————————————
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+def _config_fingerprint(data: bytes | None) -> str:
+    """盘上这一份 config 的指纹 = 全文 sha256；**文件不存在 → 空串**。
+
+    空串是个**有意义的基线**（"我载入时这里还没有文件"），不是"没有基线"：拿它做
+    CAS，别人抢先建出文件时照样能判出冲突。
+    """
+    return "" if data is None else hashlib.sha256(data).hexdigest()
+
+
+def _read_config_bytes(target: Path) -> bytes | None:
+    """config.yaml 的原始字节；不存在 → None（其余 OSError 照抛，不吞真故障）。"""
     try:
-        raw = cfg.read_text(encoding="utf-8")
-    except OSError as e:
-        raise _ApiError(500, "config 读取失败") from e
-    return 200, {"yaml": raw, "exists": True}
+        return target.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _ep_config_get(ws: Path) -> tuple[int, dict]:
+    """GET /api/config → {yaml, exists, fingerprint}。
+
+    读**字节再解码**而不是 read_text（评审 建议3）：后者按通用换行把 \\r\\n 归一成
+    \\n，于是"GET 出来原样 PUT 回去"会把盘上一份 CRLF 文件悄悄翻成 LF —— 往返有损，
+    而 PUT 侧已经是逐字节写，两边一配就成了"看一眼配置就改了全文换行"。
+    （浏览器 textarea 自身仍会把 CRLF 归一成 LF，那一步在 DOM 规范里，服务端管不着；
+    本修复保证的是**协议层**往返保真：GET 给什么，PUT 原样回来就写什么。）
+    """
+    cfg = ws / "config.yaml"
+    raw_bytes = _read_config_bytes(cfg)
+    if raw_bytes is None:
+        return 200, {"yaml": "", "exists": False, "fingerprint": ""}
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise _ApiError(500, "config.yaml 不是 UTF-8 编码，控制台无法安全载入") from e
+    return 200, {"yaml": raw, "exists": True,
+                 "fingerprint": _config_fingerprint(raw_bytes)}
 
 
 def _ep_config_put(ws: Path, body: dict) -> tuple[int, dict]:
     raw = body.get("yaml")
     if raw is None or not isinstance(raw, str):
         raise _ApiError(400, "yaml 必填（字符串）")
+    base_fp = body.get("base_fingerprint")
+    if base_fp is not None and not isinstance(base_fp, str):
+        raise _ApiError(400, "base_fingerprint 必须是字符串（GET /api/config 给的那个）")
     import yaml  # pyyaml 已在依赖白名单
     try:
         parsed = yaml.safe_load(raw)  # 仅校验可解析；不改结构
@@ -741,20 +801,32 @@ def _ep_config_put(ws: Path, body: dict) -> tuple[int, dict]:
     # 已经在盘上，常驻 run 每轮重读会持续拒绝启动。复用 state 里的同一个纯函数
     # （不拷第二份判据，也不在此处收紧规则）。顶层非映射（列表/标量）跳过校验：
     # 那种形状 validate_availability_config 本就只回空表，装载期由别处报错。
+    # 这一段**不必持锁**：它的输入只有请求正文，与盘上内容无关。
     from orch.adapters.state import validate_availability_config
 
     if isinstance(parsed, dict):
         errors = validate_availability_config(parsed)
         if errors:
             raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
-    ws.mkdir(parents=True, exist_ok=True)
-    # 写盘走**唯一**的原子写入口 _atomic_write_bytes（见那里的存在理由）。这里刻意
-    # 自己 encode 成 bytes 而不再用文本模式：文本模式在 Windows 上会把 \n 悄悄转成
-    # \r\n，而 C3 的行级手术端点必须逐字节保真——同一份 config.yaml 上两条写路各持
-    # 一套换行策略，会让"改一行"与"整存一次"互相把对方的换行全文重写，diff 全是噪音。
-    # 现在两条路一致：请求正文里是什么字节，盘上就是什么字节。
-    _atomic_write_bytes(ws / "config.yaml", raw.encode("utf-8"))
-    return 200, {"ok": True}
+    data = raw.encode("utf-8")
+    target = ws / "config.yaml"
+    # 临界区：CAS 比对 → 原子写。中间不许有别的写者插进来，否则"比过了"当场作废。
+    with _CONFIG_WRITE_LOCK:
+        if base_fp is not None:
+            current = _config_fingerprint(_read_config_bytes(target))
+            if current != base_fp:
+                raise _ApiError(
+                    409, "配置已被别处修改（可能是名册 ⚙ 改绑、另一个页签保存或手工编辑），"
+                         "请重新载入后再保存")
+        ws.mkdir(parents=True, exist_ok=True)
+        # 写盘走**唯一**的原子写入口 _atomic_write_bytes（见那里的存在理由）。这里刻意
+        # 自己 encode 成 bytes 而不再用文本模式：文本模式在 Windows 上会把 \n 悄悄转成
+        # \r\n，而 C3 的行级手术端点必须逐字节保真——同一份 config.yaml 上两条写路各持
+        # 一套换行策略，会让"改一行"与"整存一次"互相把对方的换行全文重写，diff 全是噪音。
+        # 现在两条路一致：请求正文里是什么字节，盘上就是什么字节。
+        _atomic_write_bytes(target, data)
+    # 回新指纹：前端把 CAS 基线就地更新，连存两次不必中间再 GET 一趟。
+    return 200, {"ok": True, "fingerprint": _config_fingerprint(data)}
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -1138,6 +1210,122 @@ def _edit_role_binding_text(raw: str, role: str, *, adapter: str | None,
     return "".join(out)
 
 
+def _verify_surgical_rewrite(before_raw: str, after_raw: str, role: str,
+                             changes: dict) -> dict:
+    """行级改写的**第二道闸**：语义层面自证"只改了该改的，别的一个键都没动"。
+
+    ``changes`` = 本次**刻意**要改的键 → 目标值；值 ``None`` 表示"这个键应当被删掉"：
+        {"adapter": "cli_b"}          换主绑定
+        {"model": "opencode/k3"}      钉模型
+        {"model": None}               删模型键（回落 adapter 层缺省）
+    返回改写后全文的解析产物（调用方拿去跑 §11.1 校验与组响应，不必再 safe_load 一遍）。
+    任何一条不成立即抛 ``_ApiError(400)``，调用方据此**放弃写盘**。
+
+    **为什么必须有这道闸**（评审 应修2：它原先内联在端点里、无任何用例覆盖）：字节层面
+    "只动一个 token"由替换器保证，但替换器一旦**定位错行**（缩进判定、唯一性判定出偏差），
+    它照样规规矩矩只改一行——只是改到了别的角色头上，字节数、diff 行数全都正常。本函数
+    把"改写前后除目标键外解析产物必须完全相等"钉死，定位错行当场现形。
+
+    纯函数：只吃两段文本，不读盘不写盘，故可以直接喂"被污染的改写产物"做单测。
+    """
+    import copy
+
+    import yaml  # pyyaml 已在依赖白名单
+
+    def _role_conf(doc):
+        roles = doc.get("roles") if isinstance(doc, dict) else None
+        return roles.get(role) if isinstance(roles, dict) else None
+
+    try:
+        before = yaml.safe_load(before_raw)
+    except yaml.YAMLError as exc:
+        raise _hand_edit_error("改写前的 config 解析不了") from exc
+    try:
+        after = yaml.safe_load(after_raw)
+    except yaml.YAMLError as exc:
+        raise _hand_edit_error("改写后的 config 反而解析不了") from exc
+    rc_after = _role_conf(after)
+    if not isinstance(rc_after, dict):
+        raise _hand_edit_error("改写后角色段的形状变了")
+    # ① 目标键确实变成了想要的值（防止引号/转义把值写成别的东西）。
+    for key, want in changes.items():
+        if want is None:
+            if key in rc_after:
+                raise _hand_edit_error(f"{key} 键没能删掉")
+        elif str(rc_after.get(key)) != str(want):
+            raise _hand_edit_error(f"改写后 {key} 的值与请求不符")
+    # ② 其余配置**一个键都没波及**：抹平目标键后两份解析产物必须完全相等。
+    b2, a2 = copy.deepcopy(before), copy.deepcopy(after)
+    for doc in (b2, a2):
+        rc = _role_conf(doc)
+        if isinstance(rc, dict):
+            for key in changes:
+                rc.pop(key, None)
+    if b2 != a2:
+        raise _hand_edit_error("改写波及了本次目标之外的配置")
+    return after
+
+
+def _apply_role_binding(target: Path, role: str, *, adapter: str | None,
+                        model: str | None, set_model: bool) -> tuple[int, dict]:
+    """读盘 → 行级改写 → 自证 → §11.1 校验 → 原子写。**调用方必须持 _CONFIG_WRITE_LOCK**。
+
+    整段是一个不可分割的临界区：中间任何一步之后被别的写者插进来，前面读到的全文就
+    过期了，而本函数正是拿那份全文当改写基线的（应修1a）。
+    """
+    import yaml  # pyyaml 已在依赖白名单
+
+    from orch.adapters.state import validate_availability_config
+
+    raw_bytes = _read_config_bytes(target)
+    if raw_bytes is None:
+        raise _ApiError(404, f"该工作区还没有 config.yaml，无从改角色 {role} 的绑定")
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ApiError(400, "config.yaml 不是 UTF-8 编码，无法安全自动修改，请手工编辑") from exc
+    try:
+        before = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        # 先修语法再改绑：坏文件上做行级替换 = 在看不懂的东西上动刀。
+        raise _ApiError(
+            400, "config.yaml 当前无法解析（语法错），请先到配置页修好再改绑") from exc
+    if not isinstance(before, dict):
+        raise _ApiError(400, "config.yaml 顶层不是映射，无法改绑")
+    roles_cfg = before.get("roles")
+    if not isinstance(roles_cfg, dict) or role not in roles_cfg:
+        raise _ApiError(404, f"config.yaml 的 roles 段里没有角色 {role}")
+    adapters_cfg = before.get("adapters")
+    if not isinstance(adapters_cfg, dict):
+        adapters_cfg = {}
+    if adapter is not None and adapter not in adapters_cfg:
+        raise _ApiError(
+            400, f"adapters 段未声明 {adapter}：请先在配置页声明它，再来改绑")
+
+    new_raw = _edit_role_binding_text(
+        raw, role, adapter=adapter, model=model, set_model=set_model)
+    if new_raw == raw:
+        # 没有实质改动（如删一个本就不存在的 model 键）：不写盘，盘上一个字节不动。
+        return 200, {"ok": True, "changed": False, "role": role}
+
+    changes: dict = {}
+    if adapter is not None:
+        changes["adapter"] = adapter
+    if set_model:
+        changes["model"] = model
+    after = _verify_surgical_rewrite(raw, new_raw, role, changes)
+    # §11.1 装载期校验前置到写盘之前（与 PUT /api/config 同一函数、同一口径）：
+    # 换到命令行含 {model} 占位的 adapter 而两层都没模型值，就在这里被拦下。
+    errors = validate_availability_config(after)
+    if errors:
+        raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
+
+    _atomic_write_bytes(target, new_raw.encode("utf-8"))
+    rc_after = after["roles"][role]
+    return 200, {"ok": True, "changed": True, "role": role,
+                 "adapter": rc_after.get("adapter"), "model": rc_after.get("model")}
+
+
 def _ep_config_role_binding(ws: Path, body: dict) -> tuple[int, dict]:
     """POST /api/config/role-binding —— 改某角色的主绑定 adapter 与/或模型名。
 
@@ -1152,13 +1340,12 @@ def _ep_config_role_binding(ws: Path, body: dict) -> tuple[int, dict]:
                   联网才知道，把清单写进代码等于每次供应商改名就撒谎（与
                   ``state.validate_availability_config`` 规则 3 的边界同源）。UI 侧的候选
                   下拉是提示，不是判据。
+
+    **不做 CAS**（与 PUT /api/config 有意不同，应修1b）：本端点在锁内**现读现改**——
+    改写基线就是刚刚读出来的那一份，不存在"客户端十分钟前载入的陈旧全文"这种东西，
+    没有可比对的旧基线，也就无从冲突。要 CAS 的是 PUT 那条路：它带来的是一份**离线
+    编辑过的整份全文**，与盘上现状可能已经差了好几次改动。
     """
-    import copy
-
-    import yaml  # pyyaml 已在依赖白名单
-
-    from orch.adapters.state import validate_availability_config
-
     role = body.get("role")
     if not role or not isinstance(role, str):
         raise _ApiError(400, "role 必填（字符串）")
@@ -1188,78 +1375,13 @@ def _ep_config_role_binding(ws: Path, body: dict) -> tuple[int, dict]:
                     400, f"模型名 {model!r} 含空白/引号等字符，无法安全写成裸标量，"
                          f"请到配置页手工编辑")
 
-    target = clim._workspace_config_path(ws)
-    try:
-        raw_bytes = target.read_bytes()
-    except FileNotFoundError:
-        raise _ApiError(404, f"该工作区还没有 config.yaml，无从改角色 {role} 的绑定")
-    except OSError as exc:
-        raise _ApiError(500, f"config.yaml 读取失败：{clim._one_line(exc)}") from exc
-    try:
-        raw = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _ApiError(400, "config.yaml 不是 UTF-8 编码，无法安全自动修改，请手工编辑") from exc
-    try:
-        before = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        # 先修语法再改绑：坏文件上做行级替换 = 在看不懂的东西上动刀。
-        raise _ApiError(
-            400, "config.yaml 当前无法解析（语法错），请先到配置页修好再改绑") from exc
-    if not isinstance(before, dict):
-        raise _ApiError(400, "config.yaml 顶层不是映射，无法改绑")
-    roles_cfg = before.get("roles")
-    if not isinstance(roles_cfg, dict) or role not in roles_cfg:
-        raise _ApiError(404, f"config.yaml 的 roles 段里没有角色 {role}")
-    adapters_cfg = before.get("adapters")
-    if not isinstance(adapters_cfg, dict):
-        adapters_cfg = {}
-    if adapter is not None and adapter not in adapters_cfg:
-        raise _ApiError(
-            400, f"adapters 段未声明 {adapter}：请先在配置页声明它，再来改绑")
-
-    new_raw = _edit_role_binding_text(
-        raw, role, adapter=adapter, model=model, set_model=has_model)
-    if new_raw == raw:
-        # 没有实质改动（如删一个本就不存在的 model 键）：不写盘，盘上一个字节不动。
-        return 200, {"ok": True, "changed": False, "role": role}
-
-    # —— 改写后的三重自证（全过才落盘；任一条不过 = 盘上一个字节不动）——
-    try:
-        after = yaml.safe_load(new_raw)
-    except yaml.YAMLError as exc:
-        raise _hand_edit_error("改写后的 config 反而解析不了") from exc
-    rc_after = after.get("roles", {}).get(role) if isinstance(after, dict) else None
-    if not isinstance(rc_after, dict):
-        raise _hand_edit_error("改写后角色段的形状变了")
-    # ① 目标键确实变成了想要的值（防止引号/转义把值写成别的东西）。
-    if adapter is not None and str(rc_after.get("adapter")) != adapter:
-        raise _hand_edit_error("改写后 adapter 的值与请求不符")
-    if has_model:
-        if model is None and "model" in rc_after:
-            raise _hand_edit_error("model 键没能删掉")
-        if model is not None and str(rc_after.get("model")) != model:
-            raise _hand_edit_error("改写后 model 的值与请求不符")
-    # ② 其余配置**一个键都没波及**：把本次刻意改的键抹平后两份解析产物必须完全相等。
-    #    字节层面由行级替换保证，这一条是语义层面的第二道闸（防定位错行改到别人头上）。
-    b2, a2 = copy.deepcopy(before), copy.deepcopy(after)
-    for doc in (b2, a2):
-        rc = doc.get("roles", {}).get(role)
-        if isinstance(rc, dict):
-            if adapter is not None:
-                rc.pop("adapter", None)
-            if has_model:
-                rc.pop("model", None)
-    if b2 != a2:
-        raise _hand_edit_error("改写波及了本次目标之外的配置")
-    # ③ §11.1 装载期校验前置到写盘之前（与 PUT /api/config 同一函数、同一口径）：
-    #    换到命令行含 {model} 占位的 adapter 而两层都没模型值，就在这里被拦下。
-    errors = validate_availability_config(after)
-    if errors:
-        raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
-
-    _atomic_write_bytes(target, new_raw.encode("utf-8"))
-    return 200, {"ok": True, "changed": True, "role": role,
-                 "adapter": rc_after.get("adapter"), "model": rc_after.get("model")}
+    # 读盘-改写-自证-校验-原子写**全程持锁**（应修1a）：无锁时两个改不同角色的并发
+    # POST 会各自读到同一份旧全文、各改各的一行、后写者整份覆盖前者，而两个请求都回
+    # ok:true —— 静默丢更新。参数校验在锁外做完（纯入参判断，不碰盘）。
+    with _CONFIG_WRITE_LOCK:
+        return _apply_role_binding(
+            clim._workspace_config_path(ws), role,
+            adapter=adapter, model=model, set_model=has_model)
 
 
 # ——————————————————————————————————————————————————————————————

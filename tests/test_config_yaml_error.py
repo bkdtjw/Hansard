@@ -463,11 +463,13 @@ def test_thread_status_with_valid_config_yaml_unchanged(tmp_dir):
         by_role = {r["role"]: r for r in body["roles"]}
         assert sorted(by_role) == ["moderator", "pm"]
         for row in by_role.values():
-            # 键名冻结面的**本意**是堵臆造键侵入行结构，不是冻结未来的呈现键：四个
-            # 语义键必须齐（少一个就是回退），另允许 Lead 批准的**纯呈现**键并存
-            # ——目前是 display_name（C1）与 model（C3），同 started_ts 加键先例。
-            for key in ("role", "primary", "effective", "blocked"):
-                assert key in row, row
+            # **精确**集合断言（评审 建议5）：只列 `key in row` 挡不住臆造键混进行结构，
+            # 而键集正是这条投影的冻结面。当前合法集 = 四个语义键 + Lead 批准的三个
+            # 呈现/取材键：display_name（C1 中文名）、model（C3 生效模型）、fallback
+            # （C3 回环：⚙ 面板要说"模型名同样用于备胎 X、Y"，控制台无 YAML 解析器，
+            # 除这条投影拿不到名单）。要再加键 → 改这一行并说明理由，别悄悄放行。
+            assert sorted(row) == ["blocked", "display_name", "effective",
+                                   "fallback", "model", "primary", "role"], row
             assert row["primary"] == "claude"
             assert row["effective"] == "claude"
             assert row["blocked"] is False
@@ -477,8 +479,10 @@ def test_thread_status_with_valid_config_yaml_unchanged(tmp_dir):
             assert row["display_name"] == row["role"], row
             # model 同理：VALID_YAML 的 roles 与 adapters 两层都没写 model → 必须是
             # None，不许拿 adapter 名 / 角色名之类的东西凑一个"看起来像模型名"的值。
-            assert "model" in row, row
             assert row["model"] is None, row
+            # fallback 是 config 原样投影：VALID_YAML 没配 → 空表（不是 None、也不
+            # 拿主绑定凑一个"至少有一个备胎"的假象）。
+            assert row["fallback"] == [], row
 
 
 # ——————————————————————————————————————————————————————————————

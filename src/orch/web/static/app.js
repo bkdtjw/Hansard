@@ -124,7 +124,11 @@ async function api(path, { method = "GET", body = null } = {}) {
   }
   if (!resp.ok) {
     const msg = (data && data.error) ? data.error : `HTTP ${resp.status}`;
-    throw new Error(msg);
+    const err = new Error(msg);
+    // 状态码随异常带出去：调用方要按码分流（配置页的 409 冲突走"提示 + 重新载入"，
+    // 与普通失败的 toast 不是一回事）。只加一个属性，既有 catch 全不受影响。
+    err.status = resp.status;
+    throw err;
   }
   // 后端用 200 承载 {error}（如 config 校验失败）：也当错误抛。
   if (data && data.error) {
@@ -349,12 +353,16 @@ function renderRoleBindings() {
   el.innerHTML = notable.map((r) => {
     // chip 文案走显示名（人类可读位）；primary/effective 是 adapter 名，与显示名无关。
     const role = escapeHtml(displayOf(r.role));
+    // 同一个值进两种位置，各按各的口径转义：title 是**属性位**，必须 escapeHtmlAttr
+    // （escapeHtml 不转引号，adapter 名里一个 " 就能撑破 title 属性 —— 名字来自
+    // config.yaml，属可控文本）；chip 正文是文本位，走 escapeHtml。
+    const primaryAttr = escapeHtmlAttr(String(r.primary));
     const primary = escapeHtml(String(r.primary));
     if (r.blocked) {
-      return `<span class="rb-chip blocked" title="主绑定 ${primary} 与全部备胎均已停用：` +
+      return `<span class="rb-chip blocked" title="主绑定 ${primaryAttr} 与全部备胎均已停用：` +
              `待办保持 pending，等待人工恢复">${role} ⚠ 无可用</span>`;
     }
-    return `<span class="rb-chip degraded" title="主绑定 ${primary} 已停用，本轮由备胎承接">` +
+    return `<span class="rb-chip degraded" title="主绑定 ${primaryAttr} 已停用，本轮由备胎承接">` +
            `${role} ⛔${primary}→${escapeHtml(String(r.effective))}</span>`;
   }).join("");
 }
@@ -582,9 +590,12 @@ const MODEL_CANDIDATES = {
 
 function modelCandidates(adapterName) {
   const n = String(adapterName || "").toLowerCase();
+  // "oc" 只认**独立分段**（按 - _ . / 切），不认裸子串：裸 includes("oc") 会把
+  // local_cli / mock_cli 误判成 opencode 家族（"local"、"mock" 里都含 oc）。
+  const segs = n.split(/[-_./]+/);
   if (n.includes("grok")) return MODEL_CANDIDATES.grok;
   if (n.includes("kimi")) return MODEL_CANDIDATES.kimi;
-  if (n.includes("opencode") || n.includes("oc")) return MODEL_CANDIDATES.opencode;
+  if (n.includes("opencode") || segs.includes("oc")) return MODEL_CANDIDATES.opencode;
   if (n.includes("claude")) return MODEL_CANDIDATES.claude;
   // 猜不出（自定义命名）→ 全量并集：宁可多列几行让人挑，也不给一个空下拉。
   const all = [];
@@ -615,6 +626,14 @@ function memberEditPanel(row) {
   ).join("");
   const dl = "mre-dl-" + role;
   const model = row.model ? String(row.model) : "";
+  // 备胎提示（评审 建议4）：role 层的 model 按合并语义会**同样用到备胎身上**，而异构
+  // 备胎多半不认识那个名字（实测 grok 的模型名流进 opencode 备胎）。这是**纯提示不拦截**
+  // ——配置本身合规（§11.1 刻意不查模型名有效性，那要内建各家清单），只是让人看见。
+  const fb = Array.isArray(row.fallback) ? row.fallback.map(String) : [];
+  const fbHint = fb.length
+    ? `<div class="mre-warn">模型名将同样用于备胎 ${escapeHtml(fb.join("、"))}；` +
+      `异构备胎可能不认识该名称</div>`
+    : "";
   return (
     `<div class="mr-edit-pop glass-pop" data-edit-role="${escapeHtmlAttr(role)}">` +
       `<div class="mre-title">改 ${escapeHtml(displayOf(role))} 的绑定</div>` +
@@ -625,6 +644,7 @@ function memberEditPanel(row) {
         ` value="${escapeHtmlAttr(model)}" placeholder="留空 = 用 adapter 段的缺省" /></label>` +
       `<datalist id="${escapeHtmlAttr(dl)}">${datalistOptions(modelCandidates(cur))}</datalist>` +
       `<div class="mre-hint">候选仅供参考，可手输任意值</div>` +
+      fbHint +
       `<div class="mre-err${memberEditErr ? "" : " hidden"}">${escapeHtml(memberEditErr)}</div>` +
       `<div class="mre-btns">` +
         `<button class="btn-primary mr-save" data-edit-role="${escapeHtmlAttr(role)}">保存</button>` +
@@ -2481,12 +2501,23 @@ async function gateDecision(decision) {
 // ————————————————————————————————————————————————
 // 配置视图
 // ————————————————————————————————————————————————
+// 配置页的 CAS 基线（评审 应修1b）：载入那一刻盘上全文的指纹 + 全文本身。
+// 为什么要它：配置页的 textarea 是**离线副本**——载入 → 去名册 ⚙ 改个绑 → 回来点保存，
+// 这份陈旧全文会把 ⚙ 的改动整份盖掉，而两个请求根本不并发，服务端的锁一点忙都帮不上。
+// null = 还没成功载入过（不带基线保存，行为同旧：无条件覆盖）。
+let configFingerprint = null;
+let configLoadedText = null;
+
 async function loadConfig() {
   try {
     const c = await api("/api/config");
     $("#config-text").value = c.yaml || "";
+    configFingerprint = typeof c.fingerprint === "string" ? c.fingerprint : null;
+    configLoadedText = $("#config-text").value;
     if (!c.exists) toast("workspace 尚无 config.yaml（可新建后保存）");
   } catch (e) {
+    configFingerprint = null;
+    configLoadedText = null;
     toast("载入 config 失败: " + e.message, "err");
   }
 }
@@ -2496,10 +2527,27 @@ async function saveConfig() {
   const btn = $("#btn-save-config");
   btn.disabled = true;
   try {
-    await api("/api/config", { method: "PUT", body: { yaml } });
+    const body = { yaml };
+    if (configFingerprint !== null) body.base_fingerprint = configFingerprint;
+    const r = await api("/api/config", { method: "PUT", body });
+    // 基线就地前移：连存两次不必中间再 GET 一趟（后端在响应里给了新指纹）。
+    if (r && typeof r.fingerprint === "string") configFingerprint = r.fingerprint;
+    configLoadedText = yaml;
     toast("config.yaml 已保存（校验通过）");
   } catch (e) {
-    toast("保存失败: " + e.message, "err");
+    if (e.status === 409) {
+      // 冲突：盘上已被别处改过。**未手改**的副本直接刷成最新一份（最常见形态：
+      // 载入后只是去 ⚙ 改了绑，textarea 一个字没动，刷新零损失）；已经手改过的
+      // 则只提示不刷新——拿盘上版本覆盖它等于把人正在写的东西删掉。
+      if ($("#config-text").value === configLoadedText) {
+        toast(e.message + "　—— 已为你重新载入盘上最新一份", "err");
+        await loadConfig();
+      } else {
+        toast(e.message + "　—— 你这份有未保存的手改，未自动刷新，请手工合并", "err");
+      }
+    } else {
+      toast("保存失败: " + e.message, "err");
+    }
   } finally {
     btn.disabled = false;
   }
