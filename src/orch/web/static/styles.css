@@ -636,6 +636,9 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
   font-variant-numeric: tabular-nums; white-space: nowrap;
   max-width: 100%; overflow: hidden; text-overflow: ellipsis;
 }
+/* 「已截断」= 这份列表不是全部（条数触顶 / 只解析了日志尾部）。用门禁琥珀而非红：
+   它不是故障，是如实告知边界;但也不能与普通计数 chip 同色，否则等于没标。 */
+.sc-chip.warn { color: #fbbf24; border-color: #fbbf2466; background: rgba(251, 191, 36, 0.14); }
 
 /* 空态 / 服务端那句人话：与 .bd-empty 同口径（读不到 ≠ 没有，故不写"暂无"）。 */
 .steps-empty { font-size: 12px; color: var(--txt-dim); font-style: italic; line-height: 1.6; }

@@ -382,10 +382,24 @@ _LOG_OUTPUT_MARKER = "=== OUTPUT ==="
 # counts 的键（前端按固定四档渲染字形）；零也出，省得前端分不清"没有"与"没算"。
 _STEP_KINDS = ("tool", "thinking", "text", "other")
 
+# ——— 双上限（评审 建议4）：本端点读的是**无界**产物，必须自己设界 ———
+# 读取上限：只解析输出段**尾部**这么多字节。实测一份 244MB 的 invoke 日志会解析出
+# 约 10 万步 → 18.5MB 响应 / 1.31s，单个 GET 就能把控制台（1.5s 轮询、单进程
+# ThreadingHTTPServer）压住。取尾部而非头部：一次 invoke 的收尾几步（最后的工具调用
+# 与产出信封那一段）才是"这条回复怎么来的"的答案，开头几步反而最不相关。
+_LOG_TAIL_LIMIT_BYTES = 4 * 1024 * 1024
+# 步数上限：4MB 尾部仍可能是几万行事件。500 步远超任何人愿意在一个折叠组里读的量，
+# 又足够覆盖真实长任务；超限如实置 truncated=True 并在 note 里说明，不静默截断。
+_STEP_LIMIT = 500
 
-def _steps_payload(*, steps=None, wire_format=None, log_file=None, note="") -> dict:
-    """/steps 的响应外形（键名冻结 steps/counts/wire_format/log_file/note）。
 
+def _steps_payload(*, steps=None, wire_format=None, log_file=None, note="",
+                   truncated=False) -> dict:
+    """/steps 的响应外形（键名冻结 steps/counts/wire_format/log_file/note/truncated）。
+
+    · wire_format —— **由日志原文嗅探**出的格式（`orch.adapters.sniff_log_wire_format`），
+      不是当前绑定的配置值；嗅不出来时为 None（见 _ep_thread_steps 的诚实空态）。
+    · truncated —— 步骤列表**不完整**：条数触顶或只解析了日志尾部（原因写在 note）。
     note = 一句人话说明；有步骤且无附注时是空串。**任何字段都不含 stdout 原文全文**。
     """
     rows = list(steps or [])
@@ -395,6 +409,7 @@ def _steps_payload(*, steps=None, wire_format=None, log_file=None, note="") -> d
         "wire_format": wire_format,
         "log_file": log_file,
         "note": note,
+        "truncated": bool(truncated),
     }
 
 
@@ -435,37 +450,29 @@ def _find_invoke_logs(store: "orch.store.Store", suffix: str) -> list[Path]:
     return out
 
 
-def _role_wire_format(ws: Path, store: "orch.store.Store", role: str) -> tuple[str | None, str]:
-    """该角色输出的 wire_format（决定原文有没有逐行事件）→ (wire_format 或 None, 说明)。
+def _read_log_output_tail(path: Path) -> tuple[str, str]:
+    """读该日志的 OUTPUT 段 → (原文文本, 体积附注)。超限时只读**尾部**（建议4）。
 
-    取值次序（优先盘上事实）：
-      1. sessions 行的 backend —— 该角色**上次实际用的** adapter 名（§7.5 列，降级派发
-         时写的是生效绑定名，core.py `_session_for_upsert`）；
-      2. config.roles[role].adapter —— 主绑定名兜底（无会话行时，如 API 型/首轮）。
-    再取 config.adapters[名].wire_format，role 层同名字段覆盖（与
-    `clim._build_adapters_from_config` 的 merged 同序）；缺该键 → "text"（§7.2 默认）。
-
-    返回 None 的两种"不猜"：config 读不出来，或 config 里根本没有这个角色——那时
-    连"是不是流式"都无从判定，前端给"查不到配置"的空态，绝不假装 text。
-    日志本身不记 wire_format（§14 只记原文），故这是**据当前配置的推断**：崩溃前后
-    改过 config / 换过绑定时可能与当时不同，此时步骤会退成空态而非错态。
+    小于上限 → 整份读进来走 `_log_output_section` 正常切段。超限 → 只 seek 到
+    `-_LOG_TAIL_LIMIT_BYTES` 读尾部：
+      · 丢掉窗口首行（字节切口几乎必然落在某行中间，半行解析不出东西还会误导嗅探）；
+      · 窗口内若还能找到分隔行，照旧按它切（说明 VIEW 段极大而 OUTPUT 段很小）；
+        找不到就把整个窗口当输出段——OUTPUT 段大到把窗口填满，分隔行必在窗口之前。
+    体积附注非空即表示"这不是全部"，由调用方并入 note 且置 truncated。
     """
-    cfg, cfg_error = clim._read_config_file_checked(clim._workspace_config_path(ws))
-    if cfg_error:
-        return None, cfg_error
-    roles_cfg = cfg.get("roles") or {}
-    rc = roles_cfg.get(role)
-    if not isinstance(rc, dict):
-        return None, (f"config 里没有角色 {role} 的适配器绑定，无法判定其输出形状"
-                      "（该线程可能跑在 mock/Fake 后端上）")
-    name = str(rc.get("adapter") or role)
-    sess = clim._lookup_session(store, role) or {}
-    backend = sess.get("backend")
-    if backend and isinstance(backend, str):
-        name = backend
-    ac = (cfg.get("adapters") or {}).get(name)
-    merged = {**(ac if isinstance(ac, dict) else {}), **rc}
-    return str(merged.get("wire_format", "text")), ""
+    size = path.stat().st_size
+    if size <= _LOG_TAIL_LIMIT_BYTES:
+        return _log_output_section(path.read_text(encoding="utf-8", errors="replace")), ""
+    with path.open("rb") as fh:
+        fh.seek(size - _LOG_TAIL_LIMIT_BYTES)
+        chunk = fh.read()
+    text = chunk.decode("utf-8", errors="replace").split("\n", 1)[-1]
+    if _LOG_OUTPUT_MARKER in text:
+        # 分隔行落在窗口内 ⇒ 它之后的内容（= 整个 OUTPUT 段）全在窗口里，被切掉的只有
+        # VIEW 段——而本端点根本不读 VIEW。步骤是完整的，故**不报**截断（报了就是虚惊）。
+        return _log_output_section(text), ""
+    return text, (f"执行日志过大（{size} 字节），仅解析末尾 {_LOG_TAIL_LIMIT_BYTES} 字节"
+                  "，靠前的步骤未计入")
 
 
 def _ep_thread_steps(ws: Path, tid: str, query: dict) -> tuple[int, dict]:
@@ -492,38 +499,47 @@ def _ep_thread_steps(ws: Path, tid: str, query: dict) -> tuple[int, dict]:
 
     suffix = _invoke_log_suffix([int(i) for i in (ev.get("re") or [])], role)
     logs = _find_invoke_logs(store, suffix)
-    wire, wire_note = _role_wire_format(ws, store, role)
     if not logs:
-        note = f"未找到本次执行日志（logs/ 下没有以 {suffix} 结尾的文件）"
-        return 200, _steps_payload(wire_format=wire,
-                                   note="；".join(x for x in (note, wire_note) if x))
+        return 200, _steps_payload(
+            note=f"未找到本次执行日志（logs/ 下没有以 {suffix} 结尾的文件）")
 
     path = logs[-1]          # 多份时取最新：重调过的话，产出这条回复的是最后一次
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw_output, size_note = _read_log_output_tail(path)
     except OSError as exc:
         return 200, _steps_payload(
-            wire_format=wire, log_file=path.name,
-            note=f"执行日志读取失败：{clim._one_line(exc)}")
-    raw_output = _log_output_section(text)
-    # 原文**到此为止**：只有解析产物出网关，raw_output 本身绝不进响应任何字段。
-    steps = orch.adapters.parse_invoke_steps(raw_output, wire or "")
+            log_file=path.name, note=f"执行日志读取失败：{clim._one_line(exc)}")
 
-    notes = [wire_note] if wire_note else []
+    # 格式判定只认**日志内容**（评审 应修2）：不读 config、不看 sessions.backend——
+    # 那些描述的是**当前**绑定，而这份日志是历史产物，换绑后按当前绑定硬解析会吐假步骤。
+    wire = orch.adapters.sniff_log_wire_format(raw_output)
+    # 原文**到此为止**：只有解析产物出网关，raw_output 本身绝不进响应任何字段。
+    # 多取一条用来判断"是不是被条数上限切掉了"，恰好 _STEP_LIMIT 条时不误报 truncated。
+    steps = orch.adapters.parse_invoke_steps(raw_output, wire or "",
+                                             max_steps=_STEP_LIMIT + 1)
+    truncated = bool(size_note)
+    notes = [size_note] if size_note else []
     if len(logs) > 1:
         notes.append(f"该事件与角色下有 {len(logs)} 份日志"
                      "（schema 校验失败会原地重调，每次各落一份），此处取最新一份")
+    if len(steps) > _STEP_LIMIT:
+        steps = steps[:_STEP_LIMIT]
+        truncated = True
+        notes.append(f"步骤数超过展示上限，只给前 {_STEP_LIMIT} 条"
+                     "（完整原文在 logs/，审计不受影响）")
     if not steps:
         if wire in ("json", "text"):
             notes.append(f"该后端（wire_format={wire}）不产生步骤流："
                          "整段 stdout 是单个 JSON / 直出文本，没有逐行事件")
         elif not raw_output.strip():
             notes.append("执行日志的 OUTPUT 段是空的")
-        elif wire:
+        elif wire is None:
+            notes.append("无法判定该日志的流式格式（可能产生自其他历史绑定），不猜测")
+        else:
             notes.append("本次执行日志里没有可解析的步骤"
                          "（原文可能来自非流式后端，或适配器未提供 stdout 原文）")
     return 200, _steps_payload(steps=steps, wire_format=wire, log_file=path.name,
-                               note="；".join(notes))
+                               note="；".join(notes), truncated=truncated)
 
 
 def _ep_thread_send(ws: Path, tid: str, body: dict) -> tuple[int, dict]:

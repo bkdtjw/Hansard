@@ -1133,8 +1133,10 @@ def test_steps_endpoint_parses_tool_steps_from_invoke_log(tmp_dir):
         eid = _seed_reply_with_log(tmp_dir, tid, _opencode_raw_stdout())
 
         body = _steps_of(base, tid, eid)
-        assert set(body) == {"steps", "counts", "wire_format", "log_file", "note"}, body
+        assert set(body) == {"steps", "counts", "wire_format", "log_file", "note",
+                             "truncated"}, body
         assert body["wire_format"] == "opencode-stream", body
+        assert body["truncated"] is False, body
         assert body["log_file"] and body["log_file"].endswith("_E1_pm.log"), body
         tools = [s for s in body["steps"] if s["kind"] == "tool"]
         assert len(tools) == 1, body["steps"]
@@ -1195,8 +1197,15 @@ def test_steps_endpoint_non_stream_backend_explains_empty(tmp_dir):
         assert STEPS_FIXTURE_SID not in json.dumps(body, ensure_ascii=False)
 
 
-def test_steps_endpoint_wire_format_follows_session_backend(tmp_dir):
-    """降级后 wire_format 跟着**盘上**的 sessions.backend 走，不认主绑定（§5.6.2）。"""
+def test_steps_endpoint_ignores_current_binding_and_sniffs_the_log(tmp_dir):
+    """换绑后**不得**按当前绑定硬解析：格式只认日志内容（评审 应修2）。
+
+    旧行为（错态，本用例前身只断言 wire_format 取值、不断言产物，等于把错态写进测试）：
+    sessions.backend 换成 stream-json 家的 adapter 后，同一份 opencode 原文被按
+    stream-json 逐行解析 → 顶层 type=="tool" 命中，吐出
+    `{"kind":"tool","name":"tool","summary":""}` 的**假步骤**，真实工具名与命令全丢。
+    现在：嗅探认出 opencode → 产物必须与未换绑时逐字一致。
+    """
     _write_config(tmp_dir)
     with _Serving(tmp_dir) as base:
         tid = _new_thread(base, roles=["pm", "moderator"])
@@ -1205,7 +1214,140 @@ def test_steps_endpoint_wire_format_follows_session_backend(tmp_dir):
         store.upsert_session(role="pm", sid="s1", gen=1, backend="other")
 
         body = _steps_of(base, tid, eid)
+        assert body["wire_format"] == "opencode-stream", body
+        tools = [s for s in body["steps"] if s["kind"] == "tool"]
+        assert len(tools) == 1, body["steps"]
+        assert tools[0]["name"] == "bash", "换绑不得把真实工具名换成占位 'tool'"
+        assert "pytest -q tests/test_web.py" in tools[0]["summary"], body["steps"]
+        # 假步骤的判据：kind=tool 但 name 是占位、summary 空 —— 一条都不许有。
+        assert not [s for s in body["steps"]
+                    if s["kind"] == "tool" and s["name"] == "tool" and not s["summary"]], body
+
+
+def test_steps_endpoint_refuses_to_guess_unrecognized_log_shape(tmp_dir):
+    """两家特征都不像的逐行 JSON → 诚实空态 + "不猜测"，绝不出假步骤（应修2）。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        # 逐行 JSON，但既无 opencode 的 part/sessionID，也无 stream-json 的
+        # role/tool_calls/事件型名 —— 例如某个未知后端（或未来改了形状的一家）。
+        weird = "\n".join(json.dumps({"evt": i, "payload": {"cmd": "rm -rf /"}})
+                          for i in range(4))
+        eid = _seed_reply_with_log(tmp_dir, tid, weird)
+
+        body = _steps_of(base, tid, eid)
+        assert body["wire_format"] is None, body
+        assert body["steps"] == [], body
+        assert "无法判定该日志的流式格式" in body["note"], body
+        assert "不猜测" in body["note"], body
+
+
+def test_steps_endpoint_sniffs_stream_json_shape(tmp_dir):
+    """反向对照：stream-json 形状的日志即使当前绑定是 opencode，也按 stream-json 解析。"""
+    _write_config(tmp_dir)      # pm 主绑定 oc = opencode-stream
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        raw = "\n".join(json.dumps(x, ensure_ascii=False) for x in [
+            {"role": "assistant", "content": "我先看一下测试"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "Bash", "arguments": '{"command":"pytest -q"}'}}]},
+            {"role": "meta", "type": "session.resume_hint",
+             "session_id": STEPS_FIXTURE_SID},
+        ])
+        eid = _seed_reply_with_log(tmp_dir, tid, raw)
+
+        body = _steps_of(base, tid, eid)
         assert body["wire_format"] == "stream-json", body
+        tools = [s for s in body["steps"] if s["kind"] == "tool"]
+        assert [t["name"] for t in tools] == ["Bash"], body["steps"]
+        assert STEPS_FIXTURE_SID not in json.dumps(body, ensure_ascii=False)
+
+
+def test_steps_endpoint_caps_step_count_and_flags_truncated(tmp_dir):
+    """步数上限（评审 建议4）：超限只给前 N 条 + truncated=True + note 说明。"""
+    from orch.web.server import _STEP_LIMIT
+
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        many = "\n".join(
+            json.dumps({"type": "tool", "sessionID": STEPS_FIXTURE_SID, "part": {
+                "type": "tool", "tool": f"t{i}",
+                "state": {"input": {"command": f"echo {i}"}}}}, ensure_ascii=False)
+            for i in range(_STEP_LIMIT + 40))
+        eid = _seed_reply_with_log(tmp_dir, tid, many)
+
+        body = _steps_of(base, tid, eid)
+        assert len(body["steps"]) == _STEP_LIMIT, len(body["steps"])
+        assert body["truncated"] is True, body
+        assert "展示上限" in body["note"], body
+        assert body["counts"]["tool"] == _STEP_LIMIT, body["counts"]
+
+
+def test_steps_endpoint_caps_read_size_on_huge_log(tmp_dir):
+    """读取上限（建议4）：超限只解析日志尾部 + truncated=True + note 写明字节数。
+
+    不真造 244MB：把上限临时压到很小，验证的是"按上限只读尾部"这条路，与阈值大小无关。
+    """
+    import orch.web.server as srv
+
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        head_line = json.dumps({"type": "tool", "sessionID": STEPS_FIXTURE_SID, "part": {
+            "type": "tool", "tool": "EARLIEST",
+            "state": {"input": {"command": "x" * 400}}}}, ensure_ascii=False)
+        tail_line = json.dumps({"type": "tool", "sessionID": STEPS_FIXTURE_SID, "part": {
+            "type": "tool", "tool": "LATEST",
+            "state": {"input": {"command": "final step"}}}}, ensure_ascii=False)
+        eid = _seed_reply_with_log(
+            tmp_dir, tid, "\n".join([head_line] * 12 + [tail_line]))
+
+        old = srv._LOG_TAIL_LIMIT_BYTES
+        srv._LOG_TAIL_LIMIT_BYTES = 900        # 小于该日志体积 → 走尾部读取分支
+        try:
+            body = _steps_of(base, tid, eid)
+        finally:
+            srv._LOG_TAIL_LIMIT_BYTES = old
+
+        assert body["truncated"] is True, body
+        assert "仅解析末尾" in body["note"], body
+        names = [s["name"] for s in body["steps"]]
+        assert "LATEST" in names, names       # 尾部（收尾几步）必须在
+        assert len(names) < 13, names         # 靠前的步骤如实缺席，不假装完整
+        assert STEPS_FIXTURE_SID not in json.dumps(body, ensure_ascii=False)
+
+
+def test_steps_endpoint_does_not_cry_truncation_when_output_section_fits(tmp_dir):
+    """尾部窗口里能找到分隔行 ⇒ OUTPUT 段完整（切掉的只是 VIEW）→ 不许报截断。
+
+    报了就是虚惊：读者会以为少了几步，跑去 logs/ 白找一遍。
+    """
+    import orch.web.server as srv
+
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        store = orch.store.Store(tmp_dir / tid)
+        eid = store.append_event(sender="pm", type="report", body="ok",
+                                 to=["moderator"], re=[1])
+        # VIEW 段极大、OUTPUT 段很小：尾部窗口必然把分隔行连同整个 OUTPUT 段一起框住。
+        store.write_invoke_log(
+            event_ids=[1], role="pm", view_text="v" * 4000,
+            output_text=_opencode_raw_stdout())
+
+        old = srv._LOG_TAIL_LIMIT_BYTES
+        srv._LOG_TAIL_LIMIT_BYTES = 1500
+        try:
+            body = _steps_of(base, tid, eid)
+        finally:
+            srv._LOG_TAIL_LIMIT_BYTES = old
+
+        assert body["truncated"] is False, body
+        assert "仅解析末尾" not in body["note"], body
+        tools = [s for s in body["steps"] if s["kind"] == "tool"]
+        assert [t["name"] for t in tools] == ["bash"], body["steps"]
 
 
 def test_steps_endpoint_human_and_unknown_event_are_not_invokes(tmp_dir):
@@ -1314,6 +1456,48 @@ def test_app_js_view_steps_empty_states_are_honest(tmp_dir):
         assert "res.note" in js
         # 空态不得说"暂无步骤"这类含糊话（同 bd-fail 的口径：读不到 ≠ 没有）。
         assert "steps-empty" in js
+        # 嗅不出格式那一档也得有诚实文案（应修2 的前端半边），且不冒充"查不到配置"。
+        assert "无法判定该日志的流式格式" in js
+        assert "查不到该角色的适配器配置" not in js
+        # truncated 必须在页面上有标记，否则 500 步会被读成"这就是全部"（建议4）。
+        assert "res.truncated" in js and "已截断" in js
+
+
+def test_app_js_step_kind_class_is_front_end_whitelisted(tmp_dir):
+    """kind → class 走前端白名单（评审 建议11）：不把服务端串拼进 class 属性。
+
+    kind 的源头是模型可控文本，前端不拿服务端契约当输入校验；白名单外一律 other，
+    于是 `k-` 类名永远只有四种字面量。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "const STEP_KIND_CLASS" in js
+        assert "function stepKindClass(kind)" in js
+        assert "step-row k-${kind}" in js
+        # 旧写法（直接转义服务端串再拼进 class）不得残留。
+        assert "k-${escapeHtmlAttr(kind)}" not in js
+
+
+def test_app_js_clears_typing_clock_on_thread_and_workspace_switch(tmp_dir):
+    """切线程/切工作区必须连**定时器**一起清（评审 建议12）。
+
+    只清 typingRows 会留一个每秒空转的 setInterval：renderTypingPill 见空投影只隐藏
+    胶囊，然后一直白跑到下一拍 status。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "function clearTypingClock()" in js
+        body = js.split("function clearTypingClock()", 1)[1].split("\n}\n", 1)[0]
+        assert "clearInterval(typingTimer)" in body, body
+        assert "typingTimer = null" in body, body
+        # 两处清场都改走它（不是各写两行、漏掉定时器那一行）。
+        assert js.count("clearTypingClock();") >= 2, js.count("clearTypingClock();")
+        for fn_name in ("function switchWorkspace(name)", "async function selectThread(tid)"):
+            assert fn_name in js, fn_name
+            fn = js.split(fn_name, 1)[1].split("\n}\n", 1)[0]
+            assert "clearTypingClock();" in fn, fn_name
 
 
 def test_app_js_view_steps_marks_self_claim_on_a_class_bubbles(tmp_dir):

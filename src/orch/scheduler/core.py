@@ -254,6 +254,60 @@ def _invoke_output_text(adapter, raw_env) -> str:
     )
 
 
+# invoke 异常 → 一句人话分类（只用于审计日志的抬头，不参与任何判定/分类）。
+# 顺序即优先级：AdapterUnavailableError 是 ValueError 的兄弟型还是子型由 §5.6.3
+# 契约决定，用 isinstance 逐条比对而不是按 type 名查表，子型也能命中。
+_INVOKE_FAILURE_KINDS: tuple[tuple[type, str], ...] = (
+    (TimeoutError, "超时被 kill（stdout 只可能是被截断的半程输出）"),
+    (OSError, "子进程启动或 IO 失败（多半连 stdout 都没产生）"),
+    (ValueError, "输出不可用（无合法 JSON 块 / 解包失败）"),
+)
+
+
+def _invoke_failure_output_text(adapter, exc: BaseException) -> str:
+    """失败路径的"输出原文"：抬头一句分类 + 已捕获到的 stdout 片段（评审 建议7）。
+
+    §14 行603 说的是「**每次** invoke 的完整输入/输出原文」——失败那几次也算。此前
+    只有成功路径落日志，超时 / 无 JSON 块 / 额度跳闸一律 return 前直接丢掉适配层已经
+    暂存的 `last_raw_output`，于是**最需要事后勘查的那几次**盘上一个字都没有。
+
+    抬头必须写明"这是异常路径、原文可能不全"：把半程 stdout 混在成功日志里不加标注，
+    读者会把它当完整输出，比没有更坏。
+    """
+    raw = getattr(adapter, "last_raw_output", "")
+    raw = raw if isinstance(raw, str) else ""
+    kind = f"{type(exc).__name__}"
+    for exc_type, human in _INVOKE_FAILURE_KINDS:
+        if isinstance(exc, exc_type):
+            kind = f"{type(exc).__name__} —— {human}"
+            break
+    head = (f"（本次 invoke 异常：{kind}；"
+            + ("以下是 kill/失败前已捕获到的 **部分** stdout 原文，可能不完整。）"
+               if raw else "适配层未捕获到任何 stdout 原文。）"))
+    return f"{head}\n{raw}" if raw else head
+
+
+def _write_invoke_log_on_failure(
+    store, *, event_ids: list[int], role: str, view_text: str, adapter, exc: BaseException,
+) -> None:
+    """失败路径的 §14 审计落盘。**纯追加**：不得改变调用点的返回值/重试/跳闸语义。
+
+    OSError 只在这一处吞掉，理由写死在这里：本函数是审计旁路，而调用点接着要做的
+    （跳闸记账、派发行回 pending / 标 failed）才是可恢复性的命脉。盘写不动时先保住
+    那些——审计少一行可以事后从别处推，派发行状态错了整条线程就卡住。不写裸 except：
+    非 OSError（编程错误）照旧上抛，不被降级成"日志没落上"。
+
+    两环共用本函数（async_core 直接 import，不复制第二份），同 `_invoke_output_text`。
+    """
+    try:
+        store.write_invoke_log(
+            event_ids=event_ids, role=role, view_text=view_text,
+            output_text=_invoke_failure_output_text(adapter, exc),
+        )
+    except OSError:
+        pass
+
+
 def _timeout_for(config: dict, role: str) -> float:
     conf = _role_conf(config, role)
     caps = conf.get("caps") or {}
@@ -1153,6 +1207,12 @@ def _dispatch_group_once(
         try:
             raw_env, sess = adapter.invoke(cur_view, sess)
         except AdapterUnavailableError as exc:
+            # §14 行603「**每次** invoke」：跳闸那一次也要留下原文（评审 建议7）。
+            # 纯审计追加，且 helper 自吞 OSError —— 下面的跳闸/回 pending 语义不受影响。
+            _write_invoke_log_on_failure(
+                store, event_ids=event_ids, role=target,
+                view_text=cur_view_text, adapter=adapter, exc=exc,
+            )
             if availability is None:
                 raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。
             # §5.6.3 第 1 条：立即跳闸（记在**自己解析出的**生效绑定名上）+ 审计 + 指标；
@@ -1163,6 +1223,11 @@ def _dispatch_group_once(
                 store.set_pending(eid, target)
             return _TRIP_RETRY
         except TRANSPORT_FAILURE_ERRORS as exc:
+            # 同上（建议7）：超时 / 无 JSON 块 / IO 失败这几次的原文最该留，之前全丢了。
+            _write_invoke_log_on_failure(
+                store, event_ids=event_ids, role=target,
+                view_text=cur_view_text, adapter=adapter, exc=exc,
+            )
             if availability is None:
                 raise           # 未启用 → 既有路径逐字不变（异常照旧上抛）。
             # §5.6.3 第 2 条：既有 attempts / 重试语义不变，**叠加** fail_streak 记账。

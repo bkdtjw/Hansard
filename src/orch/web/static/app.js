@@ -198,7 +198,7 @@ function switchWorkspace(name) {
   lastActiveMember = null;
   stepsCache.clear();      // 步骤摘要按事件号存：跨工作区/线程会撞车，必须清
   stepsOpen.clear();
-  typingRows = [];         // 上一个工作区的"正在处理中"不许跟着走
+  clearTypingClock();      // 走字定时器也要停（建议12：否则切完还每秒空转一次）
   renderMemberRoster();
   unseenCount = 0;
   clearTimeout(pollTimer);
@@ -710,7 +710,7 @@ async function selectThread(tid) {
   lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
   stepsCache.clear();     // 事件号是线程内标识：切线程必须清，否则回填到别人的气泡上
   stepsOpen.clear();
-  typingRows = [];        // 上一条线程的"正在处理中"不许留屏（下一拍 status 重填）
+  clearTypingClock();     // 同上（建议12）：清投影 + 停走字定时器，一并做掉
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
   // 切线程清掉角色筛选（含单聊态）：成员名单换了，留着旧成员的过滤只会显示空流。
   // #send-to 由 populateSendTo 重建 options（value 自然回到兜底首项），故此处只清标记。
@@ -1002,16 +1002,26 @@ function buildArtifactChips(ev) {
 const SELF_CLAIM_TYPES = new Set(["acceptance", "decision", "gate_decision"]);
 // 步骤字形（tool/thinking/text 各一形，其余归 ·）。
 const STEP_GLYPH = { tool: "🔧", thinking: "💭", text: "💬", other: "·" };
+// 字形位与 CSS 档位的**前端白名单**（评审 建议11）：kind 虽然由服务端枚举产出，
+// 但它源头是模型可控文本，前端不拿服务端契约当输入校验——白名单外一律归 other，
+// 于是 `k-` 类名永远只有四种字面量，不存在"把服务端串拼进 class 属性"这条路。
+const STEP_KIND_CLASS = { tool: "tool", thinking: "thinking", text: "text" };
+function stepKindClass(kind) {
+  return STEP_KIND_CLASS[String(kind)] || "other";
+}
 
 // 空态文案：一律照**盘上事实**说话（同 bd-fail 的口径：读不到 ≠ 没有）。
 function stepsEmptyText(res) {
-  // 取数本身失败时先认这一条：那时 wire_format 是前端填的 null，不是服务端说的
-  // "查不到配置"——照 wire_format 分支说话会把网络/服务端故障误报成配置问题。
+  // 取数本身失败时先认这一条：那时 wire_format 是前端填的 null，不是服务端的判定，
+  // 照 wire_format 分支说话会把网络/服务端故障误报成"格式判不出"。
   if (res && res.read_failed) return "执行步骤读取失败（读不到 ≠ 没有步骤）";
+  // wire_format 是服务端**从日志原文嗅探**出的格式（不是当前绑定的配置值）。
   const wf = res && res.wire_format;
   if (wf === "json" || wf === "text") return `该后端（wire_format=${wf}）不产生步骤流`;
-  if (!wf) return "查不到该角色的适配器配置，无法判定输出形状";
-  if (!res.log_file) return "未找到本次执行日志";
+  if (res && !res.log_file) return "未找到本次执行日志";
+  // 下面这句刻意写成服务端 note 的**前缀**（服务端会补"（可能产生自其他历史绑定），
+  // 不猜测"）：renderStepsBody 的空态去重靠 startsWith，改一个字就会两句并出重复。
+  if (!wf) return "无法判定该日志的流式格式";
   return "本次执行日志里没有可解析的步骤";
 }
 
@@ -1025,6 +1035,9 @@ function renderStepsBody(res) {
     .join("");
   const meta =
     (res.wire_format ? `<span class="sc-chip">wire ${escapeHtml(String(res.wire_format))}</span>` : "") +
+    // truncated：步骤列表不完整（条数触顶 / 只解析了日志尾部）。必须显式标出——
+    // 一个不带标记的 500 步列表会被读成"这就是全部"（原因由服务端 note 给）。
+    (res.truncated ? `<span class="sc-chip warn">已截断</span>` : "") +
     (res.log_file ? `<span class="sc-chip mono" title="${escapeHtmlAttr("logs/" + res.log_file)}">日志 ${escapeHtml(String(res.log_file))}</span>` : "");
   const head = (chips || meta) ? `<div class="steps-counts">${chips}${meta}</div>` : "";
   // 服务端的一句人话（多份日志/无配置等）原样带出，不改写、不吞。
@@ -1041,16 +1054,17 @@ function renderStepsBody(res) {
     return head + `<div class="steps-empty">${escapeHtml(line)}</div>` + note;
   }
   const list = rows.map((s) => {
-    const kind = String(s.kind || "other");
+    // kind 过前端白名单（建议11）：class 与 title 都只用白名单值，不回显服务端串。
+    const kind = stepKindClass(s.kind);
     const glyph = STEP_GLYPH[kind] || STEP_GLYPH.other;
     const dur = (s.dur_ms === undefined || s.dur_ms === null)
       ? ""
       : `<span class="step-dur mono">${escapeHtml(String(s.dur_ms))} ms</span>`;
     // summary 是**模型可控文本**（工具命令/正文摘要）：文本位一律 escapeHtml。
     return (
-      `<div class="step-row k-${escapeHtmlAttr(kind)}">` +
+      `<div class="step-row k-${kind}">` +
         `<span class="step-seq mono">${escapeHtml(String(s.seq))}</span>` +
-        `<span class="step-glyph" title="${escapeHtmlAttr(kind)}">${glyph}</span>` +
+        `<span class="step-glyph" title="${kind}">${glyph}</span>` +
         `<span class="step-name">${escapeHtml(String(s.name || kind))}</span>` +
         `<span class="step-sum">${escapeHtml(String(s.summary || ""))}</span>` +
         dur +
@@ -1685,6 +1699,18 @@ async function loadStatus() {
 // §16.2）。缺 started_ts 的行维持既有"正在响应"文案，绝不编造起点。
 let typingRows = [];        // [{role, started_ts|null}]，最近一次 status 的派生投影
 let typingTimer = null;     // 走字定时器（无在跑派发时清掉，不留空转）
+
+// 切线程 / 切工作区的清场（评审 建议12）：只清 typingRows 会留下每秒空转一次的
+// 定时器（renderTypingPill 见空投影就只隐藏胶囊，然后一直白跑到下一拍 status）。
+// 投影与定时器是一对，必须一起清——故收口成一个函数，不在两处各写两行。
+function clearTypingClock() {
+  typingRows = [];
+  if (typingTimer) {
+    clearInterval(typingTimer);
+    typingTimer = null;
+  }
+  renderTypingPill();      // 立刻收掉旧胶囊，不等下一拍
+}
 
 function updateTypingBar(s) {
   // 数据源复活后本条自然点亮；但**必须**沿用 isLiveDispatch 判 deadline_ts——

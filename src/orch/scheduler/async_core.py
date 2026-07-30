@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import subprocess
 import time
 from pathlib import Path
@@ -85,6 +86,7 @@ from orch.scheduler.core import (
     _transport_failure_fallout,
     _verify_downgrade_note,
     _view_with_retry_note,
+    _write_invoke_log_on_failure,
     _write_scope,
 )
 from orch.scheduler.permissions import (
@@ -336,11 +338,21 @@ async def _dispatch_group_async_once(
         try:
             raw_env, sess = await _invoke_adapter(adapter, cur_view, sess)
         except Exception as exc:
+            # §14 行603「**每次** invoke」的失败半边（评审 建议7）：三条出口都要留原文。
+            # 与同步环共用 core._write_invoke_log_on_failure（同一实现，非两处同改）；
+            # 写在**既有 lock 块内**、不新开 async with —— 不新增 await 点，故这些路径的
+            # 交错时序与既有实现逐字一致，只多一次盘写。
+            log_failure = functools.partial(
+                _write_invoke_log_on_failure,
+                store, event_ids=event_ids, role=target,
+                view_text=cur_view_text, adapter=adapter, exc=exc,
+            )
             # M5 §5.6.3（仅在启用时）：先按分类结果消费，与同步环同源。
             if availability is not None and isinstance(exc, AdapterUnavailableError):
                 # 特征命中 → 跳闸 + 审计 + 指标；该次失败不计 attempts，行回 pending，
                 # 由外层 _dispatch_group_async **同一轮内立即**重解析（§5.6.3 第 1 条）。
                 async with lock:
+                    log_failure()
                     on_unavailable(store, availability, str(effective), exc)
                     for eid in event_ids:
                         store.set_pending(eid, target)
@@ -349,6 +361,7 @@ async def _dispatch_group_async_once(
                 # 其他传输级失败 → 既有 attempts 语义（同源 _transport_failure_fallout）
                 # 叠加 fail_streak 记账（达阈值则跳闸 + 审计 + 指标）。
                 async with lock:
+                    log_failure()
                     on_transport_failure(
                         store, config, availability, str(effective), exc,
                     )
@@ -357,6 +370,7 @@ async def _dispatch_group_async_once(
             # invoke 异常视为一次失败（不抛出，落盘）——未启用 M5 或非传输级异常时
             # 走既有兜底路径，逐字不变。
             async with lock:
+                log_failure()
                 for eid in event_ids:
                     store.mark_failed(eid, target)
                 append_system_event(

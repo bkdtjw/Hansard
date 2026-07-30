@@ -31,9 +31,16 @@ import orch.store
 
 
 # ——————————————————————————————————————————————————————————————
-# 造数：两种流式 wire_format 的**真实形状**样例
-# （opencode 1.18.4 / kimi stream-json，形状来源见 tests/test_cli_adapter.py
-#  的 test_unwrap_opencode_stream_shape / test_unwrap_stream_json_kimi_shape）
+# 造数：两种流式 wire_format 的**构造**样例（评审 建议8 校正溯源口径）
+#
+# 外层信封形状（顶层 type / part / sessionID；assistant / meta 行）有实测依据：
+# tests/test_cli_adapter.py 的 test_unwrap_opencode_stream_shape /
+# test_unwrap_stream_json_kimi_shape。但**工具行的内层**——part.state.input /
+# state.output / state.time，以及 stream-json 的 tool_calls 行——本仓**没有**实测档案：
+# 陪跑只落盘了 assistant / meta 两种行（QUESTIONS.md Q1），state.time 的单位口径也
+# 无记录。故下面的工具行是照两家公开形状**构造**的，不是抄来的真实样本；解析层因此
+# 一律走宽容兜底（认多家形状、认不出就归 other、单位不可证就不给 dur_ms），
+# 而不是依赖这份样例的精确性。
 # ——————————————————————————————————————————————————————————————
 
 # 敏感串埋点：真实 opencode/grok stdout 的 sessionId 形状（Q9 档案实证含十六进制尾）。
@@ -98,6 +105,74 @@ def _kimi_lines(sid: str = FIXTURE_SID) -> list[dict]:
 
 def _kimi_stdout(sid: str = FIXTURE_SID) -> str:
     return "\n".join(json.dumps(x, ensure_ascii=False) for x in _kimi_lines(sid))
+
+
+# ——————————————————————————————————————————————————————————————
+# ②a sniff_log_wire_format：格式判定只认原文形状（评审 应修2）
+#
+# 为什么必须由内容定：logs/ 的原文是**历史**产物，换绑后当前绑定与产出它的后端可能
+# 不是一家；按当前绑定硬解析会吐出假步骤（真实工具名与命令全丢，而页面看不出错）。
+# ——————————————————————————————————————————————————————————————
+
+def test_sniff_recognizes_both_stream_shapes():
+    """两家流式形状各自认出来（判据是 part/sessionID vs role/tool_calls/事件型名）。"""
+    from orch.adapters import sniff_log_wire_format
+
+    assert sniff_log_wire_format(_opencode_stdout()) == "opencode-stream"
+    assert sniff_log_wire_format(_kimi_stdout()) == "stream-json"
+    # 只有一行的流式日志也不能被"整段能 json.loads"误判成 json（逐行票先算）。
+    one_line = json.dumps(_opencode_lines()[1], ensure_ascii=False)
+    assert sniff_log_wire_format(one_line) == "opencode-stream"
+
+
+def test_sniff_recognizes_non_stream_shapes():
+    """单 JSON 直出 → "json"；没有任何 JSON 行 → "text"（都不是流式，产物必为空）。"""
+    from orch.adapters import parse_invoke_steps, sniff_log_wire_format
+
+    single = json.dumps({"text": "收到\n" + _ENVELOPE, "sessionId": FIXTURE_SID})
+    assert sniff_log_wire_format(single) == "json"
+    assert sniff_log_wire_format("收到。\n" + _ENVELOPE) == "text"
+    # sessionId（小写 d）/ session_id 都不是 opencode 的 sessionID，不许误命中。
+    assert sniff_log_wire_format(json.dumps({"session_id": FIXTURE_SID})) == "json"
+    # 作者信封行不是事件行：它自己就是合法 JSON 对象，且 type 可以合法地取
+    # "system"/"user"（附录 A 枚举内，与 stream-json 的事件型名撞名）。两件事都不许
+    # 让裸文本被读成流式 —— 否则会按流式去解析一段散文，吐出满屏 other 假步骤。
+    for env_type in ("report", "system", "user"):
+        raw = ("先说结论。\n```json\n"
+               + json.dumps({"to": ["pm"], "type": env_type, "body": "done"})
+               + "\n```")
+        assert sniff_log_wire_format(raw) == "text", env_type
+    for raw in (single, "收到。\n" + _ENVELOPE):
+        wire = sniff_log_wire_format(raw)
+        assert parse_invoke_steps(raw, wire) == []
+
+
+def test_sniff_returns_none_when_shape_is_unrecognized():
+    """两家特征都不像 / 票数相等 → None（诚实空态的服务端依据），绝不猜。"""
+    from orch.adapters import parse_invoke_steps, sniff_log_wire_format
+
+    weird = "\n".join(json.dumps({"evt": i, "payload": {"cmd": "ls"}}) for i in range(3))
+    assert sniff_log_wire_format(weird) is None
+    # 混杂（一行 opencode 一行 stream-json）：说不清是哪一家，同样不猜。
+    mixed = "\n".join([
+        json.dumps({"type": "text", "part": {"type": "text", "text": "a"}}),
+        json.dumps({"role": "assistant", "content": "b"}),
+    ])
+    assert sniff_log_wire_format(mixed) is None
+    assert sniff_log_wire_format("") is None
+    assert sniff_log_wire_format(None) is None      # type: ignore[arg-type]
+    # None 传给解析器 → 空（不按行试探）。
+    assert parse_invoke_steps(weird, sniff_log_wire_format(weird) or "") == []
+
+
+def test_sniff_ignores_current_binding_by_construction():
+    """判据里没有"配置"这个入参——嗅探是纯函数，签名上就不可能读到绑定（应修2）。"""
+    import inspect
+
+    from orch.adapters import sniff_log_wire_format
+
+    params = list(inspect.signature(sniff_log_wire_format).parameters)
+    assert params == ["raw_text"], params
 
 
 # ——————————————————————————————————————————————————————————————
@@ -168,6 +243,48 @@ def test_parse_steps_summary_truncated_with_ellipsis():
     assert len(summary) <= 120, len(summary)
     assert summary.endswith("…")
     assert "A" * 500 not in summary
+
+
+def test_parse_steps_name_is_capped_too():
+    """name 与 summary 同源同截断（评审 建议3）：工具名也是模型可控文本，不许无界。
+
+    有上限而另一边没有，等于留一条整段外泄的旁路——造一个超长"工具名"即可绕过。
+    """
+    from orch.adapters import _STEP_NAME_LIMIT, parse_invoke_steps
+
+    long_name = "T" * 4000
+    oc = {"type": "tool", "sessionID": FIXTURE_SID, "part": {
+        "type": "tool", "tool": long_name, "state": {"input": {"command": "ls"}}}}
+    got = parse_invoke_steps(json.dumps(oc), "opencode-stream")
+    assert len(got[0]["name"]) <= _STEP_NAME_LIMIT, len(got[0]["name"])
+    assert got[0]["name"].endswith("…")
+    assert long_name not in json.dumps(got, ensure_ascii=False)
+
+    # stream-json 侧同样受限（两条入口都不能漏）。
+    sj = {"role": "assistant", "tool_calls": [
+        {"function": {"name": long_name, "arguments": '{"command":"ls"}'}}]}
+    got = parse_invoke_steps(json.dumps(sj), "stream-json")
+    assert len(got[0]["name"]) <= _STEP_NAME_LIMIT, len(got[0]["name"])
+
+
+def test_parse_steps_respects_max_steps_cap():
+    """max_steps 到量即停（建议4 的解析侧半边）：不白解析后面几万行。"""
+    from orch.adapters import parse_invoke_steps
+
+    raw = "\n".join(
+        json.dumps({"type": "tool", "part": {
+            "type": "tool", "tool": f"t{i}", "state": {"input": {"command": "ls"}}}})
+        for i in range(300))
+    assert len(parse_invoke_steps(raw, "opencode-stream")) == 300      # 不给上限=不截
+    got = parse_invoke_steps(raw, "opencode-stream", max_steps=25)
+    assert len(got) == 25, len(got)
+    assert [s["seq"] for s in got] == list(range(1, 26))
+    # 一行产出多步时也不越界（stream-json 的 tool_calls 可一行多个）。
+    multi = json.dumps({"role": "assistant", "tool_calls": [
+        {"function": {"name": f"n{i}", "arguments": "{}"}} for i in range(10)]})
+    assert len(parse_invoke_steps(multi, "stream-json", max_steps=3)) == 3
+    # 非正数/None 视为"不设上限"（不静默截成 0 条）。
+    assert len(parse_invoke_steps(raw, "opencode-stream", max_steps=0)) == 300
 
 
 def test_parse_steps_tolerates_broken_lines_and_never_raises():
@@ -383,3 +500,152 @@ def test_async_and_sync_scheduler_share_one_output_text_helper():
     import orch.scheduler.core as sc
 
     assert ac._invoke_output_text is sc._invoke_output_text
+    # 失败路径的落盘 helper 同样单一实现（评审 建议7）。
+    assert ac._write_invoke_log_on_failure is sc._write_invoke_log_on_failure
+
+
+# ——————————————————————————————————————————————————————————————
+# ③ 失败路径也落 invoke 日志（评审 建议7 · 红转绿）
+#
+# §14 行603 说的是「**每次** invoke 的完整输入/输出原文」。此前只有成功路径落盘：
+# 超时 / 无合法 JSON 块 / 额度跳闸这三条 return 前把适配层已暂存的 last_raw_output
+# 当场丢掉——最需要事后勘查的那几次，盘上一个字都没有。
+# ——————————————————————————————————————————————————————————————
+
+def _timeout_popen(monkeypatch, partial: str):
+    """打桩 Popen：带 timeout 的 communicate 必超时；kill 后排空能读到 partial。"""
+    import subprocess as _sp
+
+    class _SlowProc:
+        returncode = -9
+
+        def __init__(self, argv, **kw):
+            pass
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise _sp.TimeoutExpired(cmd="oc", timeout=timeout)
+            return (partial, "")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _SlowProc)
+
+
+def _seeded_thread(tmp_dir, name: str):
+    thread_dir = tmp_dir / name
+    store = orch.store.Store(thread_dir)
+    store.set_meta("status", "running")
+    store.append_event(sender="human", type="assign", body="跑一轮", to=["moderator"])
+    return thread_dir, store
+
+
+def _cli_adapter(thread_dir):
+    return orch.adapters.CliAdapter(
+        role="moderator",
+        config={**_cli_role_config()["adapters"]["oc"], "adapter": "oc"},
+        worktree=thread_dir,
+    )
+
+
+def test_timeout_path_writes_invoke_log_with_partial_stdout(tmp_dir, monkeypatch):
+    """超时（§16.2 传输级失败）也落审计日志：抬头注明异常 + 已捕获的半程原文。
+
+    红（修复前）：logs/ 目录里一个文件都没有——`_read_invoke_log` 直接 assert 失败。
+    """
+    partial = _opencode_stdout()
+    _timeout_popen(monkeypatch, partial)
+    thread_dir, store = _seeded_thread(tmp_dir, "t-fail-timeout")
+
+    # availability 未启用（无 adapter_state_path）→ 该路径按既有语义**上抛**，
+    # 不因为多了一次落盘而改变（落盘在 raise 之前，语义不变）。
+    with pytest.raises(TimeoutError):
+        orch.scheduler.run_thread(
+            store, _cli_role_config(), {"moderator": _cli_adapter(thread_dir)})
+
+    text = _read_invoke_log(thread_dir, "moderator")
+    assert "本次invoke异常" in text.replace(" ", "") or "本次 invoke 异常" in text, text[:400]
+    assert "TimeoutError" in text, text[:400]
+    assert "部分" in text, "半程原文必须标明可能不完整，否则会被当成完整输出读"
+    # 已捕获的片段确实落进去了（工具行命令 + 只存在于原文里的 sessionID）。
+    assert "pytest -q tests/test_web.py" in text
+    assert FIXTURE_SID in text
+    # 输入侧照旧是本次真实送出的渲染视图。
+    assert "=== VIEW (role=moderator" in text
+
+
+def test_transport_failure_path_writes_invoke_log_with_availability_enabled(
+        tmp_dir, monkeypatch):
+    """M5 启用时超时走 return（不上抛）那条出口，同样要落日志，且不改跳闸/派发语义。"""
+    _timeout_popen(monkeypatch, _opencode_stdout())
+    thread_dir, store = _seeded_thread(tmp_dir, "t-fail-trip")
+    cfg = {**_cli_role_config(),
+           "adapter_state_path": str(tmp_dir / "adapter_state.json")}
+
+    orch.scheduler.run_thread(store, cfg, {"moderator": _cli_adapter(thread_dir)})
+
+    text = _read_invoke_log(thread_dir, "moderator")
+    assert "TimeoutError" in text, text[:400]
+    assert FIXTURE_SID in text
+    # 语义不变：派发行仍按既有 attempts 语义留在盘上（落盘只是旁路，不改状态机）。
+    rows = store.dispatches_snapshot()
+    assert rows and any(int(r["attempts"]) >= 1 for r in rows), rows
+
+
+def test_no_json_block_path_writes_invoke_log(tmp_dir, monkeypatch):
+    """"无合法 JSON 块"（ValueError）那条出口同样落盘：原文全在，才看得出后端说了啥。"""
+    junk = "我想了很久但忘了输出信封。\n随便几行散文。"
+    _patch_popen(monkeypatch, junk)
+    thread_dir, store = _seeded_thread(tmp_dir, "t-fail-nojson")
+
+    with pytest.raises(ValueError):
+        orch.scheduler.run_thread(
+            store, _cli_role_config(), {"moderator": _cli_adapter(thread_dir)})
+
+    text = _read_invoke_log(thread_dir, "moderator")
+    assert "ValueError" in text, text[:400]
+    assert "随便几行散文" in text, "原文必须在（这正是排查'为什么没信封'的唯一依据）"
+
+
+def test_failure_log_helper_is_pure_audit_and_never_breaks_caller(tmp_dir):
+    """落盘 helper 是**纯审计旁路**：盘写不动时也不得把异常带给调用点（建议7 硬约束）。
+
+    调用点接着要做的（跳闸记账 / 派发行回 pending / 标 failed）是可恢复性的命脉，
+    绝不能被"审计少一行"这种事顶掉。
+    """
+    from orch.scheduler.core import _invoke_failure_output_text, _write_invoke_log_on_failure
+
+    class _NoRaw:
+        pass
+
+    head = _invoke_failure_output_text(_NoRaw(), TimeoutError("boom"))
+    assert "TimeoutError" in head and "未捕获到任何 stdout" in head, head
+
+    class _WithRaw:
+        last_raw_output = "line-1\nline-2"
+
+    body = _invoke_failure_output_text(_WithRaw(), ValueError("no json"))
+    assert body.endswith("line-1\nline-2"), body
+    assert "ValueError" in body.splitlines()[0], body
+
+    class _BrokenStore:
+        def write_invoke_log(self, **kw):
+            raise OSError("disk full")
+
+    # 不抛（否则调用点的跳闸/状态落盘会被顶掉）。
+    _write_invoke_log_on_failure(
+        _BrokenStore(), event_ids=[1], role="pm", view_text="v",
+        adapter=_NoRaw(), exc=TimeoutError("x"),
+    )
+
+    class _WeirdStore:
+        def write_invoke_log(self, **kw):
+            raise RuntimeError("programming error")
+
+    # 非 OSError（真 bug）照旧上抛，不被降级成"日志没落上"。
+    with pytest.raises(RuntimeError):
+        _write_invoke_log_on_failure(
+            _WeirdStore(), event_ids=[1], role="pm", view_text="v",
+            adapter=_NoRaw(), exc=TimeoutError("x"),
+        )

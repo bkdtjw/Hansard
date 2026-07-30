@@ -384,6 +384,12 @@ def _strip_to_author_fields(raw: dict) -> dict:
 # summary 上限：模型可控文本一律截断到此长度（含省略号），防大段正文经 HTTP 外泄。
 _STEP_SUMMARY_LIMIT = 120
 
+# name 上限（评审 建议3）：工具名同样是**模型可控**文本——`tool_calls[].function.name`
+# 与 opencode `part.tool` 都由后端进程写，没有任何一层保证它短。summary 有上限而 name
+# 没有，等于留了一条整段外泄的旁路（造一个 1MB 的"工具名"即可）。80 比 summary 短：
+# 工具名本该是标识符量级，超出这个量级本身就说明它不是名字。
+_STEP_NAME_LIMIT = 80
+
 # 只有**逐行事件流**才有"步骤"可言：
 #   · "json"（claude/grok）整段 stdout 是单个 JSON 对象；
 #   · "text" 直出裸文本。
@@ -498,26 +504,147 @@ def _steps_from_stream_json_line(obj: dict) -> list[tuple[str, str, str, int | N
     return [("other", type_ or role or "other", "", None)]
 
 
-def parse_invoke_steps(raw_text: str, wire_format: str) -> list[dict]:
+# ——————————————————————————————————————————————————————————————
+# 日志格式嗅探（评审 应修2）：格式判定只认**日志内容自身**
+#
+# 为什么禁止按"当前绑定"判：logs/ 里的一份原文是**历史**产物，换绑之后（§5.6.2 降级
+# 派发 / 人工改 config）当前绑定与产出该日志的后端可能不是一家。按当前绑定硬解析的
+# 后果已实测：一份 opencode 原文按 stream-json 解析会逐行命中顶层 type=="tool"，吐出
+# `{"kind":"tool","name":"tool","summary":""}` 这样的**假步骤**——真实工具名与命令全丢，
+# 而页面上看不出这是错的（比空态坏得多）。日志本身不记 wire_format（§14 只记原文），
+# 故唯一可靠判据是原文自己的形状；形状也说不清时给诚实空态，不猜。
+# ——————————————————————————————————————————————————————————————
+
+# 探测行数上限：每种格式每行同构，形状在头几行就定了，多读只是白花时间。
+_SNIFF_MAX_LINES = 20
+
+# stream-json 侧的事件型名特征（Anthropic 流式事件 + claude-code 顶层型）。
+# **不含**裸 "tool"/"text"/"reasoning"：那几个是 opencode 的顶层型名，放进来会让
+# 缺了 part 的残行错投给 stream-json。
+_STREAM_JSON_TYPE_MARKERS = frozenset({
+    "message_start", "message_delta", "message_stop",
+    "content_block_start", "content_block_delta", "content_block_stop",
+    "tool_use", "tool_call", "tool_result",
+    "assistant", "user", "result", "system",
+})
+
+
+def _is_author_envelope(obj: dict) -> bool:
+    """这一行是**作者信封**（附录 A 的 to/type/body），不是流式事件 —— 嗅探时必须排掉。
+
+    非流式后端（text 直出 / 单 JSON）的 stdout 末尾一定有这么一段（通常在 ```json
+    围栏里，但围栏行不碍事：信封那一行自己就是一个合法 JSON 对象）。不排掉它会踩两坑：
+      · 它被算作"有 JSON 行"，于是"裸文本直出"这一档永远判不出来；
+      · 它的 type 可以合法地是 "system"/"user"（附录 A 枚举内），会错投给 stream-json。
+    判据要三键齐（to + 字符串 type + 字符串 body）：没有哪种流式事件行同时带这三个。
+    """
+    return ("to" in obj and isinstance(obj.get("type"), str)
+            and isinstance(obj.get("body"), str))
+
+
+def _sniff_line_vote(obj: dict) -> str:
+    """单行 JSON 对象 → 它像哪一家（"opencode-stream" / "stream-json" / ""=看不出）。
+
+    一行最多投一票，且**先验 opencode**：它的两个标志是结构性的——
+      · `part` 是对象（opencode 把每个事件的内容都装在 part 里）；
+      · 顶层 `sessionID`（驼峰大写 ID。claude/grok 单 JSON 用 `sessionId`、kimi meta 行
+        用 `session_id`，三者字符串各不相同，键名精确比对不会互撞）。
+    stream-json 侧只有较弱特征（role / tool_calls / 事件型名），故排在后面。
+    """
+    if isinstance(obj.get("part"), dict) or "sessionID" in obj:
+        return "opencode-stream"
+    if isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
+        return "stream-json"
+    if isinstance(obj.get("role"), str) and obj["role"]:
+        return "stream-json"
+    if _norm_step_type(obj.get("type")) in _STREAM_JSON_TYPE_MARKERS:
+        return "stream-json"
+    return ""
+
+
+def sniff_log_wire_format(raw_text: str) -> str | None:
+    """据**原文自身形状**嗅探这段 stdout 属于哪种 wire_format（不看任何配置/绑定）。
+
+    返回：
+      · "opencode-stream" / "stream-json" —— 逐行事件流，且该家特征严格占多数；
+      · "json" —— 整段恰好是**一个** JSON 对象（claude/grok 的单 JSON 直出）；
+      · "text" —— 有内容但没有任何一行能解析成 JSON 对象（裸文本直出）；
+      · None —— 有 JSON 行、但两家特征都不像或票数相等（混杂）。调用方据此给诚实
+        空态，**禁止**回落"按当前绑定解析"。
+
+    次序上先数逐行票、后试整段 JSON：只有一行的流式日志整段也能 json.loads 成功，
+    先试整段会把它误判成 "json"。纯函数、不抛、不看盘。
+    """
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return None
+    votes = {"opencode-stream": 0, "stream-json": 0}
+    dict_lines = 0
+    probed = 0
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if probed >= _SNIFF_MAX_LINES:
+            break
+        probed += 1
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if _is_author_envelope(obj):
+            continue                     # 信封行不是事件行：既不投票也不算 JSON 行
+        dict_lines += 1
+        vote = _sniff_line_vote(obj)
+        if vote:
+            votes[vote] += 1
+    oc, sj = votes["opencode-stream"], votes["stream-json"]
+    if oc or sj:
+        if oc == sj:
+            return None                  # 混杂：两家都投到票，不猜是哪一家
+        return "opencode-stream" if oc > sj else "stream-json"
+    try:
+        whole = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError):
+        whole = None
+    if isinstance(whole, dict):
+        return "json"                    # 整段一个 JSON 对象 = 单 JSON 直出
+    if dict_lines == 0:
+        # 一行 JSON 对象都没有。每种流式格式都是逐行 JSON，故"全都不是 JSON"是
+        # 裸文本的强证据（残缺的流式日志不可能一行都不完整）。
+        return "text"
+    return None
+
+
+def parse_invoke_steps(
+    raw_text: str, wire_format: str, *, max_steps: int | None = None,
+) -> list[dict]:
     """把一次 invoke 的 stdout 原文解析成**展示用**步骤摘要列表。
 
     返回 `[{seq, kind, name, summary[, dur_ms]}, …]`：
       · seq —— 1 起连续序号（本次解析内的次序，不是任何盘上标识）；
       · kind ∈ {"tool", "thinking", "text", "other"}；
-      · name —— 工具名 / 事件型名；
+      · name —— 工具名 / 事件型名，≤ _STEP_NAME_LIMIT 字符（同样是模型可控文本）；
       · summary —— ≤ _STEP_SUMMARY_LIMIT 字符的展示摘要（超长截断加省略号），
         **不是**原文行；
       · dur_ms —— 仅当日志给出可证单位的时间戳对时出现（见 _step_dur_ms）。
 
-    `wire_format` 不在 _STEP_STREAM_FORMATS 内 → 返回 []（不按行试探，不猜）。
+    `wire_format` 不在 _STEP_STREAM_FORMATS 内 → 返回 []（不按行试探，不猜）；调用方
+    应先用 `sniff_log_wire_format` 从原文本身定格式，**不要**传当前绑定的值。
+    `max_steps` 给出时到量即停（评审 建议4：10 万步的日志实测能撑出 18.5MB 响应；
+    上限由调用方定，本函数只负责不白解析后面那些）。
     任何行解析失败一律**跳过该行**，返回已解析部分；本函数不抛。
     """
     if str(wire_format) not in _STEP_STREAM_FORMATS:
         return []
     if not isinstance(raw_text, str) or not raw_text.strip():
         return []
+    cap = max_steps if isinstance(max_steps, int) and max_steps > 0 else None
     steps: list[dict] = []
     for raw_line in raw_text.splitlines():
+        if cap is not None and len(steps) >= cap:
+            break
         line = raw_line.strip()
         if not line:
             continue
@@ -537,10 +664,13 @@ def parse_invoke_steps(raw_text: str, wire_format: str) -> list[dict]:
             # 真 bug（如 MemoryError）不该被降级成"这行没步骤"（§16）。
             continue
         for kind, name, summary, dur_ms in items:
+            if cap is not None and len(steps) >= cap:
+                break
             step = {
                 "seq": len(steps) + 1,
                 "kind": kind,
-                "name": str(name or kind),
+                # name 与 summary 同源同截断（建议3）：两者都是后端进程写出的文本。
+                "name": _summarize(str(name or kind), _STEP_NAME_LIMIT),
                 "summary": _summarize(summary, _STEP_SUMMARY_LIMIT),
             }
             if dur_ms is not None:
