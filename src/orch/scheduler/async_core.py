@@ -69,6 +69,7 @@ from orch.scheduler.core import (
     _finish_interrupted_terminate,
     _group_pending,
     _handle_terminate,
+    _invoke_output_text,
     _is_cold_start,
     _last_ok_commit,
     _persist_resume_state,
@@ -369,9 +370,11 @@ async def _dispatch_group_async_once(
             on_invoke_success(availability, str(effective))
         # 审计原文（本次实际送出的视图文本）+ §13 采集点1 tokens/cost（与 core 同源同修）。
         async with lock:
+            # output_text 与同步环共用 _invoke_output_text（同一实现，非两处同改）。
             store.write_invoke_log(
                 event_ids=event_ids, role=target,
-                view_text=cur_view_text, output_text=str(raw_env),
+                view_text=cur_view_text,
+                output_text=_invoke_output_text(adapter, raw_env),
             )
             _record_invoke_tokens(store, target, cur_view_text, raw_env)
             _record_invoke_cost(store, target, adapter)

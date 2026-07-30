@@ -36,6 +36,13 @@ let lastBoardSig = "";
 let lastRoundStats = null;
 // R5：最近一次线程列表缓存（切换器/标题复用，仍是端点数据的只读投影）。
 let lastThreads = [];
+// T4 View Steps：折叠组的**展开态 + 已取回的步骤摘要**（纯前端投影）。
+// 为何要存：renderStream 每次变化都整流重建 innerHTML，DOM 里的展开态会被吞掉；
+// 存下来后重建时按这两份回填，**不重打端点** —— 点开才 lazy fetch，1.5s 轮询
+// 因此不会被放大成 N 次读盘（服务端每请求现读盘、零缓存，代价在这一侧省）。
+// 键是事件号，故切线程/切工作区必须清（事件号跨线程会撞车）。
+const stepsCache = new Map();   // eid → /steps 响应原样（前端不重算任何一项）
+const stepsOpen = new Set();    // eid → 当前展开
 // R5 D3：每线程"首个 A 类自动展开一次"记忆 + A 类计数变化检测（新条目高亮）。
 const boardAutoShown = new Set();
 let lastBoardACount = -1;
@@ -189,6 +196,9 @@ function switchWorkspace(name) {
   lastConfigError = "";   // 工作区换了，上一个工作区的 config 报错不该跟着走
   lastThreadRoles = [];
   lastActiveMember = null;
+  stepsCache.clear();      // 步骤摘要按事件号存：跨工作区/线程会撞车，必须清
+  stepsOpen.clear();
+  typingRows = [];         // 上一个工作区的"正在处理中"不许跟着走
   renderMemberRoster();
   unseenCount = 0;
   clearTimeout(pollTimer);
@@ -698,6 +708,9 @@ async function selectThread(tid) {
   lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
   lastConfigError = "";   // 同理：config 报错是工作区级事实，下一拍 status 会重填
   lastThreadRoles = [];   // 名册兜底名单同理（populateSendTo 会立刻重填）
+  stepsCache.clear();     // 事件号是线程内标识：切线程必须清，否则回填到别人的气泡上
+  stepsOpen.clear();
+  typingRows = [];        // 上一条线程的"正在处理中"不许留屏（下一拍 status 重填）
   availTick = 0;          // 新线程立刻补一次角色投影（心跳第一拍就取）
   // 切线程清掉角色筛选（含单聊态）：成员名单换了，留着旧成员的过滤只会显示空流。
   // #send-to 由 populateSendTo 重建 options（value 自然回到兜底首项），故此处只清标记。
@@ -971,6 +984,137 @@ function buildArtifactChips(ev) {
   return `<div class="b-arts">${chips}</div>`;
 }
 
+// ————————————————————————————————————————————————
+// T4 View Steps：每条**后端回复**气泡挂一个执行流折叠组（QUESTIONS.md Q11 裁决 A）。
+//
+// 边界（写进代码旁，改这段前先读）：
+//   · 只作**人类展示**。步骤既不回流任何调度判定（路由/重试/聚合/超时），也不进
+//     orch.render 视图层——spec §7.1 行396「调度器不知道信封背后是一步还是一百步」
+//     的主语是调度器，展示层看明细不越界。
+//   · 数据全部来自 GET /steps 的**解析后摘要**；stdout 原文不经 HTTP（原文含 sessionId
+//     的实证见 QUESTIONS.md Q9），页面上永远拿不到原文，要看原文去 logs/。
+//   · **点开才取数**：折叠组构建函数里没有任何 fetch，取数只在点击处理里发生一次。
+//   · acceptance/decision 上额外标注"后端自述·非系统验证"，且折叠组固定在气泡
+//     **末尾**（verify 徽章在正文之上），两者不相邻：§16 第 5 条—— meta.verify 才是
+//     系统侧证据，后端自述的工具明细不得与它争夺证据地位。
+// ————————————————————————————————————————————————
+// 需要"这是自述、不是系统验证"标注的型：黑板/验收类（A 类里带裁决效力的三型）。
+const SELF_CLAIM_TYPES = new Set(["acceptance", "decision", "gate_decision"]);
+// 步骤字形（tool/thinking/text 各一形，其余归 ·）。
+const STEP_GLYPH = { tool: "🔧", thinking: "💭", text: "💬", other: "·" };
+
+// 空态文案：一律照**盘上事实**说话（同 bd-fail 的口径：读不到 ≠ 没有）。
+function stepsEmptyText(res) {
+  // 取数本身失败时先认这一条：那时 wire_format 是前端填的 null，不是服务端说的
+  // "查不到配置"——照 wire_format 分支说话会把网络/服务端故障误报成配置问题。
+  if (res && res.read_failed) return "执行步骤读取失败（读不到 ≠ 没有步骤）";
+  const wf = res && res.wire_format;
+  if (wf === "json" || wf === "text") return `该后端（wire_format=${wf}）不产生步骤流`;
+  if (!wf) return "查不到该角色的适配器配置，无法判定输出形状";
+  if (!res.log_file) return "未找到本次执行日志";
+  return "本次执行日志里没有可解析的步骤";
+}
+
+function renderStepsBody(res) {
+  if (!res) return `<div class="steps-empty">正在读取执行日志…</div>`;
+  const rows = res.steps || [];
+  const counts = res.counts || {};
+  const chips = Object.keys(counts)
+    .filter((k) => Number(counts[k]) > 0)
+    .map((k) => `<span class="sc-chip">${escapeHtml(k)} ${escapeHtml(String(counts[k]))}</span>`)
+    .join("");
+  const meta =
+    (res.wire_format ? `<span class="sc-chip">wire ${escapeHtml(String(res.wire_format))}</span>` : "") +
+    (res.log_file ? `<span class="sc-chip mono" title="${escapeHtmlAttr("logs/" + res.log_file)}">日志 ${escapeHtml(String(res.log_file))}</span>` : "");
+  const head = (chips || meta) ? `<div class="steps-counts">${chips}${meta}</div>` : "";
+  // 服务端的一句人话（多份日志/无配置等）原样带出，不改写、不吞。
+  const note = (res.note) ? `<div class="steps-note">${escapeHtml(String(res.note))}</div>` : "";
+  if (!rows.length) {
+    // 空态**只出一句**：服务端 note 多半就是前端通用文案的详版（同一句开头 + 括注
+    // 原因），那时只出 note——它信息更全，且原样不改写；两句都出会读成"说了两遍"。
+    // note 说的是另一回事（多份日志、读取失败等）时才两句并出，不吞任何一句。
+    const line = stepsEmptyText(res);
+    const said = res.note ? String(res.note) : "";
+    if (said.startsWith(line)) {
+      return head + `<div class="steps-empty">${escapeHtml(said)}</div>`;
+    }
+    return head + `<div class="steps-empty">${escapeHtml(line)}</div>` + note;
+  }
+  const list = rows.map((s) => {
+    const kind = String(s.kind || "other");
+    const glyph = STEP_GLYPH[kind] || STEP_GLYPH.other;
+    const dur = (s.dur_ms === undefined || s.dur_ms === null)
+      ? ""
+      : `<span class="step-dur mono">${escapeHtml(String(s.dur_ms))} ms</span>`;
+    // summary 是**模型可控文本**（工具命令/正文摘要）：文本位一律 escapeHtml。
+    return (
+      `<div class="step-row k-${escapeHtmlAttr(kind)}">` +
+        `<span class="step-seq mono">${escapeHtml(String(s.seq))}</span>` +
+        `<span class="step-glyph" title="${escapeHtmlAttr(kind)}">${glyph}</span>` +
+        `<span class="step-name">${escapeHtml(String(s.name || kind))}</span>` +
+        `<span class="step-sum">${escapeHtml(String(s.summary || ""))}</span>` +
+        dur +
+      `</div>`
+    );
+  }).join("");
+  return head + `<div class="steps-list">${list}</div>` + note;
+}
+
+function buildStepsBlock(ev) {
+  const sender = ev.sender || "system";
+  // human 是人类发言、system 是编排器审计事件：都不是一次 invoke，不挂折叠组。
+  if (sender === "human" || sender === "system") return "";
+  const eid = Number(ev.id);
+  const res = stepsCache.has(eid) ? stepsCache.get(eid) : null;
+  const open = stepsOpen.has(eid);
+  // N 未知（尚未取数）时按钮只写 "View Steps"，取回后回填计数——不预告不知道的数。
+  const label = res ? `View Steps · ${(res.steps || []).length}` : "View Steps";
+  const claim = SELF_CLAIM_TYPES.has(ev.type)
+    ? `<span class="steps-selfclaim" title="${escapeHtmlAttr("这些步骤来自后端自己的输出原文（logs/），不是系统侧验证；系统侧证据只有正文上方的 meta.verify 徽章")}">后端自述·非系统验证</span>`
+    : "";
+  return (
+    `<div class="b-steps">` +
+      `<div class="steps-head">` +
+        `<button class="steps-toggle" data-steps-eid="${escapeHtmlAttr(String(eid))}"` +
+        ` data-expanded="${open ? "1" : "0"}"` +
+        ` title="${escapeHtmlAttr("展开这次 invoke 的执行步骤（读 logs/ 原文解析出的摘要，点开才取）")}">` +
+          `${open ? "▾" : "▸"} ${escapeHtml(label)}</button>` +
+        claim +
+      `</div>` +
+      `<div class="steps-body${open ? "" : " hidden"}">${open ? renderStepsBody(res) : ""}</div>` +
+    `</div>`
+  );
+}
+
+// 只重绘某一条气泡的折叠组（不走 renderStream 整流：那会打断滚动位置与展开态）。
+function paintStepsBlock(eid) {
+  const ev = currentEvents.find((e) => Number(e.id) === Number(eid));
+  if (!ev) return;
+  const sel = `#chat-stream .bubble[data-eid="${CSS.escape(String(eid))}"] .b-steps`;
+  const host = $(sel);
+  if (!host) return;
+  host.outerHTML = buildStepsBlock(ev);
+}
+
+// 点开时的**唯一**取数点（lazy）：一条气泡一次，结果进 stepsCache 供重建回填。
+async function loadSteps(eid) {
+  const tid = selectedThread;
+  if (!tid) return;
+  try {
+    const res = await api(`/api/threads/${tid}/steps?event_id=${encodeURIComponent(eid)}`);
+    if (tid !== selectedThread) return;      // 线程已切换：丢弃过期响应
+    stepsCache.set(Number(eid), res);
+  } catch (e) {
+    // 取不到就如实写"取不到"，不留空白也不编空态（读不到 ≠ 没有步骤）。
+    // read_failed 标记让空态说"读取失败"而不是照 wire_format=null 说"查不到配置"。
+    stepsCache.set(Number(eid), {
+      steps: [], counts: {}, wire_format: null, log_file: null, read_failed: true,
+      note: "执行步骤读取失败: " + (e.message || "未知错误"),
+    });
+  }
+  paintStepsBlock(eid);
+}
+
 // D9 卡片头：一行式 = 头像圆点 · 名字 · → · @目标chips · type 徽章 · [已入黑板]
 //            · (弹性空隙) · meta · #n · 时间。
 // @目标只从信封 to 渲染（§16.1，禁广播）。
@@ -1036,7 +1180,10 @@ function buildBubble(ev) {
     buildArtifactChips(ev) +
     (lineCount > CLAMP_LINES
       ? `<button class="toggle-clamp" data-expanded="0">展开（${lineCount} 行）</button>`
-      : "");
+      : "") +
+    // T4：执行流折叠组固定在**最末**——与正文上方的 verify 徽章隔着整段正文，
+    // 不与它相邻争位（§16 第 5 条，见 buildStepsBlock 顶部注释）。
+    buildStepsBlock(ev);
   return div;
 }
 
@@ -1283,8 +1430,9 @@ function fmtDuration(sec) {
 
 // 统计卡三栏 = 耗时 / 步骤 / invoke 次数。数据**全部**取自 /events 响应的同级键
 // round_stats（服务端每请求现算），前端不重算——口径只留一处，避免两处漂移。
-// 「工具数」一栏有意**不做**：invoke 内部的工具调用在本系统盘上任何位置都无痕迹
-// （logs/ 落的是作者字段 dict repr 而非 stdout 原文），伪造口径比缺一栏更坏。
+// 「工具数」一栏仍**不做**：T4 修复合规债后工具调用在 logs/ 有痕迹了，但那是逐次
+// invoke 的日志文件，凑一栏"本轮工具数"要把窗口内每条回复的日志都读一遍求和（1.5s
+// 轮询下最重的读盘热点）。工具明细改由每条气泡的 View Steps 折叠组按需给出。
 function buildRoundStatsSection() {
   const st = lastRoundStats;
   if (!st) return "";
@@ -1529,17 +1677,52 @@ async function loadStatus() {
 
 // R5 D6："⋯ {role} 正在响应"胶囊——数据来自既有 status 端点的 dispatching 行，
 // 不新增后端功能；多个并行则并列角色名。
+//
+// T4 升级为「正在处理中 mm:ss」：起点取 /status 派发行的**可选**键 started_ts
+// （服务端由落盘的 deadline_ts − 该角色超时秒逆算，见 server.py:_dispatch_started_ts；
+// 推不出来时该键缺席）。走字是**纯展示**：setInterval 每秒只重画文案，前端不持有
+// 任何权威状态，也**不参与任何调度判定**（超时那条线一律用服务端落盘的绝对时间戳，
+// §16.2）。缺 started_ts 的行维持既有"正在响应"文案，绝不编造起点。
+let typingRows = [];        // [{role, started_ts|null}]，最近一次 status 的派生投影
+let typingTimer = null;     // 走字定时器（无在跑派发时清掉，不留空转）
+
 function updateTypingBar(s) {
+  // 数据源复活后本条自然点亮；但**必须**沿用 isLiveDispatch 判 deadline_ts——
+  // 崩溃滞留的 dispatching 行否则会让胶囊永久常亮（同一个假绿根因）。
+  const byRole = new Map();
+  for (const d of (s.dispatches || []).filter(isLiveDispatch)) {
+    const role = String(d.target);
+    const st = Number(d.started_ts);
+    const started = isFinite(st) ? st : null;
+    if (!byRole.has(role)) { byRole.set(role, started); continue; }
+    // 同角色多条在跑（同批多事件）：取最早起点，显示的是"这一轮处理了多久"。
+    const cur = byRole.get(role);
+    if (started !== null && (cur === null || started < cur)) byRole.set(role, started);
+  }
+  typingRows = Array.from(byRole, ([role, started_ts]) => ({ role, started_ts }));
+  renderTypingPill();
+  if (typingRows.length && !typingTimer) {
+    typingTimer = setInterval(renderTypingPill, 1000);
+  } else if (!typingRows.length && typingTimer) {
+    clearInterval(typingTimer);
+    typingTimer = null;
+  }
+}
+
+function renderTypingPill() {
   const bar = $("#typing-bar");
   if (!bar) return;
-  // 数据源复活后本条自然点亮；但**必须**沿用 isLiveDispatch 判 deadline_ts——
-  // 崩溃滞留的 dispatching 行否则会让"正在响应"胶囊永久常亮（同一个假绿根因）。
-  const roles = Array.from(new Set((s.dispatches || [])
-    .filter(isLiveDispatch).map((d) => String(d.target))));
-  if (!roles.length) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
+  if (!typingRows.length) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
+  const parts = typingRows.map((r) => {
+    const name = escapeHtml(r.role);
+    if (r.started_ts === null) return `${name} 正在响应`;
+    // fmtDuration 已是 mm:ss（超一小时 h:mm:ss），与统计卡同一格式，不另造一套。
+    const el = escapeHtml(fmtDuration(Date.now() / 1000 - r.started_ts));
+    return `${name} 正在处理中 <span class="typing-clock mono">${el}</span>`;
+  });
   bar.innerHTML =
     `<span class="typing-pill"><span class="typing-dots"><i></i><i></i><i></i></span>` +
-    `${roles.map(escapeHtml).join("、")} 正在响应</span>`;
+    `${parts.join("、")}</span>`;
   bar.classList.remove("hidden");
 }
 
@@ -2287,6 +2470,20 @@ function bind() {
     if (fx) { removeFilter(fx.dataset.fkind, fx.dataset.fval); return; }
     const goto = e.target.closest("[data-goto]");
     if (goto) { gotoEvent(goto.dataset.goto); return; }
+    // T4 View Steps：**唯一**的取数触发点——点开才 fetch，且同一条只 fetch 一次
+    // （已在 stepsCache 里就直接回填，收起再展开不重打端点，轮询更不会打）。
+    const stepsBtn = e.target.closest(".steps-toggle");
+    if (stepsBtn) {
+      const eid = Number(stepsBtn.dataset.stepsEid);
+      if (stepsOpen.has(eid)) {
+        stepsOpen.delete(eid);
+      } else {
+        stepsOpen.add(eid);
+        if (!stepsCache.has(eid)) loadSteps(eid);
+      }
+      paintStepsBlock(eid);
+      return;
+    }
     const clamp = e.target.closest(".toggle-clamp");
     if (clamp) {
       const body = clamp.previousElementSibling;

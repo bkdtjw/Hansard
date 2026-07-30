@@ -364,6 +364,191 @@ def _strip_to_author_fields(raw: dict) -> dict:
     return {k: raw[k] for k in _AUTHOR_FIELDS if k in raw}
 
 
+# ======================================================================
+# T4：invoke 执行流步骤解析（**只供人类展示**；QUESTIONS.md Q11 裁决 A）
+#
+# 为什么放在适配层：判据只留一处。"哪种 wire_format 的 stdout 长什么样"这份知识
+# 已经由 `_unwrap_agent_output` 持有；把它复制到 web 层等于开第二处同源判据。
+#
+# 边界（Q11 裁决 + spec §7.1 行396）：行396「调度器不知道、也不需要知道信封背后是
+# 一步还是一百步」的主语是**调度器**。本函数的产物只喂控制台 HTTP 只读端点与页面，
+# **禁止**回流任何调度判定（路由 / 重试 / 聚合 / 超时 / 可用性分类），也不进
+# orch.render 任何视图层——全仓唯一调用方是 web/server.py 的 /steps 端点。
+#
+# 暴露口径（Q11 裁决 A）：只出工具名 + 命令摘要（截断）+ 计数；stdout 原文
+# （已实证含 sessionId，见 QUESTIONS.md Q9 档案）不经 HTTP 直出，只落 logs/ 供审计。
+# 因此工具**输出**正文（state.output / tool_result）一律不进 summary——它是敏感串
+# 与大段正文的藏身处，且对"这一步做了什么"无增益。
+# ======================================================================
+
+# summary 上限：模型可控文本一律截断到此长度（含省略号），防大段正文经 HTTP 外泄。
+_STEP_SUMMARY_LIMIT = 120
+
+# 只有**逐行事件流**才有"步骤"可言：
+#   · "json"（claude/grok）整段 stdout 是单个 JSON 对象；
+#   · "text" 直出裸文本。
+# 这两种没有中间事件，返回 [] 是事实而非解析失败——控制台据此给诚实空态。
+_STEP_STREAM_FORMATS = ("stream-json", "opencode-stream")
+
+# 毫秒纪元下限（2001-09-09）。两端时间戳都跨过它，差值才**可证**是毫秒；否则单位
+# 不明（陪跑记录未写明 opencode state.time 的单位口径）→ 不给耗时，不臆造单位。
+_EPOCH_MS_MIN = 1_000_000_000_000
+
+# 工具入参里"命令摘要"的取值优先级：各家 CLI 的工具入参键名不同，命中即取。
+# 全都不命中时退回 "k=v" 拼接（仍受 _STEP_SUMMARY_LIMIT 截断），不整段 dump 值。
+_TOOL_INPUT_KEYS = (
+    "command", "cmd", "file_path", "filePath", "path", "pattern",
+    "query", "url", "description", "prompt",
+)
+
+
+def _norm_step_type(value: object) -> str:
+    """事件类型归一：小写 + `-`→`_`（opencode 顶层 step_start / part 内 step-start）。"""
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _tool_input_summary(value: object) -> str:
+    """工具入参 → 一行命令摘要。只读入参（不读输出），产物再交 _summarize 截断。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in _TOOL_INPUT_KEYS:
+            v = value.get(key)
+            if isinstance(v, (str, int, float)) and str(v):
+                return str(v)
+        return ", ".join(f"{k}={v}" for k, v in value.items())
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _step_dur_ms(time_obj: object) -> int | None:
+    """opencode 工具行的 state.time → 毫秒耗时；单位不可证时返回 None（见 _EPOCH_MS_MIN）。"""
+    if not isinstance(time_obj, dict):
+        return None
+    start, end = time_obj.get("start"), time_obj.get("end")
+    if not (isinstance(start, (int, float)) and isinstance(end, (int, float))):
+        return None
+    if start < _EPOCH_MS_MIN or end < _EPOCH_MS_MIN or end < start:
+        return None
+    return int(end - start)
+
+
+def _step_from_opencode_line(obj: dict) -> tuple[str, str, str, int | None]:
+    """opencode-stream 单行 → (kind, name, summary 素材, dur_ms)。
+
+    判据取 part.type（缺失时退回顶层 type）：实测两者同义异形
+    （顶层 step_start ↔ part step-start，见 tests/test_cli_adapter.py 的样例）。
+    """
+    part = obj.get("part")
+    part = part if isinstance(part, dict) else {}
+    kind_src = _norm_step_type(part.get("type") or obj.get("type"))
+    if kind_src == "tool":
+        state = part.get("state")
+        state = state if isinstance(state, dict) else {}
+        name = part.get("tool") or part.get("name") or "tool"
+        return (
+            "tool", str(name), _tool_input_summary(state.get("input")),
+            _step_dur_ms(state.get("time")),
+        )
+    if kind_src in ("reasoning", "thinking"):
+        return "thinking", kind_src, str(part.get("text") or ""), None
+    if kind_src == "text":
+        return "text", "text", str(part.get("text") or ""), None
+    # step_start / step_finish / 未知型：如实记一行"其他"，不解读、不带正文。
+    return "other", kind_src or "other", "", None
+
+
+def _steps_from_stream_json_line(obj: dict) -> list[tuple[str, str, str, int | None]]:
+    """stream-json 单行 → 0..n 个 (kind, name, summary 素材, dur_ms)。
+
+    陪跑只落盘了 assistant / meta 两种行（QUESTIONS.md Q1），**工具行形状未实测**；
+    故两家常见形状都认——OpenAI 风 `tool_calls[].function` 与 Anthropic 风
+    `type=tool_use`——都不命中则归 other，不猜。
+    """
+    calls = obj.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        out: list[tuple[str, str, str, int | None]] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            fn = fn if isinstance(fn, dict) else {}
+            name = fn.get("name") or call.get("name") or "tool"
+            args = fn.get("arguments")
+            if args is None:
+                args = call.get("input") or call.get("arguments")
+            out.append(("tool", str(name), _tool_input_summary(args), None))
+        return out
+    type_ = _norm_step_type(obj.get("type"))
+    role = _norm_step_type(obj.get("role"))
+    if type_ in ("tool_use", "tool_call", "tool") or role == "tool":
+        name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or "tool"
+        args = obj.get("input")
+        if args is None:
+            args = obj.get("arguments") or obj.get("parameters")
+        return [("tool", str(name), _tool_input_summary(args), None)]
+    if type_ in ("thinking", "reasoning") or role in ("thinking", "reasoning"):
+        text = obj.get("content")
+        if not isinstance(text, str):
+            text = obj.get("text")
+        return [("thinking", type_ or role, str(text or ""), None)]
+    if role == "assistant" and isinstance(obj.get("content"), str):
+        return [("text", "assistant", obj["content"], None)]
+    return [("other", type_ or role or "other", "", None)]
+
+
+def parse_invoke_steps(raw_text: str, wire_format: str) -> list[dict]:
+    """把一次 invoke 的 stdout 原文解析成**展示用**步骤摘要列表。
+
+    返回 `[{seq, kind, name, summary[, dur_ms]}, …]`：
+      · seq —— 1 起连续序号（本次解析内的次序，不是任何盘上标识）；
+      · kind ∈ {"tool", "thinking", "text", "other"}；
+      · name —— 工具名 / 事件型名；
+      · summary —— ≤ _STEP_SUMMARY_LIMIT 字符的展示摘要（超长截断加省略号），
+        **不是**原文行；
+      · dur_ms —— 仅当日志给出可证单位的时间戳对时出现（见 _step_dur_ms）。
+
+    `wire_format` 不在 _STEP_STREAM_FORMATS 内 → 返回 []（不按行试探，不猜）。
+    任何行解析失败一律**跳过该行**，返回已解析部分；本函数不抛。
+    """
+    if str(wire_format) not in _STEP_STREAM_FORMATS:
+        return []
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return []
+    steps: list[dict] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue                     # 坏行（半个 JSON / 非 JSON 噪音）：跳过
+        if not isinstance(obj, dict):
+            continue
+        try:
+            if wire_format == "opencode-stream":
+                items = [_step_from_opencode_line(obj)]
+            else:
+                items = _steps_from_stream_json_line(obj)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # 形状不符（某家改了嵌套结构）→ 丢这一行。**不**写裸 except：
+            # 真 bug（如 MemoryError）不该被降级成"这行没步骤"（§16）。
+            continue
+        for kind, name, summary, dur_ms in items:
+            step = {
+                "seq": len(steps) + 1,
+                "kind": kind,
+                "name": str(name or kind),
+                "summary": _summarize(summary, _STEP_SUMMARY_LIMIT),
+            }
+            if dur_ms is not None:
+                step["dur_ms"] = dur_ms
+            steps.append(step)
+    return steps
+
+
 def _caps_from_config(config: dict, *, supports_resume: bool) -> Caps:
     """从 config（§11.1 子集）派生 Caps，缺省字段用最小合理默认。适配层不判角色语义。"""
     return {  # type: ignore[return-value]
@@ -470,6 +655,11 @@ class CliAdapter:
         # cli.main._build_adapters_from_config 的 merged）> 角色名兜底（同
         # state.resolve_effective_adapter 的主绑定约定）。仅用于错误归属，不影响 invoke。
         self.adapter_name = str(adapter_name or self.config.get("adapter") or role)
+        # T4（§14 行603 合规）：本次 invoke 的 stdout **完整原文**暂存点，供调度层
+        # write_invoke_log 落盘审计。只被写与读，**不参与**任何分类/判定——stdout 正文
+        # 一旦进 _classify_unavailable 就会撞子串清单（见该函数注释的误跳闸实证）。
+        # 每次 invoke 起首重置：残留上一次的原文比空串更坏（审计会对错事件）。
+        self.last_raw_output: str = ""
 
     def invoke(
         self, view: dict, sess: dict | None
@@ -488,6 +678,7 @@ class CliAdapter:
         # start_cmd 里的字面量 {cwd} → 本次调用的 worktree（token 级替换，见 _start_cmd_argv）。
         cmd = _start_cmd_argv(start_cmd, self.worktree) + tools_args + [str(view["text"])]
         timeout_s = int(self.config.get("timeout_s", self.caps.get("timeout_s", 0)) or 0)
+        self.last_raw_output = ""     # 本次调用起首归零（见 __init__ 注释）
         proc = subprocess.Popen(  # noqa: S603 — 冷启动子进程是 §7.2 明列职责
             cmd,
             cwd=str(self.worktree),
@@ -502,6 +693,12 @@ class CliAdapter:
         except subprocess.TimeoutExpired as exc:
             proc.kill()
             _drained_out, drained_err = _drain_after_kill(proc)
+            # §14 审计原文"拿到多少存多少"：超时被 kill 时，先前已写出的 stdout 仍是
+            # 真发生过的输出（exc.output 有则优先，否则用 kill 后排空读到的）。拿不到
+            # 就维持空串——不臆造。落盘与否由调度层决定，本层只暂存。
+            self.last_raw_output = (
+                _as_text(getattr(exc, "output", None)) or _drained_out
+            )
             # 超时属传输级失败：kill 后能读到的 stderr 仍要过一遍特征匹配（§5.6.3-1）。
             # stdout 侧（exc.output / 排空读到的正文）不进分类——不属 §5.6.3 列举的
             # 三类报错文本，且正常输出里的 UUID 会撞子串清单（见 _classify_unavailable）。
@@ -517,6 +714,9 @@ class CliAdapter:
                 f"CliAdapter[{self.role}] timed out after {timeout_s}s"
             )
 
+        # 原文暂存在**解包之前**：解包只取信封那一段，中间事件行（工具调用等）正是
+        # 被 `_unwrap_agent_output` continue 掉的那些行，只有原文里才有（§14）。
+        self.last_raw_output = stdout or ""
         agent_text, sid_hint = _unwrap_agent_output(stdout or "", self.config)
         block = _extract_last_json_block(agent_text or "")
         if block is None:
@@ -667,6 +867,10 @@ class FakeCliAdapter:
         self.last_cwd: str | None = None
         self.last_view_text: str | None = None
         self.last_argv: list[str] | None = None
+        # 与 CliAdapter 同名同义（孪生不漂移）：本次"假子进程"的 stdout 原文。
+        # scripted_replies 路径直接给信封、根本没有 stdout —— 那时恒为空串，
+        # 由调度层退回信封 repr 并注明（scheduler.core._invoke_output_text）。
+        self.last_raw_output: str = ""
         self.attempts: int = 0
         self.killed: bool = False
         self.gen: int = 0
@@ -686,6 +890,7 @@ class FakeCliAdapter:
         self.call_no += 1
         self.last_cwd = str(self.worktree)
         self.last_view_text = str(view.get("text", ""))
+        self.last_raw_output = ""     # 本次调用起首归零（同 CliAdapter）
         # §8.1 R-a：等价于 CliAdapter 的 argv 组装（含自动注入 --allowedTools）；
         # last_argv 供测试断言"配置注入生效"。
         start_cmd = str(self.config.get("start_cmd", ""))
@@ -730,6 +935,7 @@ class FakeCliAdapter:
             )
 
         stdout = self.scripted_output
+        self.last_raw_output = stdout or ""     # 假子进程的"原文"就是 scripted_output
         block = _extract_last_json_block(stdout)
         if block is None:
             raise ValueError(

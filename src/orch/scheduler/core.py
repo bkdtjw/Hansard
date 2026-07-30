@@ -230,6 +230,30 @@ def _ensure_audit_baseline(store, config: dict, role: str) -> None:
         store.set_meta(f"last_ok_commit:{role}", sha)
 
 
+def _invoke_output_text(adapter, raw_env) -> str:
+    """§14 行603 的"输出原文"：本次 invoke 的 stdout 完整原文，供 write_invoke_log 落盘。
+
+    此前两环都落 `str(raw_env)` —— 那是 `_strip_to_author_fields` 剥到 6 个作者字段
+    后的**信封 dict repr**，中间过程（工具调用等）一个字都没有，与 §14「完整输入/
+    输出原文」直接冲突。原文由适配层在 invoke 期间暂存（`CliAdapter.last_raw_output`，
+    超时/失败路径"拿到多少存多少"）。
+
+    拿不到原文（mock / API 型后端本就无子进程 stdout）→ 退回信封 repr 并**注明原因**：
+    这是把既有语义显式化，不是回归；但绝不假装那段 repr 就是原文。
+
+    async_core 直接 import 本函数（不复制第二份）——孪生单边漂移是本仓既往伤
+    （见 adapters/__init__.py `_start_cmd_argv` 的同款注释）。
+    """
+    raw = getattr(adapter, "last_raw_output", "")
+    if isinstance(raw, str) and raw:
+        return raw
+    return (
+        "（本次 invoke 无 stdout 原文可落：该适配器未提供 last_raw_output"
+        "——mock / API 型后端无子进程输出。以下为规范化后的作者字段信封 repr。）\n"
+        f"{raw_env!s}"
+    )
+
+
 def _timeout_for(config: dict, role: str) -> float:
     conf = _role_conf(config, role)
     caps = conf.get("caps") or {}
@@ -1149,9 +1173,10 @@ def _dispatch_group_once(
             # 成败与可用性无关（输出质量问题不是可用性问题）。
             on_invoke_success(availability, str(effective))
         # 审计原文（§14 一等公民）：本次实际送出的视图文本 + 输出原文。
+        # output_text 走 _invoke_output_text（stdout 完整原文；拿不到才退信封 repr）。
         store.write_invoke_log(
             event_ids=event_ids, role=target,
-            view_text=cur_view_text, output_text=str(raw_env),
+            view_text=cur_view_text, output_text=_invoke_output_text(adapter, raw_env),
         )
         # §13 采集点1：每次 invoke 记 tokens（可复算）+ 可选 cost（有真实用量才记）。
         _record_invoke_tokens(store, target, cur_view_text, raw_env)

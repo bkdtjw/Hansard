@@ -1046,3 +1046,317 @@ def test_app_js_board_reads_endpoint_and_shows_read_failure(tmp_dir):
         code, css = _req(base, "/styles.css")
         assert code == 200, code
         assert ".bd-fail" in css
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-10) T4：GET /api/threads/{id}/steps —— invoke 执行流步骤摘要（只读）
+#
+# 裁决口径（QUESTIONS.md Q11 采 A）：只出**解析后的摘要**（工具名 + 命令摘要 + 计数），
+# stdout 原文不经 HTTP 直出（原文留 logs/ 供审计）。故本节除三态外，必须有一条
+# **敏感串不外泄**断言：fixture 原文里埋 sessionId 样式串，断言响应全文不含它。
+# ——————————————————————————————————————————————————————————————
+
+# 与 tests/test_invoke_steps.py 同源的埋点串（那边验解析层，这边验 HTTP 出网关）。
+STEPS_FIXTURE_SID = "ses_019f98e73524-0758bd76e429"
+
+
+def _opencode_raw_stdout(sid: str = STEPS_FIXTURE_SID) -> str:
+    """opencode run --format json 形状的 stdout 原文（含工具行与敏感 sessionId）。"""
+    envelope = '```json\n{"to":["moderator"],"type":"report","body":"跑完了"}\n```'
+    lines = [
+        {"type": "step_start", "sessionID": sid, "part": {"type": "step-start"}},
+        {"type": "tool", "sessionID": sid, "part": {
+            "type": "tool", "tool": "bash",
+            "state": {"status": "completed",
+                      "input": {"command": "pytest -q tests/test_web.py"},
+                      "output": f"3 passed; session={sid}",
+                      "time": {"start": 1785037196000, "end": 1785037198500}}}},
+        {"type": "text", "sessionID": sid,
+         "part": {"type": "text", "text": "结论：\n" + envelope}},
+        {"type": "step_finish", "sessionID": sid,
+         "part": {"type": "step-finish", "reason": "stop"}},
+    ]
+    return "\n".join(json.dumps(x, ensure_ascii=False) for x in lines)
+
+
+def _write_config(ws: Path, wire_format: str = "opencode-stream", timeout_s: int = 300):
+    """workspace 级 config.yaml：pm 绑一个 CLI 型 adapter（wire_format 可调）。"""
+    (ws / "config.yaml").write_text(
+        "adapters:\n"
+        "  oc:\n"
+        "    kind: cli\n"
+        "    start_cmd: oc run --format json\n"
+        f"    wire_format: {wire_format}\n"
+        "  other:\n"
+        "    kind: cli\n"
+        "    start_cmd: kimi -p\n"
+        "    wire_format: stream-json\n"
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: oc\n"
+        "    can_decide: true\n"
+        f"    caps: {{timeout_s: {timeout_s}}}\n"
+        "  moderator:\n"
+        "    adapter: oc\n"
+        "    can_decide: true\n",
+        encoding="utf-8",
+    )
+
+
+def _seed_reply_with_log(ws: Path, tid: str, raw_stdout: str | None,
+                         role: str = "pm") -> int:
+    """造一条角色回复气泡（re=[1]）+ 其 invoke 日志；返回该回复的事件号。
+
+    日志用 store.write_invoke_log 落（§14 文件名约定的**权威**写者，不手拼文件名）。
+    raw_stdout=None → 只有回复、没有日志（"未找到执行日志"那一态）。
+    """
+    store = orch.store.Store(ws / tid)
+    eid = store.append_event(sender=role, type="report", body="跑完了", to=["moderator"],
+                             re=[1])
+    if raw_stdout is not None:
+        store.write_invoke_log(event_ids=[1], role=role,
+                               view_text="=== 焦点窗 ===\n#1 …", output_text=raw_stdout)
+    return eid
+
+
+def _steps_of(base: str, tid: str, event_id) -> dict:
+    code, body = _req(base, f"/api/threads/{tid}/steps?event_id={event_id}")
+    assert code == 200, (code, body)
+    return body
+
+
+def test_steps_endpoint_parses_tool_steps_from_invoke_log(tmp_dir):
+    """有步骤态：流式后端的 logs/ 原文 → 工具名 + 命令摘要 + counts + log_file。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        eid = _seed_reply_with_log(tmp_dir, tid, _opencode_raw_stdout())
+
+        body = _steps_of(base, tid, eid)
+        assert set(body) == {"steps", "counts", "wire_format", "log_file", "note"}, body
+        assert body["wire_format"] == "opencode-stream", body
+        assert body["log_file"] and body["log_file"].endswith("_E1_pm.log"), body
+        tools = [s for s in body["steps"] if s["kind"] == "tool"]
+        assert len(tools) == 1, body["steps"]
+        assert tools[0]["name"] == "bash"
+        assert "pytest -q tests/test_web.py" in tools[0]["summary"]
+        assert tools[0]["dur_ms"] == 2500
+        assert body["counts"]["tool"] == 1, body["counts"]
+        assert body["counts"]["text"] == 1, body["counts"]
+        # seq 连续，供前端直接列序号。
+        assert [s["seq"] for s in body["steps"]] == list(
+            range(1, len(body["steps"]) + 1))
+
+
+def test_steps_endpoint_never_exposes_raw_stdout_or_session_id(tmp_dir):
+    """Q11 硬口径：响应**全文**不得含 stdout 原文片段与 sessionId（原文只在盘上）。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        eid = _seed_reply_with_log(tmp_dir, tid, _opencode_raw_stdout())
+
+        code, raw = _req(base, f"/api/threads/{tid}/steps?event_id={eid}")
+        assert code == 200, raw
+        blob = json.dumps(raw, ensure_ascii=False)
+        assert STEPS_FIXTURE_SID not in blob, blob
+        assert "3 passed" not in blob, "工具输出正文不得随摘要外泄"
+        assert "sessionID" not in blob, blob
+        # 对照：原文确实在盘上（审计不受影响，只是不经 HTTP）。
+        logs = list((tmp_dir / tid / "logs").iterdir())
+        assert logs and STEPS_FIXTURE_SID in logs[0].read_text(encoding="utf-8")
+
+
+def test_steps_endpoint_no_log_returns_empty_with_note(tmp_dir):
+    """无日志态：200 + steps=[] + 一句人话（不 404、不猜）。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        eid = _seed_reply_with_log(tmp_dir, tid, None)
+
+        body = _steps_of(base, tid, eid)
+        assert body["steps"] == [] and body["log_file"] is None, body
+        assert "未找到本次执行日志" in body["note"], body
+        assert body["counts"] == {"tool": 0, "thinking": 0, "text": 0, "other": 0}, body
+
+
+def test_steps_endpoint_non_stream_backend_explains_empty(tmp_dir):
+    """非流式态：wire_format=json 的后端没有逐行事件 → 空 + 说明为什么空。"""
+    _write_config(tmp_dir, wire_format="json")
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        eid = _seed_reply_with_log(
+            tmp_dir, tid,
+            json.dumps({"text": "收到", "sessionId": STEPS_FIXTURE_SID}))
+
+        body = _steps_of(base, tid, eid)
+        assert body["wire_format"] == "json", body
+        assert body["steps"] == [], body
+        assert "不产生步骤流" in body["note"], body
+        assert STEPS_FIXTURE_SID not in json.dumps(body, ensure_ascii=False)
+
+
+def test_steps_endpoint_wire_format_follows_session_backend(tmp_dir):
+    """降级后 wire_format 跟着**盘上**的 sessions.backend 走，不认主绑定（§5.6.2）。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        eid = _seed_reply_with_log(tmp_dir, tid, _opencode_raw_stdout())
+        store = orch.store.Store(tmp_dir / tid)
+        store.upsert_session(role="pm", sid="s1", gen=1, backend="other")
+
+        body = _steps_of(base, tid, eid)
+        assert body["wire_format"] == "stream-json", body
+
+
+def test_steps_endpoint_human_and_unknown_event_are_not_invokes(tmp_dir):
+    """human/system 事件与不存在的事件号：都是 200 + 空 + 说明，不 404。"""
+    _write_config(tmp_dir)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        body = _steps_of(base, tid, 1)          # E1 = human assign
+        assert body["steps"] == [] and "不是一次后端 invoke" in body["note"], body
+        body = _steps_of(base, tid, 9999)
+        assert body["steps"] == [] and "没有事件 #9999" in body["note"], body
+
+
+def test_steps_endpoint_requires_event_id_and_get(tmp_dir):
+    """event_id 必填（整数）；方法白名单只放 GET；未知线程仍 404。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        code, body = _req(base, f"/api/threads/{tid}/steps")
+        assert code == 400, (code, body)
+        code, body = _req(base, f"/api/threads/{tid}/steps?event_id=abc")
+        assert code == 400, (code, body)
+        code, body = _req(base, f"/api/threads/{tid}/steps?event_id=1", "POST", {})
+        assert code == 405, (code, body)
+        code, body = _req(base, "/api/threads/no-such/steps?event_id=1")
+        assert code == 404, (code, body)
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-11) T4：/status 派发行的可选键 started_ts（由 deadline_ts 逆算，不新增落盘字段）
+# ——————————————————————————————————————————————————————————————
+
+def test_status_dispatch_row_carries_started_ts_derived_from_deadline(tmp_dir):
+    """started_ts = deadline_ts − 该角色 caps.timeout_s（与调度层 _timeout_for 同源）。"""
+    _write_config(tmp_dir, timeout_s=300)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        store = orch.store.Store(tmp_dir / tid)
+        e1 = store.events()[0]["id"]
+        deadline = time.time() + 120
+        store.mark_dispatching(e1, "pm", deadline)
+
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        row = _dispatch_row(body["dispatches"], e1, "pm")
+        assert abs(float(row["started_ts"]) - (deadline - 300)) < 0.001, row
+        # 既有键一个不动（键名冻结）+ 仍不得出现 role 键。
+        for key in ("event_id", "target", "status", "deadline_ts", "attempts"):
+            assert key in row, row
+        assert "role" not in row, row
+
+
+def test_status_omits_started_ts_when_deadline_or_config_missing(tmp_dir):
+    """两条"不猜"出口：pending 行无 deadline_ts → 无该键；config 坏了 → 整体不给。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        # (a) 无 config.yaml：pending 行没有 deadline_ts，键必须缺席。
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        pending = [d for d in body["dispatches"] if d["status"] == "pending"]
+        assert pending, body
+        assert all("started_ts" not in d for d in pending), pending
+
+        # (b) config.yaml 语法错：超时秒取不到 → dispatching 行也不给 started_ts。
+        store = orch.store.Store(tmp_dir / tid)
+        e1 = store.events()[0]["id"]
+        store.mark_dispatching(e1, "pm", time.time() + 60)
+        (tmp_dir / "config.yaml").write_text("roles:\n  pm: [oops\n", encoding="utf-8")
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert body.get("config_error"), body
+        row = _dispatch_row(body["dispatches"], e1, "pm")
+        assert "started_ts" not in row, row
+        assert row["deadline_ts"] is not None, row      # 原有键照旧如实给
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-12) T4 前端判据：View Steps 折叠组（lazy fetch / 空态 / 自述标注 / 走字）
+# ——————————————————————————————————————————————————————————————
+
+def test_app_js_view_steps_is_lazy_and_cached(tmp_dir):
+    """点开才 fetch（轮询不得放大）；重渲染用缓存回填，不重复打端点。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        # ① 只在点击处理里发请求；折叠组构建函数里没有 fetch。
+        assert "/api/threads/${tid}/steps?event_id=" in js
+        assert "async function loadSteps(eid)" in js
+        head = js.split("function buildStepsBlock(ev)", 1)
+        assert len(head) == 2, "buildStepsBlock 应存在"
+        assert "api(" not in head[1].split("\n}\n", 1)[0], "构建折叠组时不得取数（lazy）"
+        # ② 展开态与结果都存在前端投影里（轮询重建气泡后不重打端点）。
+        assert "const stepsCache = new Map();" in js
+        assert "const stepsOpen = new Set();" in js
+        # ③ 计数回填按钮文案。
+        assert "View Steps" in js
+        assert "View Steps · " in js
+
+
+def test_app_js_view_steps_empty_states_are_honest(tmp_dir):
+    """空态两句都在：非流式后端 / 未找到日志；且服务端 note 原样带出。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "不产生步骤流" in js
+        assert "未找到本次执行日志" in js
+        assert "res.note" in js
+        # 空态不得说"暂无步骤"这类含糊话（同 bd-fail 的口径：读不到 ≠ 没有）。
+        assert "steps-empty" in js
+
+
+def test_app_js_view_steps_marks_self_claim_on_a_class_bubbles(tmp_dir):
+    """acceptance/decision 上必须标注"后端自述·非系统验证"，且不与 verify 徽章争位。
+
+    §16 第 5 条：verify 徽章才是系统侧证据。折叠组挂在气泡**末尾**（徽章在正文之上），
+    两者不相邻。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "后端自述·非系统验证" in js
+        assert "steps-selfclaim" in js
+        # 结构：verify 徽章在正文之前、折叠组在 artifacts/展开按钮之后（气泡最末）。
+        # 定位必须先切到 buildBubble 的**函数体**再比次序：子串 "buildStepsBlock(ev)"
+        # 在全文里还命中函数定义（`function buildStepsBlock(ev)`）与 paintStepsBlock 的
+        # 单气泡重绘，两处都在 buildBubble 之前，全文 str.index 取首次出现会定位到定义
+        # 上——那测的是"定义写在哪"，不是接线次序。
+        parts = js.split("function buildBubble(ev)", 1)
+        assert len(parts) == 2, "buildBubble 应存在"
+        fn = parts[1].split("\n}\n", 1)[0]
+        badge_i = fn.index("buildVerifyBadge(ev) +")
+        steps_i = fn.index("buildStepsBlock(ev)")
+        assert badge_i < steps_i, "折叠组必须在 verify 徽章之后（不相邻争位）"
+        # 且隔着整段正文与 artifacts chips：不是"紧贴徽章"的换位摆法。
+        assert badge_i < fn.index('class="b-body') < steps_i, fn
+        assert fn.index("buildArtifactChips(ev)") < steps_i, fn
+        # 折叠组是拼接的最后一项（其后只剩 return）。
+        assert "buildStepsBlock(ev);" in fn.split("return div;", 1)[0], fn
+        code, css = _req(base, "/styles.css")
+        assert code == 200, code
+        assert ".steps-selfclaim" in css and ".b-steps" in css
+
+
+def test_app_js_typing_pill_counts_up_from_started_ts(tmp_dir):
+    """「正在处理中 mm:ss」每秒走字：纯前端 setInterval，数据源是落盘推得的 started_ts。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "正在处理中" in js
+        assert "d.started_ts" in js
+        assert "setInterval(renderTypingPill, 1000)" in js
+        # 缺 started_ts 时维持既有胶囊文案（不编造起点）。
+        assert "正在响应" in js
+        # 计时只是展示：不得参与任何调度判定（注释显式声明）。
+        assert "不参与任何调度判定" in js

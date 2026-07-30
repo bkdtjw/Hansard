@@ -22,6 +22,8 @@ import orch.store
 import orch.scheduler
 import orch.render
 import orch.protocol
+# 只用其纯函数 parse_invoke_steps（展示用步骤解析）；wire_format 形状知识只留适配层一处。
+import orch.adapters
 
 # 复用 CLI 层既有 helper（同包私有名允许直接 import；不拷业务逻辑）。
 import orch.cli.main as clim
@@ -118,8 +120,10 @@ def _round_stats(events: list[dict]) -> dict:
       · steps      = 窗口事件数
       · invokes    = 窗口内 sender ∉ {human, system} 的事件数（system 是审计事件，
                      不是一次模型调用）
-    **不出「工具数」一栏**：invoke 内部的工具调用在本系统盘上任何位置都无痕迹
-    （logs/ 今天落的是作者字段 dict repr 而非 stdout 原文），伪造口径比缺一栏更坏。
+    **不出「工具数」一栏**：T4 修复合规债后 logs/ 落的已是 stdout 原文、工具调用在盘上
+    有痕迹了，但那是**逐次 invoke 的日志文件**——凑一栏"本轮工具数"须把窗口内每条回复的
+    日志都读一遍求和，把统计卡从"零查库的事件派生"变成 N 次读盘（1.5s 轮询下的最重热点）。
+    工具明细改由 /steps 端点按需给出（点开某条气泡才取那一份日志），统计卡维持三栏。
 
     入参是 _ep_thread_events 的只读投影（含 sender/ts/id），不查库、不改数据。
     """
@@ -242,37 +246,38 @@ def _ep_thread_board(ws: Path, tid: str) -> tuple[int, dict]:
 
 
 def _role_binding_projection(
-    ws: Path, store: "orch.store.Store",
-) -> tuple[list[dict], str | None]:
+    ws: Path, store: "orch.store.Store", cfg: dict, cfg_error: str | None,
+) -> list[dict]:
     """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
 
-    返回 (投影行, config 错误人话 或 None)。行的键名冻结：
-    {role, primary, effective, blocked}；effective=None ⇔ blocked=True（该角色主绑定
-    与全部备胎均已停用，§5.6.2）。解析复用 state.resolve_effective_adapter，与调度层
-    同一判据；本函数**不写盘、不改配置**。
+    返回投影行，键名冻结 {role, primary, effective, blocked}；effective=None ⇔
+    blocked=True（该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用
+    state.resolve_effective_adapter，与调度层同一判据；本函数**不写盘、不改配置**。
+
+    (cfg, cfg_error) 由调用方传入（`clim._read_config_file_checked` 的原样产物）：
+    同一请求内 config 只读一次，角色投影与派发行的 started_ts 推算同源同拍——两处
+    各读一次会在"运维正保存 config"的瞬间给出互相矛盾的两半。
 
     两条"不猜测"的空投影出口，同向不同信号：
-      · 状态文件损坏 → 空投影 + 无 config 信号（run 端点会给人话报错，读页面不该被打断）；
-      · config.yaml 读不出来（语法错/顶层非映射/读不动）→ 空投影 + **错误信号**
-        （评审"应修3"）。绝不用"角色名当主绑定"兜底：``state.is_enabled`` 对未记录的
-        名字返回 True，兜底会让每一行都是 blocked=false 的**假健康**，而真实主绑定
-        可能正被人工停用，§12「阻塞角色必须显著警示」在该路径恒不触发。
+      · 状态文件损坏 → 空投影（run 端点会给人话报错，读页面不该被打断）；
+      · config.yaml 读不出来（语法错/顶层非映射/读不动）→ 空投影，错误信号由调用方
+        （_ep_thread_status 的 config_error 顶层键）承载（评审"应修3"）。绝不用
+        "角色名当主绑定"兜底：``state.is_enabled`` 对未记录的名字返回 True，兜底会让
+        每一行都是 blocked=false 的**假健康**，而真实主绑定可能正被人工停用，
+        §12「阻塞角色必须显著警示」在该路径恒不触发。
     """
     from orch.adapters.state import AdapterStateError, resolve_effective_adapter
 
-    cfg_path = clim._workspace_config_path(ws)
-    # checked 版：区分"没有 config"（合法，维持既有角色名兜底）与"config 坏了"（不臆造）。
-    cfg, cfg_error = clim._read_config_file_checked(cfg_path)
     if cfg_error:
-        return [], cfg_error
+        return []
     roles_cfg = cfg.get("roles") or {}
     roles = clim._thread_roles(store) or [str(r) for r in roles_cfg]
     if not roles:
-        return [], None
+        return []
     try:
-        availability = clim._open_availability(cfg_path)
+        availability = clim._open_availability(clim._workspace_config_path(ws))
     except AdapterStateError:
-        return [], None
+        return []
     out = []
     for role in roles:
         rc = roles_cfg.get(role) or {}
@@ -284,7 +289,35 @@ def _role_binding_projection(
             "effective": effective,
             "blocked": effective is None,
         })
-    return out, None
+    return out
+
+
+def _dispatch_started_ts(cfg: dict, target: str, deadline_ts) -> float | None:
+    """dispatching 行的**推得**起点 = deadline_ts − 该 target 的超时秒（不新增落盘字段）。
+
+    scheduler/core.py `_dispatch_group` 落盘时用的正是
+    `time.time() + _timeout_for(config, target)`（§4.4 事务(2)），故此处 import **同一个**
+    `_timeout_for` 逆算：超时口径只留一处，复制第二份就会让页面上的"已处理 mm:ss"
+    与真实超时判据慢慢分叉。纯函数、不查库、不写盘。
+
+    返回 None（→ 端点省略该键，前端维持既有"正在响应"胶囊）的情形：
+      · deadline_ts 不是有限数（pending 行本就没有截止时间戳）；
+      · 超时秒推不出正数。
+    调用方还须在 config **读不出来**时整个跳过本函数：`_timeout_for` 那时会退到
+    600s 默认值，而那未必是当时真正用的超时秒，据它算出的起点是编的。
+    """
+    from orch.scheduler.core import _timeout_for
+
+    try:
+        deadline = float(deadline_ts)
+    except (TypeError, ValueError):
+        return None
+    if deadline != deadline or deadline in (float("inf"), float("-inf")):
+        return None                      # NaN / inf：盘上被人工改坏，不猜
+    timeout_s = float(_timeout_for(cfg or {}, str(target)))
+    if timeout_s <= 0:
+        return None
+    return deadline - timeout_s
 
 
 def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
@@ -295,19 +328,29 @@ def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
     # 键名冻结 event_id/target/status/deadline_ts/attempts —— **不得**把 target 改名成
     # role：tests/test_m5_availability.py 的 _role_projection 按"首个每项含 role 键的
     # 顶层列表"结构探测 roles 投影，派发行一旦带 role 键会被误命中。
+    # T4 追加**可选**键 started_ts（Lead 批准的加键，不是改名）：由 deadline_ts 逆算
+    # （见 _dispatch_started_ts），推不出来就**不出现**——键缺失时前端维持既有胶囊。
+    # 它同样不含 role 键，故上述结构探测不受影响。
     # 每请求现查盘、零缓存（§16.9）。
     rows = store.dispatches_snapshot()
-    roles, cfg_error = _role_binding_projection(ws, store)
+    # config 每请求读一次，两处投影共用（见 _role_binding_projection 的入参说明）。
+    cfg, cfg_error = clim._read_config_file_checked(clim._workspace_config_path(ws))
+    roles = _role_binding_projection(ws, store, cfg, cfg_error)
+    dispatches = []
+    for r in rows:
+        row = {
+            "event_id": r["event_id"], "target": r["target"],
+            "status": r["status"], "deadline_ts": r["deadline_ts"],
+            "attempts": r["attempts"],
+        }
+        if not cfg_error:
+            started = _dispatch_started_ts(cfg, r["target"], r["deadline_ts"])
+            if started is not None:
+                row["started_ts"] = started
+        dispatches.append(row)
     payload = {
         "status": store.get_meta("status") or "unknown",
-        "dispatches": [
-            {
-                "event_id": r["event_id"], "target": r["target"],
-                "status": r["status"], "deadline_ts": r["deadline_ts"],
-                "attempts": r["attempts"],
-            }
-            for r in rows
-        ],
+        "dispatches": dispatches,
         # M5 §12：角色行的生效绑定 / 阻塞点名（前端据此渲染，不再只看"有没有 disabled"）。
         "roles": roles,
     }
@@ -317,6 +360,170 @@ def _ep_thread_status(ws: Path, tid: str) -> tuple[int, dict]:
         # 无错误时该键**不出现** —— 健康路径（含"根本没有 config.yaml"）的响应逐字同旧。
         payload["config_error"] = cfg_error
     return 200, payload
+
+
+# ——————————————————————————————————————————————————————————————
+# T4：invoke 执行流步骤（GET /api/threads/{id}/steps?event_id=N）
+#
+# 裁决边界（QUESTIONS.md Q11 采 A）：**只作人类展示**——本端点的产物不回流任何调度
+# 判定（路由/重试/聚合/超时/可用性），也不进 orch.render 任何视图层；spec §7.1 行396
+# 「调度器不知道信封背后是一步还是一百步」的主语是调度器，展示层不越界。
+# 暴露口径：只出**解析后的步骤摘要**（工具名 + 命令摘要截断 + 计数）。stdout 原文
+# （已实证含 sessionId，Q9 档案）**不经 HTTP 直出**，原文只留 logs/ 供审计
+# （orch attach / 现场勘查照旧）。§12 缺省绑 127.0.0.1 但无鉴权，故这条口径是硬的。
+# 每请求现读盘、零缓存、无模块级可变状态（§16.9）。
+# ——————————————————————————————————————————————————————————————
+
+# store.write_invoke_log 写入的段分隔行（store/__init__.py:622-627 逐字）。本端点只
+# **读**它写的文件，格式权威在那一处；此常量是镜像而非第二处定义——那边一旦改格式，
+# 本端点当场退成"没有可解析的步骤"（诚实空态），不会给出错误步骤。
+_LOG_OUTPUT_MARKER = "=== OUTPUT ==="
+
+# counts 的键（前端按固定四档渲染字形）；零也出，省得前端分不清"没有"与"没算"。
+_STEP_KINDS = ("tool", "thinking", "text", "other")
+
+
+def _steps_payload(*, steps=None, wire_format=None, log_file=None, note="") -> dict:
+    """/steps 的响应外形（键名冻结 steps/counts/wire_format/log_file/note）。
+
+    note = 一句人话说明；有步骤且无附注时是空串。**任何字段都不含 stdout 原文全文**。
+    """
+    rows = list(steps or [])
+    return {
+        "steps": rows,
+        "counts": {k: sum(1 for s in rows if s.get("kind") == k) for k in _STEP_KINDS},
+        "wire_format": wire_format,
+        "log_file": log_file,
+        "note": note,
+    }
+
+
+def _log_output_section(text: str) -> str:
+    """从 invoke 日志里切出 OUTPUT 段（分隔行之后的全部内容）。
+
+    取**最后一个**分隔行：VIEW 段是渲染出的视图文本，其中含 agent 正文（模型可控），
+    正文里伪造一行分隔符是可能的。取最后一个的结果是"至多少显示几步"，而不是把视图
+    正文当输出去解析——两种偏差里选不会张冠李戴的那种。
+    """
+    idx = text.rfind(_LOG_OUTPUT_MARKER)
+    if idx < 0:
+        return ""
+    return text[idx + len(_LOG_OUTPUT_MARKER):].lstrip("\r\n")
+
+
+def _invoke_log_suffix(event_ids: list[int], role: str) -> str:
+    """§14 日志文件名的后缀（store/__init__.py:618-621 的命名约定镜像）。
+
+    定位链：一条角色回复气泡 → 该事件的 re（= 本批触发事件号，core.py:1244 由编排器
+    权威赋值）+ from（= 角色名）→ 文件名 `{ts:.6f}_E{ids}_{role}.log` 的后缀。
+    """
+    ids_part = "-".join(str(int(i)) for i in event_ids) if event_ids else "none"
+    return f"_E{ids_part}_{role}.log"
+
+
+def _find_invoke_logs(store: "orch.store.Store", suffix: str) -> list[Path]:
+    """logs/ 下名字以 suffix 结尾的日志，按文件名（= 时间戳前缀）旧→新排序。
+
+    用后缀比对而不是 glob：角色名/事件号进 glob 模式还要转义，比对更直白也更严格。
+    同一 (批, 角色) 可有多份——schema 校验失败会原地重调，每次各落一份（§5.1）。
+    """
+    logs_dir = store.thread_dir / "logs"
+    if not logs_dir.is_dir():
+        return []
+    out = [p for p in logs_dir.iterdir() if p.is_file() and p.name.endswith(suffix)]
+    out.sort(key=lambda p: p.name)
+    return out
+
+
+def _role_wire_format(ws: Path, store: "orch.store.Store", role: str) -> tuple[str | None, str]:
+    """该角色输出的 wire_format（决定原文有没有逐行事件）→ (wire_format 或 None, 说明)。
+
+    取值次序（优先盘上事实）：
+      1. sessions 行的 backend —— 该角色**上次实际用的** adapter 名（§7.5 列，降级派发
+         时写的是生效绑定名，core.py `_session_for_upsert`）；
+      2. config.roles[role].adapter —— 主绑定名兜底（无会话行时，如 API 型/首轮）。
+    再取 config.adapters[名].wire_format，role 层同名字段覆盖（与
+    `clim._build_adapters_from_config` 的 merged 同序）；缺该键 → "text"（§7.2 默认）。
+
+    返回 None 的两种"不猜"：config 读不出来，或 config 里根本没有这个角色——那时
+    连"是不是流式"都无从判定，前端给"查不到配置"的空态，绝不假装 text。
+    日志本身不记 wire_format（§14 只记原文），故这是**据当前配置的推断**：崩溃前后
+    改过 config / 换过绑定时可能与当时不同，此时步骤会退成空态而非错态。
+    """
+    cfg, cfg_error = clim._read_config_file_checked(clim._workspace_config_path(ws))
+    if cfg_error:
+        return None, cfg_error
+    roles_cfg = cfg.get("roles") or {}
+    rc = roles_cfg.get(role)
+    if not isinstance(rc, dict):
+        return None, (f"config 里没有角色 {role} 的适配器绑定，无法判定其输出形状"
+                      "（该线程可能跑在 mock/Fake 后端上）")
+    name = str(rc.get("adapter") or role)
+    sess = clim._lookup_session(store, role) or {}
+    backend = sess.get("backend")
+    if backend and isinstance(backend, str):
+        name = backend
+    ac = (cfg.get("adapters") or {}).get(name)
+    merged = {**(ac if isinstance(ac, dict) else {}), **rc}
+    return str(merged.get("wire_format", "text")), ""
+
+
+def _ep_thread_steps(ws: Path, tid: str, query: dict) -> tuple[int, dict]:
+    """某条角色回复气泡背后那次 invoke 的执行步骤摘要（只读，见本节顶部裁决边界）。
+
+    找不到日志 / 该事件不是一次 invoke / 后端不产生步骤流 → 一律 **200 + steps=[] +
+    note 一句人话**，不 404、不猜。
+    """
+    store = _require_thread(ws, tid)
+    raw_id = (query.get("event_id") or [""])[0]
+    try:
+        event_id = int(str(raw_id).strip())
+    except (TypeError, ValueError):
+        raise _ApiError(400, "event_id 必填（整数：该条回复气泡的事件号）")
+
+    ev = next((e for e in store.events() if int(e["id"]) == event_id), None)
+    if ev is None:
+        return 200, _steps_payload(note=f"线程 {tid} 里没有事件 #{event_id}")
+    role = str(ev.get("from") or "")
+    if role in ("", "human", "system"):
+        return 200, _steps_payload(
+            note=(f"#{event_id} 的发件人是 {role or '未知'}，不是一次后端 invoke"
+                  "（human 是人类发言、system 是编排器审计事件），没有执行日志"))
+
+    suffix = _invoke_log_suffix([int(i) for i in (ev.get("re") or [])], role)
+    logs = _find_invoke_logs(store, suffix)
+    wire, wire_note = _role_wire_format(ws, store, role)
+    if not logs:
+        note = f"未找到本次执行日志（logs/ 下没有以 {suffix} 结尾的文件）"
+        return 200, _steps_payload(wire_format=wire,
+                                   note="；".join(x for x in (note, wire_note) if x))
+
+    path = logs[-1]          # 多份时取最新：重调过的话，产出这条回复的是最后一次
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return 200, _steps_payload(
+            wire_format=wire, log_file=path.name,
+            note=f"执行日志读取失败：{clim._one_line(exc)}")
+    raw_output = _log_output_section(text)
+    # 原文**到此为止**：只有解析产物出网关，raw_output 本身绝不进响应任何字段。
+    steps = orch.adapters.parse_invoke_steps(raw_output, wire or "")
+
+    notes = [wire_note] if wire_note else []
+    if len(logs) > 1:
+        notes.append(f"该事件与角色下有 {len(logs)} 份日志"
+                     "（schema 校验失败会原地重调，每次各落一份），此处取最新一份")
+    if not steps:
+        if wire in ("json", "text"):
+            notes.append(f"该后端（wire_format={wire}）不产生步骤流："
+                         "整段 stdout 是单个 JSON / 直出文本，没有逐行事件")
+        elif not raw_output.strip():
+            notes.append("执行日志的 OUTPUT 段是空的")
+        elif wire:
+            notes.append("本次执行日志里没有可解析的步骤"
+                         "（原文可能来自非流式后端，或适配器未提供 stdout 原文）")
+    return 200, _steps_payload(steps=steps, wire_format=wire, log_file=path.name,
+                               note="；".join(notes))
 
 
 def _ep_thread_send(ws: Path, tid: str, body: dict) -> tuple[int, dict]:
@@ -784,6 +991,10 @@ def _make_handler(ws_map: dict, default_name: str):
                     if method != "GET":
                         raise _ApiError(405, "status 仅支持 GET")
                     return _ep_thread_status(ws, tid)
+                if sub == "steps":
+                    if method != "GET":
+                        raise _ApiError(405, "steps 仅支持 GET")
+                    return _ep_thread_steps(ws, tid, query)
                 if sub == "send":
                     if method != "POST":
                         raise _ApiError(405, "send 仅支持 POST")

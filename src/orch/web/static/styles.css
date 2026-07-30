@@ -405,6 +405,14 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .typing-dots i:nth-child(2) { animation-delay: 0.2s; }
 .typing-dots i:nth-child(3) { animation-delay: 0.4s; }
+/* T4「正在处理中 mm:ss」走字：等宽 + tabular-nums（每秒重画时数字不左右跳动），
+   再套一枚内嵌小胶囊把"这是在走的计时"与角色名分开。定宽由 tabular-nums 保证，
+   故整条胶囊宽度不随秒数抖动——不需要任何布局属性过渡。 */
+.typing-clock {
+  font-variant-numeric: tabular-nums; color: var(--txt);
+  padding: 0 6px; border-radius: var(--radius-chip);
+  background: rgba(255, 255, 255, 0.08); border: 1px solid var(--glass-brd);
+}
 .sel, .inp {
   background: rgba(0, 0, 0, 0.28); color: var(--txt); border: 1px solid var(--glass-brd);
   border-radius: 8px; padding: 7px 10px; font-family: inherit; font-size: 13px;
@@ -594,6 +602,72 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
   background: rgba(0, 0, 0, 0.3); border: 1px solid var(--glass-brd);
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ============================================================
+   T4 View Steps 折叠组（气泡最末；数据来自 /steps 的解析后摘要）
+   —— 纯 rgba + border，无 blur（全站唯一 backdrop-filter 仅顶栏，E2）。
+   —— transition 只用 background-color/border-color/color（不碰布局属性）。
+   —— 视觉上**刻意弱于** .verify-badge：徽章是实底绿/红的系统侧结论，折叠组是
+      灰描边的次要区域，读者一眼能分出"系统验证"与"后端自述"（§16 第 5 条）。
+   ============================================================ */
+.b-steps { margin-top: 8px; padding-top: 7px; border-top: 1px dashed rgba(255, 255, 255, 0.10); }
+.steps-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.steps-toggle {
+  padding: 2px 10px; font-size: 12px; font-family: inherit;
+  background: rgba(255, 255, 255, 0.05); color: var(--txt-dim);
+  border: 1px solid var(--glass-brd); border-radius: var(--radius-chip); cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.steps-toggle:hover { background: rgba(255, 255, 255, 0.13); color: var(--txt); }
+/* 「后端自述·非系统验证」：虚线描边 + 弱化灰，绝不用徽章的实底绿——那会读成验收证据。 */
+.steps-selfclaim {
+  font-size: 11px; color: var(--txt-dim); padding: 1px 7px;
+  border: 1px dashed rgba(255, 255, 255, 0.28); border-radius: var(--radius-chip);
+  background: rgba(255, 255, 255, 0.03); white-space: nowrap; cursor: help;
+}
+.steps-body { margin-top: 6px; }
+
+/* 计数 / wire / 日志名 chips */
+.steps-counts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.sc-chip {
+  font-size: 11px; color: var(--txt-meta); padding: 1px 7px;
+  border-radius: var(--radius-chip); border: 1px solid var(--glass-brd);
+  background: rgba(255, 255, 255, 0.05);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 空态 / 服务端那句人话：与 .bd-empty 同口径（读不到 ≠ 没有，故不写"暂无"）。 */
+.steps-empty { font-size: 12px; color: var(--txt-dim); font-style: italic; line-height: 1.6; }
+.steps-note { margin-top: 5px; font-size: 11px; color: var(--txt-dim); line-height: 1.6; }
+
+/* 步骤行：序号（等宽定宽）· 字形 · 名 · 摘要 · 耗时 */
+.steps-list { display: flex; flex-direction: column; }
+.step-row {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 0; font-size: 12px; line-height: 1.6;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.step-row:last-child { border-bottom: none; }
+.step-seq {
+  flex: 0 0 auto; min-width: 18px; text-align: right;
+  color: var(--txt-dim); font-variant-numeric: tabular-nums; font-size: 11px;
+}
+.step-glyph { flex: 0 0 auto; width: 15px; text-align: center; font-size: 11px; line-height: 1; }
+.step-name { flex: 0 0 auto; font-weight: 600; color: var(--txt); max-width: 34%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.step-sum { flex: 1 1 auto; min-width: 0; color: var(--txt-meta); word-break: break-word; }
+.step-dur { flex: 0 0 auto; color: var(--txt-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* tool / thinking / text / other 四档字形区分（颜色 + 字族 + 字形，不靠单一维度）。 */
+.step-row.k-tool .step-glyph, .step-row.k-tool .step-name { color: #93c5fd; }
+.step-row.k-tool .step-sum { font-family: var(--font-mono); font-size: 11.5px; }
+.step-row.k-thinking .step-glyph, .step-row.k-thinking .step-name { color: #a78bfa; }
+.step-row.k-thinking .step-sum { font-style: italic; color: var(--txt-dim); }
+.step-row.k-text .step-glyph, .step-row.k-text .step-name { color: var(--txt-meta); }
+.step-row.k-text .step-sum { color: var(--txt); }
+.step-row.k-other { opacity: 0.7; }
+.step-row.k-other .step-glyph, .step-row.k-other .step-name { color: var(--txt-dim); font-weight: 400; }
 
 /* —— D15 连续 system 事件聚合分组行 —— */
 .sys-group { display: flex; flex-direction: column; gap: 8px; }
