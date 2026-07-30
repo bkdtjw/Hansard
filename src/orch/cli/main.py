@@ -47,6 +47,7 @@ typer 单文件实现，命令与 spec §12 表一致：
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import time
 import uuid
@@ -85,11 +86,61 @@ app.add_typer(adapter_app, name="adapter")
 # ——————————————————————————————————————————————————————————————
 
 def _one_line(exc: BaseException) -> str:
-    """异常文本压成一行（yaml 的 MarkedYAMLError 自带多行 mark，原样塞进 JSON 很难读）。
+    """异常文本压成一行（多行异常原样塞进 JSON 很难读）。
 
-    只压空白，**不**截断——mark 里的 "line 4, column 12" 正是运维要的定位信息。
+    只压空白，**不**截断。**不要**拿它处理 yaml 解析异常——那条路走
+    ``_yaml_error_brief``（理由见该函数）。
     """
     return " ".join(str(exc).split())
+
+
+# pyyaml 有几条诊断措辞会把**从文档里读到的**名字用 %r 嵌进 problem / context
+# （实测：`found duplicate anchor 'xxx'; first occurrence`、`could not determine a
+# constructor for the tag '!xxx'`、`found undefined alias 'xxx'`）——那同样是 config
+# 内容。故把引号里的**长且无空白无逗号**片段（≥8 字符、不以 "<" 开头）抹成 '…'：
+#   · 会被抹的只可能是文档里的记名（YAML 的 anchor / alias / tag 都不许含空白）；
+#   · pyyaml 自己的记号名要么很短（','、']'、'\t'），要么带空白或尖括号
+#     （'<stream end>'、'<block mapping start>'）—— 一个都不会误伤；
+#   · 排除空白/逗号还顺带避开一个坑：引号在整句里并非成对可解析，若允许含空白，
+#     `expected ',' or ']', but got '<stream end>'` 里的 ", but got " 会被当成一段
+#     "引号内容"抹掉（实测过）。
+# 定位（line/column）照给，运维照样找得到那一行 —— 只是这句话里不再带它的原文。
+_QUOTED_RUN_RE = re.compile(r"(['\"])(?!<)([^'\"\s,]{8,})\1")
+
+
+def _redact_quoted(text: str) -> str:
+    """抹掉诊断措辞里嵌的长引号片段（见 _QUOTED_RUN_RE 的理由）。"""
+    return _QUOTED_RUN_RE.sub(lambda m: f"{m.group(1)}…{m.group(1)}", text)
+
+
+def _yaml_error_brief(exc: BaseException) -> str:
+    """yaml 解析异常 → 一行**不含源码**的定位人话（评审建议6）。
+
+    为什么不能用 str(exc)：pyyaml 的 Mark.__str__ 在 buffer 可得时会附上出错行的
+    **原文片段 + 插入符**（从字符串装载时必然可得），而这段人话经
+    `_read_config_file_checked` → web `/status` 的 config_error 进浏览器；坏行邻近
+    密钥即外泄。故只取 pyyaml 自己的诊断措辞（context / problem）与 problem_mark
+    的 line/column 定位，源码内容一律不进消息。
+
+    非 MarkedYAMLError 的 YAMLError（如 reader 层的 ReaderError）没有 problem/mark，
+    退到它的 reason；连 reason 都没有就只留类名 —— 宁可少说，不回抄原文。
+    """
+    parts: list[str] = []
+    for attr in ("context", "problem"):
+        seg = getattr(exc, attr, None)
+        if seg:
+            parts.append(_redact_quoted(" ".join(str(seg).split())))
+    if not parts:
+        reason = getattr(exc, "reason", None)
+        parts.append(_redact_quoted(" ".join(str(reason).split()))
+                     if reason else type(exc).__name__)
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    line, col = getattr(mark, "line", None), getattr(mark, "column", None)
+    if line is not None and col is not None:
+        # pyyaml 的 Mark.line/column 从 0 起算，人话按 1 起算（与 pyyaml 自己的
+        # "line 4, column 12" 口径一致）。
+        parts.append(f"line {line + 1} column {col + 1}")
+    return "；".join(parts)
 
 
 def _read_config_file_checked(cfg_path: Path) -> tuple[dict, str | None]:
@@ -128,7 +179,12 @@ def _read_config_file_checked(cfg_path: Path) -> tuple[dict, str | None]:
         # 语法写错的 config.yaml（缩进错/冒号后少空格/括号不闭合）会让解析异常穿透，
         # CLI 带栈崩、web 控制台 status 端点被顶层兜底吞成 500（状态面板全黑）。
         # 只扩到这三类，**不**写裸 except Exception（§16：真 bug 不该被降级吞掉）。
-        return {}, f"config.yaml 解析失败（{cfg_path}）：{_one_line(exc)}"
+        # yaml 异常的人话经 _yaml_error_brief 构造（**不是** str(exc)）：那份原文会
+        # 带出错行的 config 源码片段，而这句话要经 /status 进浏览器（评审建议6）。
+        # 非 yaml 的 ValueError 维持现状（它的消息与 config 源码无关，照压一行）。
+        detail = (_yaml_error_brief(exc) if isinstance(exc, yaml.YAMLError)
+                  else _one_line(exc))
+        return {}, f"config.yaml 解析失败（{cfg_path}）：{detail}"
     if data is None:
         return {}, None          # 空文件 / 只有注释：合法的"没配置"，不是错误
     if not isinstance(data, dict):

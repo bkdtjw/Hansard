@@ -20,6 +20,7 @@ workspace 的 config.yaml 一旦语法写错（缩进错 / 冒号后少空格 / 
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -49,6 +50,25 @@ adapters:
    start_cmd: claude
 """
 
+# 建议6 用的埋点样本：坏行上就坐着一个可识别的"密钥"。pyyaml 的 Mark.__str__ 在
+# buffer 可得时会把**这一行原文 + 插入符**附进 str(exc)，而这句人话经 /status 的
+# config_error 进浏览器 —— 故错误信息里绝不许出现 CONFIG_SECRET。
+CONFIG_SECRET = "SUPERSECRETKEY-abc123"
+
+BROKEN_YAML_WITH_SECRET = f"""\
+adapters:
+  claude:
+    kind: cli
+    api_key: [{CONFIG_SECRET}
+"""
+
+# 另一条泄漏面：pyyaml 有几条诊断措辞会把**文档里的记名**用 %r 嵌进自己的
+# problem/context（这里是 anchor 名），不经处理同样会随 problem 出网。
+BROKEN_YAML_SECRET_IN_ANCHOR = f"""\
+a: &{CONFIG_SECRET} 1
+b: &{CONFIG_SECRET} 2
+"""
+
 VALID_YAML = """\
 adapters:
   claude:
@@ -62,9 +82,12 @@ roles:
 """
 
 
-@pytest.mark.parametrize("text", [BROKEN_YAML_FLOW_SEQ, BROKEN_YAML_INDENT])
+@pytest.mark.parametrize("text", [
+    BROKEN_YAML_FLOW_SEQ, BROKEN_YAML_INDENT,
+    BROKEN_YAML_WITH_SECRET, BROKEN_YAML_SECRET_IN_ANCHOR,
+])
 def test_broken_samples_really_are_yaml_errors(text):
-    """自证样本：两份样本都必须让 pyyaml 抛 YAMLError（否则下面的用例是假绿）。"""
+    """自证样本：每份样本都必须让 pyyaml 抛 YAMLError（否则下面的用例是假绿）。"""
     with pytest.raises(yaml.YAMLError):
         yaml.safe_load(text)
 
@@ -173,6 +196,82 @@ def test_read_config_file_checked_flags_non_mapping_top_level(tmp_dir):
     assert clim._read_config_file(p) == {}
 
 
+# ——————————————————————————————————————————————————————————————
+# ④b 二轮评审 建议6：错误人话只给定位，**不**回抄 config 源码
+#     （原实现把 str(exc) 整段压行，pyyaml 的 mark 在 buffer 可得时自带出错行原文；
+#      这句话经 /status 的 config_error 进浏览器，坏行邻近密钥即外泄）
+# ——————————————————————————————————————————————————————————————
+
+def test_pyyaml_raw_message_really_leaks_the_source_line():
+    """自证泄漏面：pyyaml 自己的 str(exc) 确实带坏行原文（否则下面两条无区分力）。
+
+    从**字符串**装载时 Mark 的 buffer 可得 → 片段必然附上；这正是原实现直接压行
+    的那份文本。
+    """
+    with pytest.raises(yaml.YAMLError) as ei:
+        yaml.safe_load(BROKEN_YAML_WITH_SECRET)
+
+    assert CONFIG_SECRET in str(ei.value), "样本没能触发 pyyaml 附源码片段，用例失去区分力"
+
+
+def test_yaml_error_brief_drops_source_snippet_keeps_position():
+    """构造器只取诊断措辞 + line/column：同一个异常，源码片段一个字都不进人话。"""
+    with pytest.raises(yaml.YAMLError) as ei:
+        yaml.safe_load(BROKEN_YAML_WITH_SECRET)
+    brief = clim._yaml_error_brief(ei.value)
+
+    assert CONFIG_SECRET not in brief, f"人话仍带 config 源码：{brief!r}"
+    assert "api_key" not in brief, f"人话仍带 config 源码：{brief!r}"
+    assert re.search(r"line \d+ column \d+", brief), f"缺行列定位：{brief!r}"
+    assert "\n" not in brief
+
+
+def test_config_error_locates_the_line_without_quoting_it(tmp_dir):
+    """端到端（读文件那条真实路径）：config_error 带行列定位、且不含坏行原文。"""
+    p = tmp_dir / "config.yaml"
+    p.write_text(BROKEN_YAML_WITH_SECRET, encoding="utf-8")
+
+    cfg, err = clim._read_config_file_checked(p)
+
+    assert cfg == {}
+    assert isinstance(err, str) and "config.yaml" in err
+    assert re.search(r"line \d+ column \d+", err), f"缺行列定位：{err!r}"
+    assert CONFIG_SECRET not in err, f"错误人话外泄 config 源码：{err!r}"
+    assert "api_key" not in err, f"错误人话外泄 config 源码：{err!r}"
+    # 不再是 str(exc) 整段压行：pyyaml 的 mark 原文形如 `in "<路径>", line 4, column 14`，
+    # 那一段（连带可能的源码片段）整体不进人话。
+    assert 'in "' not in err, f"仍在原样转抄 pyyaml 的 mark 文本：{err!r}"
+    assert "\n" not in err
+
+
+def test_config_error_redacts_names_pyyaml_quotes_from_the_document(tmp_dir):
+    """pyyaml 把文档里的记名（anchor/alias/tag）嵌进自己的措辞时，也不许带出去。"""
+    p = tmp_dir / "config.yaml"
+    p.write_text(BROKEN_YAML_SECRET_IN_ANCHOR, encoding="utf-8")
+
+    cfg, err = clim._read_config_file_checked(p)
+
+    assert cfg == {}
+    assert CONFIG_SECRET not in err, f"anchor 名随 problem 外泄：{err!r}"
+    # 诊断措辞本身要留着（运维得知道是"重复 anchor"，只是不给名字）。
+    assert "duplicate anchor" in err, err
+
+
+def test_non_yaml_valueerror_message_unchanged(tmp_dir, monkeypatch):
+    """对照：非 yaml 的 ValueError 走原样压行（本卡只改 YAMLError 的文案构造）。"""
+    p = tmp_dir / "config.yaml"
+    p.write_text(VALID_YAML, encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        raise ValueError("这条消息与 config 源码无关")
+
+    monkeypatch.setattr(yaml, "safe_load", _boom)
+    cfg, err = clim._read_config_file_checked(p)
+
+    assert cfg == {}
+    assert "这条消息与 config 源码无关" in err, err
+
+
 def test_read_config_file_delegates_to_checked_no_second_loader(tmp_dir):
     """只有一处 yaml 装载：打桩 checked 版后，宽松版必须跟着变（证明是委托而非复制）。"""
     sentinel = ({"marker": 1}, None)
@@ -279,6 +378,22 @@ def test_broken_config_yields_empty_projection_and_error_signal(tmp_dir):
         err = body.get("config_error")
         assert isinstance(err, str) and err.strip(), f"缺 config_error 信号：{body!r}"
         assert "config.yaml" in err, f"错误人话应点名文件：{err!r}"
+
+
+def test_status_config_error_does_not_ship_config_source_to_the_browser(tmp_dir):
+    """建议6 的出网关钉子：/status 响应**全文**不得出现坏行里的密钥串。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        (tmp_dir / "config.yaml").write_text(BROKEN_YAML_WITH_SECRET, encoding="utf-8")
+
+        code, body = _req(base, f"/api/threads/{tid}/status")
+
+        assert code == 200, (code, body)
+        err = body.get("config_error")
+        assert isinstance(err, str) and err.strip(), f"缺 config_error 信号：{body!r}"
+        assert re.search(r"line \d+ column \d+", err), f"缺行列定位：{err!r}"
+        whole = json.dumps(body, ensure_ascii=False)
+        assert CONFIG_SECRET not in whole, f"响应外泄 config 源码：{whole!r}"
 
 
 def test_broken_config_error_signal_does_not_confuse_role_probe(tmp_dir):

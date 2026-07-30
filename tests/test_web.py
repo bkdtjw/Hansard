@@ -1049,6 +1049,151 @@ def test_app_js_board_reads_endpoint_and_shows_read_failure(tmp_dir):
 
 
 # ——————————————————————————————————————————————————————————————
+# (w-9b) 二轮评审 应修1：**损坏**的 state.json 不许被当"空黑板"直出 200
+#
+# 复现依据：Store._write_state 是非原子 write_text（store/__init__.py:643-647），
+# 崩在中途即得半截 JSON；而宽松读取把 JSONDecodeError 降级成空结构
+# （store:_read_state），端点无从区分 —— 页面于是渲染成正常空态。
+# spec §9.1 把"黑板文件缺失**或损坏**"并列，两者在恢复路径同解（rebuild），但在
+# **展示**路径不同解：展示层不重建，只能如实说"读不出来"。错的空白比读不到更骗人。
+# ——————————————————————————————————————————————————————————————
+
+def _state_json_path(ws: Path, tid: str) -> Path:
+    """权威状态文件（同 tests/helpers.py 的旁路口径，不碰 store 私有属性）。"""
+    return ws / tid / "blackboard" / "state.json"
+
+
+def _seed_board_state(ws: Path, tid: str) -> Path:
+    """经**唯一**落盘路径写一份合法权威状态（apply_blackboard_ops），返回文件路径。"""
+    store = orch.store.Store(ws / tid)
+    orch.store.apply_blackboard_ops(store, [
+        {"op": "set_task", "key": "alpha", "status": "doing"},
+        {"op": "freeze_contract", "name": "like-api", "version": 1,
+         "path": "docs/like-api.md"},
+        {"op": "set_decision", "text": "先做 alpha"},
+    ], 1)
+    p = _state_json_path(ws, tid)
+    assert json.loads(p.read_text(encoding="utf-8"))["tasks"] == {"alpha": "doing"}
+    return p
+
+
+def test_board_endpoint_flags_corrupt_state_json_instead_of_faking_empty(tmp_dir):
+    """截半的 state.json → 200 + board_error（键形状不变），**不**伪装成空黑板。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        p = _seed_board_state(tmp_dir, tid)
+        good = p.read_text(encoding="utf-8")
+        broken = good[: len(good) // 2]
+        p.write_text(broken, encoding="utf-8")
+        with pytest.raises(ValueError):
+            json.loads(broken)      # 自证：截断后真解析不了（否则本用例假绿）
+
+        code, board = _req(base, f"/api/threads/{tid}/board")
+
+        assert code == 200, (code, board)
+        err = board.get("board_error")
+        assert isinstance(err, str) and err.strip(), f"损坏必须说出来：{board!r}"
+        assert "state.json" in err, err
+        assert "orch run" in err, f"错误人话应带 §9.1 自救提示：{err!r}"
+        assert "\n" not in err, f"人话须压成一行（要进 JSON 与红字）：{err!r}"
+        # 报错本身不回抄状态原文（黑板正文含契约路径/决策原文，不宜随报错外传）。
+        assert "like-api" not in err, err
+        # 空结构照给、键形状只多 board_error 一个键（前端渲染逻辑不用改形状）。
+        assert set(board) == {"contracts", "decisions", "tasks", "task_order",
+                              "task_evt", "board_error"}, sorted(board)
+        assert board["contracts"] == {} and board["decisions"] == []
+        assert board["tasks"] == {} and board["task_order"] == []
+        assert board["task_evt"] == {}
+
+
+def test_board_endpoint_missing_state_json_stays_healthy_empty(tmp_dir):
+    """对照①：文件**不存在** —— 合法的"还没写过黑板"，健康空态、无 board_error。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        p = _state_json_path(tmp_dir, tid)
+        if p.exists():
+            p.unlink()
+        assert not p.exists()
+
+        code, board = _req(base, f"/api/threads/{tid}/board")
+
+        assert code == 200, (code, board)
+        assert "board_error" not in board, f"没写过黑板不是错误：{board!r}"
+        assert board == {"contracts": {}, "decisions": [], "tasks": {},
+                         "task_order": [], "task_evt": {}}, board
+
+
+def test_board_endpoint_valid_state_json_payload_unchanged(tmp_dir):
+    """对照②：合法权威状态 —— 响应逐字同旧（五键一字不动，无 board_error）。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        _seed_board_state(tmp_dir, tid)
+
+        code, board = _req(base, f"/api/threads/{tid}/board")
+
+        assert code == 200, (code, board)
+        assert set(board) == {"contracts", "decisions", "tasks", "task_order",
+                              "task_evt"}, sorted(board)
+        assert board["tasks"] == {"alpha": "doing"}, board
+        assert board["task_order"] == ["alpha"], board
+        assert board["contracts"]["like-api"] == {
+            "version": 1, "path": "docs/like-api.md", "frozen_at": 1,
+        }, board
+        assert [d["text"] for d in board["decisions"]] == ["先做 alpha"], board
+        # ops 是直接灌的（source_event_id=1 那条是 human/assign，非 A 类），故溯源
+        # 键查不到事件号 —— 如实空着，端点不编号（前端出 "—"）。
+        assert board["task_evt"] == {}, board
+
+
+def test_app_js_board_error_routes_into_explicit_failure_state(tmp_dir):
+    """前端判据：board_error 走**既有** bd-fail 失败态（不得渲染成正常空态）。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "data.board_error" in js, "前端须消费端点的 board_error 信号"
+        # 与 HTTP 失败同一出口：data 置 null → renderBoard 据 lastBoard===null 出红字。
+        assert "return { data: null, err: String(data.board_error) };" in js
+        assert "黑板读取失败" in js and "bd-fail" in js
+        # 失败文案只进文本位（既有 failMsg 已 escapeHtml），不新增属性位。
+        assert "const failMsg = `黑板读取失败：${escapeHtml(lastBoardError" in js
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-9c) 二轮评审 建议10：线程 id 白名单先行 —— ".." 不许穿透到文件系统
+#
+# 根因：路由把 path 按 "/" 切开后不校验分量（server.py:_route_api），tid=".."
+# 一路走到 orch.store.Store(目录)，而它的构造**会建目录**（blackboard/、logs/、
+# events.db）—— 一个 GET 就能在 workspace 之外落文件。
+# ——————————————————————————————————————————————————————————————
+
+def test_thread_routes_reject_bad_tid_before_touching_disk(tmp_dir):
+    """不合白名单的 tid → 404，且 workspace 与其**父目录**都不许多出任何条目。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        ws_before = sorted(p.name for p in tmp_dir.iterdir())
+        parent_before = sorted(p.name for p in tmp_dir.parent.iterdir())
+
+        for path in (
+            "/api/threads/../status",          # ".." 直接当线程名（父目录 exists() 为真）
+            "/api/threads/../board",
+            "/api/threads/../x/status",
+            "/api/threads/t-%2e%2e/status",    # 百分号编码的 ".."
+            "/api/threads/%2e%2e/board",
+            "/api/threads/t-bad_name/events",  # 下划线不在白名单（仓内真实命名无它）
+        ):
+            code, body = _req(base, path)
+            assert code == 404, (path, code, body)
+
+        assert sorted(p.name for p in tmp_dir.iterdir()) == ws_before, "workspace 被写脏"
+        assert sorted(p.name for p in tmp_dir.parent.iterdir()) == parent_before, (
+            "workspace **之外**被落了文件（Store 构造会建目录）"
+        )
+        # 合法 id（POST /api/threads 与 threads 列表给的就是这一形态）不受影响。
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+
+
+# ——————————————————————————————————————————————————————————————
 # (w-10) T4：GET /api/threads/{id}/steps —— invoke 执行流步骤摘要（只读）
 #
 # 裁决口径（QUESTIONS.md Q11 采 A）：只出**解析后的摘要**（工具名 + 命令摘要 + 计数），

@@ -1247,9 +1247,16 @@ function ingestEvents(evs, force = false) {
 }
 
 // 黑板取数：失败**不**连坐事件流（两个端点各读各的），但失败必须显式落到面板上。
+// 两种失败一个出口（data=null + err 非空 → renderBoard 走 bd-fail 显式失败态）：
+//   ① HTTP/网络层失败 → catch；
+//   ② 端点 200 但带 board_error → 权威 state.json 坏了（截断 / 非法 JSON / 顶层
+//      非对象）。端点照给空结构以稳住键形状，前端**绝不**能把它当正常空态渲染，
+//      否则页面长成"黑板本来是空的"——错的空白比读不到更骗人。
 async function fetchBoard(tid) {
   try {
-    return { data: await api(`/api/threads/${tid}/board`), err: "" };
+    const data = await api(`/api/threads/${tid}/board`);
+    if (data && data.board_error) return { data: null, err: String(data.board_error) };
+    return { data, err: "" };
   } catch (e) {
     return { data: null, err: e.message || "读取失败" };
   }

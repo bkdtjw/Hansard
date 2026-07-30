@@ -132,6 +132,13 @@ def board_state(store: Store) -> dict:   # 读 state.json 供断言
 # （M5 后追加，签名不变）board_state 亦是**展示层**读权威黑板的唯一入口：控制台
 # GET /api/threads/{id}/board 经它投影三节，只读、不写盘；展示层禁止据事件的
 # bb_ops 自行重投影（落库 ≠ 生效，被 §3.3 门槛拒绝的 ops 照样在事件里）。
+
+def board_state_checked(store: Store) -> tuple[dict, str | None]:
+    """（M5 后追加，只读原语）同 board_state 的键形状，另给"读不出来"的一句人话：
+    文件不存在 → (空结构, None)；JSON 坏 / 顶层非对象 / 读不动 → (空结构, 人话)。
+    仅供**展示层**（/board 的 board_error）——它不重建只渲染，损坏必须说出来；
+    调度/恢复路径仍用宽松的 board_state（§9.1 缺失与损坏同解为 rebuild）。
+    **禁改** board_state / Store._read_state 的宽松语义与签名。"""
 ```
 
 > board.md 的具体**渲染格式**属 spec §17 开放决策点，由 T3 自定并记 NOTES（不影响本契约）。

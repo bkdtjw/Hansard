@@ -8,7 +8,8 @@
 
 对外符号（docs/m0-contract.md §2 + §8 冻结）：
   类 Store（公开属性 thread_dir）及其方法；
-  模块级 apply_blackboard_ops / rebuild_blackboard / board_state。
+  模块级 apply_blackboard_ops / rebuild_blackboard / board_state
+  （M5 后追加只读原语 board_state_checked，既有三者签名与行为不变）。
 """
 
 from __future__ import annotations
@@ -667,6 +668,50 @@ def _normalize_state(data: dict) -> dict:
     }
 
 
+def _read_state_file_checked(state_path: Path) -> tuple[dict, str | None]:
+    """读一份 blackboard/state.json，并**区分**"本来没有"与"有、但读不出来"。
+
+    返回 (状态, 错误人话 或 None)：
+      · 文件不存在                    → (空结构, None)   —— 合法：还没写过黑板
+      · 读不动（OSError）             → (空结构, 一句人话)
+      · JSON 解析失败 / 顶层非对象    → (空结构, 一句人话)
+      · 成功                          → (归一化状态, None)
+
+    键形状在四条出口上完全一致（都过 _empty_state / _normalize_state 这**同一份**
+    归一化逻辑），故调用方拿到的结构永远可直接渲染；"坏了"这件事只由第二个返回值
+    承载。错误人话里带 §9.1 的自救提示，但本函数自己**不**触发重建、不写盘。
+
+    错误人话只放定位（line/column）与失败类别，**不**回抄文件内容：这份状态经
+    web 控制台 GET /api/threads/{id}/board 进浏览器，黑板正文可能含契约路径、
+    决策原文等不宜随报错外传的材料。
+    """
+    if not state_path.exists():
+        return _empty_state(), None
+    hint = "；可 `orch run` 触发 §9.1 重建"
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _empty_state(), (
+            f"黑板状态文件读不动（{state_path}）：{exc.strerror or type(exc).__name__}"
+            + hint
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _empty_state(), (
+            f"黑板状态文件损坏（{state_path}）：{exc.msg}"
+            f"（line {exc.lineno} column {exc.colno}）" + hint
+        )
+    if not isinstance(data, dict):
+        # 顶层写成数组/标量：解析得动但不是状态 —— 与语法坏同类，_normalize_state
+        # 拿它会当场 AttributeError，故必须在归一化之前拦下。
+        return _empty_state(), (
+            f"黑板状态文件顶层不是对象（{state_path}，实为 {type(data).__name__}）"
+            + hint
+        )
+    return _normalize_state(data), None
+
+
 def _apply_ops_into(state: dict, ops: list[dict], source_event_id: int) -> None:
     """把一批 ops 就地作用到 state（§3.3 三种 op）。"""
     for op in ops or []:
@@ -761,3 +806,21 @@ def rebuild_blackboard(store: Store) -> None:
 def board_state(store: Store) -> dict:
     """读 state.json 供断言（§4.6）。"""
     return store._read_state()
+
+
+def board_state_checked(store: Store) -> tuple[dict, str | None]:
+    """（M5 后追加，只读）同 board_state，但把"读不出来"**说出来**（展示层用）。
+
+    返回 (状态, 错误人话 或 None)；键形状与 board_state 逐字一致（同一份
+    _empty_state / _normalize_state），故第一个返回值可直接当 board_state 用。
+
+    与 ``board_state`` / ``Store._read_state`` 的分工（**故意**留两套语义）：
+      · 调度 / 恢复路径继续用宽松那份：§9.1 把"黑板文件缺失**或损坏**"并列为
+        "重建"的触发条件，那条路上"坏了"与"没有"确实同解 —— 都是清空重放
+        （rebuild_blackboard），报错反而多余。tests/test_scheduler.py 里写坏
+        state.json 后仍要求 board_state 可读，正是这份宽松语义的用例。
+      · 展示路径（控制台 /board）必须用这份：它**不**重建，只渲染。把损坏文件
+        降级成空结构直出 200，页面就长成"黑板本来是空的"—— 错的空白比读不到更
+        骗人。故这里不改宽松那份的行为，只在旁边加一条会说话的出口。
+    """
+    return _read_state_file_checked(store._state_path)

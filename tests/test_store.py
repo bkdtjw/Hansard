@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -448,3 +449,78 @@ def test_rebuild_only_replays_qualified_A_class(thread_dir):
     state = orch.store.board_state(st)
     assert state["contracts"]["like-api"]["version"] == 1, \
         "report 型的 bb_ops 不满足 §3.3 门槛，rebuild 不得采纳"
+
+
+# ——————————————————————————————————————————————————————————————
+# board_state_checked（M5 后追加的只读原语）：区分"没有"与"坏了"
+#
+# 存在理由：宽松读取（board_state / Store._read_state）把损坏降级成空结构 ——
+# 恢复路径要的正是这份宽松（§9.1 缺失或损坏同解为 rebuild），但**展示**路径不
+# 重建、只渲染，拿空结构直出就等于替 store 编一个"黑板本来是空的"。
+# 本节同时钉住"宽松那份没被改坏"。
+# ——————————————————————————————————————————————————————————————
+
+def _state_file(thread_dir: Path) -> Path:
+    return thread_dir / "blackboard" / "state.json"
+
+
+def test_board_state_checked_missing_file_is_not_an_error(thread_dir):
+    """文件不存在 = 还没写过黑板：空结构 + 无错误（与 board_state 逐字一致）。"""
+    st = _new_store(thread_dir)
+    assert not _state_file(thread_dir).exists()
+
+    state, err = orch.store.board_state_checked(st)
+
+    assert err is None
+    assert state == {"contracts": {}, "decisions": [], "tasks": {}}
+    assert state == orch.store.board_state(st)
+
+
+def test_board_state_checked_valid_file_matches_lenient_reader(thread_dir):
+    """合法状态：第一个返回值与 board_state 逐字段一致，第二个是 None。"""
+    st = _new_store(thread_dir)
+    e = st.append_event(sender="pm", type="decision", body="d", to=["moderator"],
+                        blackboard_ops=[_freeze("like-api", "docs/like-api.md", 3)])
+    orch.store.apply_blackboard_ops(st, [_freeze("like-api", "docs/like-api.md", 3)], e)
+
+    state, err = orch.store.board_state_checked(st)
+
+    assert err is None
+    assert state == orch.store.board_state(st)
+    assert state["contracts"]["like-api"]["version"] == 3
+
+
+def test_board_state_checked_reports_truncated_file_while_lenient_stays_lenient(thread_dir):
+    """截半的 state.json：checked 版给人话；board_state **仍**降级成空结构不抛。
+
+    后半句是本卡的硬约束（调度/恢复路径依赖宽松语义，见 tests/test_scheduler.py
+    的"写坏 state.json 后仍要能读"），一旦有人把宽松读取改严，这条当场红。
+    """
+    st = _new_store(thread_dir)
+    e = st.append_event(sender="pm", type="decision", body="d", to=["moderator"],
+                        blackboard_ops=[_freeze("like-api", "docs/like-api.md", 1)])
+    orch.store.apply_blackboard_ops(st, [_freeze("like-api", "docs/like-api.md", 1)], e)
+    p = _state_file(thread_dir)
+    good = p.read_text(encoding="utf-8")
+    p.write_text(good[: len(good) // 2], encoding="utf-8")
+
+    state, err = orch.store.board_state_checked(st)
+
+    assert isinstance(err, str) and err.strip(), "损坏必须说出来"
+    assert "state.json" in err and "orch run" in err, err
+    assert "\n" not in err, f"人话须压成一行：{err!r}"
+    assert state == {"contracts": {}, "decisions": [], "tasks": {}}, state
+    # 宽松那份行为不变：同一份坏文件照旧空结构、不抛、不报错。
+    assert orch.store.board_state(st) == {"contracts": {}, "decisions": [], "tasks": {}}
+
+
+def test_board_state_checked_reports_non_object_top_level(thread_dir):
+    """顶层写成数组：解析得动但不是状态 —— 同样报错（归一化拿它会当场炸）。"""
+    st = _new_store(thread_dir)
+    _state_file(thread_dir).write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+
+    state, err = orch.store.board_state_checked(st)
+
+    assert isinstance(err, str) and err.strip()
+    assert "state.json" in err, err
+    assert state == {"contracts": {}, "decisions": [], "tasks": {}}

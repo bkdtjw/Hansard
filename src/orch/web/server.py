@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -99,7 +100,29 @@ def _ep_thread_create(ws: Path, body: dict) -> tuple[int, dict]:
     return 200, {"id": tid}
 
 
+# 线程 id 白名单。仓内真实命名（先查后定）：`orch new` / POST /api/threads 生成
+# "t-" + uuid4().hex[:8]（cli/main.py:_new_thread_id），`_find_thread_dirs` 只认
+# name.startswith("t-")，测试与实盘出现过的形态是字母/数字/连字符（t-bb2、
+# t-fail-timeout、t-A）。故白名单 = ^t-[A-Za-z0-9-]+$ —— 里面既无 "/" 也无 "."，
+# ".." 与任何路径分量都进不来。
+_TID_RE = re.compile(r"^t-[A-Za-z0-9-]+$")
+
+
+def _check_tid(tid: str) -> None:
+    """线程 id 名字校验：不合白名单 → 404，且**在碰文件系统之前**返回。
+
+    必须前置的理由：路由把 path 按 "/" 切开后不校验分量，tid=".." 能一路穿到
+    ``orch.store.Store(目录)``，而它的构造**会建目录**（blackboard/、logs/、
+    events.db），于是一个 GET /api/threads/../status 就能在 workspace 之外落文件。
+    校验谓词只此一份，路由入口与 _require_thread 两处都调它（后者兜住 /api/gate
+    这类 tid 来自**请求体**的入口）。
+    """
+    if not _TID_RE.match(tid or ""):
+        raise _ApiError(404, f"线程 id 不合法: {tid}")
+
+
 def _require_thread(ws: Path, tid: str) -> "orch.store.Store":
+    _check_tid(tid)
     tdir = ws / tid
     if not tdir.exists():
         raise _ApiError(404, f"线程 {tid} 不存在")
@@ -183,9 +206,17 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
 def _ep_thread_board(ws: Path, tid: str) -> tuple[int, dict]:
     """§4.6 **权威**黑板的只读投影（控制台右栏三节的唯一数据源）。
 
-    权威 = blackboard/state.json 这份材料化状态，用既有公开只读函数
-    ``orch.store.board_state`` 读出（docs/m0-contract.md §2 已冻结的对外符号）；
-    本端点不新增 store 方法、不写盘、不改配置。
+    权威 = blackboard/state.json 这份材料化状态，用公开只读函数
+    ``orch.store.board_state_checked`` 读出（docs/m0-contract.md §2 的对外符号）；
+    本端点不写盘、不改配置、不触发重建。
+
+    **为什么用 checked 版而非 board_state**：Store._write_state 是非原子 write_text，
+    崩溃截断可复现；而宽松读取把 JSONDecodeError 降级成空结构（store:_read_state），
+    端点无从区分，损坏的 state.json 会被当"空黑板"直出 200 —— 页面渲染成正常空态，
+    错的空白比读不到更骗人。故损坏时照给空结构（键形状不变）**并**加一个顶层
+    board_error 人话，前端据它走显式失败态。健康路径（含"还没写过 state.json"）
+    响应逐字同旧：无 board_error 键。§9.1 的重建仍只由调度/恢复路径做（`orch run`），
+    展示层只负责如实说"读不出来"。
 
     **为什么不据事件的 bb_ops 重投影**：落库 ≠ 生效。被 §3.3 门槛拒绝的 ops 照样
     进库（store.reply_and_done:319/345 无条件写 bb_ops_json），调度层
@@ -206,10 +237,11 @@ def _ep_thread_board(ws: Path, tid: str) -> tuple[int, dict]:
     也不进「第 N/M 步」的分母。
 
     键名冻结：contracts / decisions / tasks（state.json 逐字段原样）+
-    task_order / task_evt（溯源）。每请求现查盘、零缓存、无模块级状态（§16.9）。
+    task_order / task_evt（溯源）+ board_error（**仅**损坏时出现）。
+    每请求现查盘、零缓存、无模块级状态（§16.9）。
     """
     store = _require_thread(ws, tid)
-    state = orch.store.board_state(store)
+    state, board_error = orch.store.board_state_checked(store)
     tasks = dict(state.get("tasks") or {})
 
     first_evt: dict[str, int] = {}
@@ -236,13 +268,18 @@ def _ep_thread_board(ws: Path, tid: str) -> tuple[int, dict]:
         # 排在最后并按 key 名定序：不编造事件号，也不让它插队。
         return (0, first_evt[k], k) if k in first_evt else (1, 0, k)
 
-    return 200, {
+    payload = {
         "contracts": dict(state.get("contracts") or {}),
         "decisions": list(state.get("decisions") or []),
         "tasks": tasks,
         "task_order": sorted(tasks, key=_order_key),
         "task_evt": last_evt,
     }
+    if board_error:
+        # 顶层新键，值是**字符串**（同 /status 的 config_error 口径）：无错误时该键
+        # 不出现，故健康路径的响应与键集合逐字同旧。
+        payload["board_error"] = board_error
+    return 200, payload
 
 
 def _role_binding_projection(
@@ -990,6 +1027,9 @@ def _make_handler(ws_map: dict, default_name: str):
             # —— /api/threads/{id}/... ——
             if len(parts) >= 3 and parts[0] == "api" and parts[1] == "threads":
                 tid = parts[2]
+                # 名字校验先行：任何 threads/{tid}/* 处理之前，且此前一步都不碰盘
+                # （评审建议10；判据见 _check_tid）。
+                _check_tid(tid)
                 sub = parts[3] if len(parts) >= 4 else None
 
                 if sub is None:
