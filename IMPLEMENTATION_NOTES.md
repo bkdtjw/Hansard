@@ -688,6 +688,56 @@ acceptance 也过不了钩子——两层故障叠着。
   用 str.index 首次出现定位、疑把函数定义误当调用点)。app.js 4 个 NUL 字节:
   用户已在独立会话跑 chip 排查,施工全程各卡自证字节计数守恒。
 
+### 控制台人性化 C 批:中文名+每角色选 CLI/选模型(2026-07-30~31,Lead 施工台账)
+
+- 立项链:用户需求原话"每个负责人名字中文化,每个负责人都可以选择使用什么cil,
+  选择什么模型,派子代理看一下"→ 两只读调查(系统内边界 + 四家 CLI 模型参数实测,
+  grok/kimi/opencode `-m`、claude `--model` 全支持;opencode 无缺省=开盲盒)→
+  Q13 用户授权 {model} 占位入 §11.1(spec adf1f48);config 改写方式用户明选
+  行级外科手术。教训入长期记忆 plain-language-questions-only:问用户必须纯人话,
+  治理手续 Lead 自办留痕。
+- C1(19fceff)中文显示名+加固:roles[].display_name 纯呈现键(render 只取
+  prompt/write_scope/tools/adapter 四键,marker 实验证不进模型视图);投影加键;
+  前端 8 处文本位 displayOf,机器匹配位(option.value/CSS 类/单聊比较键)一律
+  保 role id;PUT /api/config 校验前置+原子写;名册常显生效绑定;8 床顶层
+  watchdog: 死键→thread_defaults:(引擎从未读过前者,一直吃 100/3 兜底);
+  opencode 补显式 -m。两冲突 Lead 裁:①B卡遗留的投影行四键全等断言改"必含+
+  display_name 缺省语义"(其本意堵臆造非冻结呈现键);②code-ws 扩名单同修。
+  收卡:白名单零越权,164 绿+全量 529。
+- C2(3748748){model} 引擎:_start_cmd_argv 三参化,占位判定在**模板 token**
+  上做(防 worktree 路径含"{model}"字样给无占位配置造假需求);fail-closed
+  空值拒换;合并语义单点(装配层 merged,适配层不二次合并);装载期校验主绑定
+  +全部 fallback 逐一查,报错人话点名角色/adapter/缺处;红转绿 10 条;oc-ws/
+  hetero-ws opencode 家接线 `-m {model}`+adapter 层 model 缺省。收卡:124 绿
+  +全量 545。调度层零改动(模型经 merged config 到适配层,调度层不组装 argv)。
+- C3(d123d34)名册⚙就地改绑:POST /api/config/role-binding 行级外科手术
+  (块式/内联双形态;28 种怪形态实测宁 400 不猜、盘上零字节动;三重自证:
+  改后可解析+目标键等于请求值+抹平目标键后两产物全等);投影加 model 键
+  (取值 role→主绑定 adapter→null,刻意不看降级 effective——异构备胎缺省
+  与本角色配置无关,展示它是编造);四家族模型候选 datalist(名字子串猜家族,
+  只影响提示不影响可填值);走字胶囊 displayOf 收尾。工人保守裁断 Lead 认:
+  角色无显式 adapter 行时改绑→400 不插入(卡只授权值替换)。PUT 换行语义
+  统一为逐字节(两写路一套换行策略)。收卡:192 绿+全量 564。
+- 三轮独立评审(adf1f48..d123d34):**阻断 0/应修 2/建议 6**;12 变异 11 抓红
+  (唯一漏网=自证②零覆盖);28 形态无一"盘变了但改错";render marker 实验
+  display_name/model 双零泄漏;§16 十三条零触碰;§14 零新依赖。
+- C3回环(7181b67,应修 2+建议 6 全纳入):①并发写保护双层——模块级
+  threading.Lock 串行两条写路(变异实证:无锁 12/12 丢更新,有锁 0/12)+
+  GET fingerprint/PUT base_fingerprint CAS(陈旧全文→409 人话;锁与 CAS
+  互不替代各有专测;role-binding 锁内现读现改无陈旧基线故不做 CAS,记
+  docstring);②自证②抽 _verify_surgical_rewrite 纯函数,直喂污染产物 4 测
+  +HTTP 调用点 inspect 断言,删闸必红;③GET 改字节读,CRLF 往返保真;
+  ④⚙ 面板备胎模型提示(role.model 按 §11.1 覆盖全部 fallback,异构备胎
+  可能不认——投影加第三呈现键 fallback 供点名名单,精确集合断言升 7 键,
+  Lead 认偏离:判据强度不降且为提示取材必需);⑤title 属性位转义收口/
+  oc 家族分段判/弹层宽度钳制。收卡:208 绿+全量 580。
+- Lead 决策记录:呈现键家族=display_name/model/fallback 三键,精确集合断言
+  守门;role.model 覆盖备胎属 §11.1 合并语义,校验只查存在性,异构模型名
+  兼容属配置者责任(UI 提示缓解);模型名有效性引擎不可知,不做白名单。
+- 收官门(HEAD=7181b67):全量 **580 passed, 5 skipped** exit 0;三卡+回环
+  净增 78 用例;评审应修清零、建议 6/6 纳入 0 记录不改。遗留待人裁仍仅
+  Q12(恢复重放,与本批无关)。
+
 ### 控制台对齐 AionUi:T4+二轮评审+A/B 回环收官(2026-07-30,Lead 施工台账)
 
 - Q11 裁决(用户 07-30"每条记录要看到具体细节"→放行)后 T4 落地(a8ca668,收尾
