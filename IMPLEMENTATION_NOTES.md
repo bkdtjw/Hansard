@@ -626,3 +626,64 @@ acceptance 也过不了钩子——两层故障叠着。
 新增待决:Q9(§5.6.3 子串口径对十六进制串撞击,429 卡升级,推荐 A 维持)。
 → Q9 同日获用户裁决采 A:维持子串口径,spec 与实现零改动;残留 stderr 撞击
 风险接受(有 enable 恢复路径),中文 pattern 兼容性为决定性论据。当前待决归零。
+
+### 控制台对齐 AionUi:T1–T3+三回环(2026-07-29~30,Lead 施工台账)
+
+- 立项链:调研报告 aionui-alignment-study.md(workflow wf_25c86736,10×opus,b19bf04)
+  → Q10 用户裁决采 A 修 §0 例外(spec b941897)→ 用户批准 T1–T3 先行、T4 待前置
+  → Q11 用户 07-30 指示"每条记录看到具体细节"解除 T4 前置(f537d87)。
+- T1(5ddba24)成员名册+状态灯+单聊:store 新增只读 dispatches_snapshot(禁改
+  pending_dispatches,7 调用点依赖"只回 pending");/status 全五态+deadline_ts;
+  四态灯 live 判据防崩溃滞留假绿;isMemberRelated=sender∨to,注释显式声明非 §6.2
+  焦点窗、不回流调度;docs/m0-contract §2 增补。收卡:白名单零越权,91 绿+全量
+  430,exit 0。工人两处报备均属卡内授权分支:「可裁决」徽标缓做(/api/config 只回
+  yaml 原文无解析 roles,硬做会挂错人——留作后续候选卡);滞留 dispatching 归灰
+  +如实 title。
+- T2(998fd53)待办+统计:声明序 firstSeen+勾选字形(纯展示映射不写回,schema
+  不动)+「第N/M步」;_round_stats 纯函数挂 /events **同级键**(事件元素 12 键
+  冻结面零触碰)。Lead 决策①「轮」口径=最后一条 sender=='human' 事件起的窗口
+  (spec 零定义,serve 属实现自由;可盘上重建,§16.9 合规);②统计卡不设「工具
+  数」——当时盘上无痕迹不编造,第三栏=invoke 次数。收卡:98 绿+全量 437。
+- T3(4bd04df)config 黑屏缺陷:yaml.YAMLError 非 ValueError 子类(MRO 亲验)
+  穿透修复;红转绿 10 用例含反向守卫(monkeypatch RuntimeError 断言穿透,钉死
+  未退化裸 except)。收卡:48 绿+全量 447。
+- 首轮独立评审(b941897..4bd04df 全 diff):**阻断 0/应修 4/建议 7**;§16 十三条
+  逐条核销,冻结面零触碰确认,新增转义逐处过,测试抽查 4 强 1 弱。
+- 回环闭环(评审与 Lead 均未代改;应修 4 条全清):
+  · T1回环(3fd8dc1):取消单聊解锁 #send-to——解锁收在 readFilters,统一覆盖
+    再点取消/清除全部/chips ✕/手动取消勾选四条退出路径;dispatching chip 改
+    live 判据(与胶囊/绿点同判);灰档 title 分 failed/gate_wait/stale 如实;
+    populateFilterRoles 属性位 escapeHtmlAttr 补洞;DISPATCH_CLOCK_SKEW_S=3s
+    展示容差;探测器 docstring 补 deadline_ts。收卡:102 绿+全量 451。
+  · T3回环(2c67e77):_read_config_file_checked 三态区分(缺失/空文件=合法无配置;
+    语法错/OSError/顶层非映射=一句人话),宽松版委托保契约(mock 证同一装载);
+    坏 config → 角色投影空表+/status 顶层 config_error(仅错误时出现;字符串型
+    不撞 _role_projection 结构探测),前端"⚠ 配置读取失败·绑定未知"警示;
+    import yaml 移出 try 的导入期语义变化注释说明(不可测原因写明)。工人进程
+    中断未交报告,Lead 亲验逐条代收:120 绿+全量 459。
+  · T2回环(d5cd619):黑板三节改吃**权威** state.json——新增 GET /board 用既有
+    公开 board_state(store 零改动);sort_keys=True 落盘抹平插入序(store:643-647
+    亲验),故服务端扫事件补 task_order/task_evt 溯源键、只对权威已存 key 生效;
+    projectBoard 整体退役**无兜底**(兜底=保留一条采信被拒自述的路径),端点
+    失败渲染显式红字。原 owner 档案丢失,接替工人完成。收卡:135 绿+全量 464。
+- Q12(02ebe55,待人裁):T2回环实盘复现 rebuild_blackboard 重放只按 type 不判
+  can_decide,§9.1 恢复会把曾被拒的 bb_ops 灌回权威黑板(违 §4.6"重放=增量")。
+  展示层已防(吃 state.json 而非自算),但恢复一旦发生污染的是权威状态本身;
+  修法四选项见 QUESTIONS.md,根因在 store/scheduler 侧,不入本轮控制台卡。
+- 评审建议处置:纳入 6 条(见各回环 commit);记录不改 3 条——①JS 四个新纯函数
+  无行为断言(仓库无 JS 运行时,§14 单测要求不含 web 层,字符串断言为既有惯例);
+  ②workspace 级花名册缓议(每拍扫全部 t-* 开 sqlite 是最重轮询热点,先量后决);
+  ③单聊发送不自动 run(POST /run 阻塞到终态,自动触发把"发一句"变"同步跑到
+  线程终止")。checklist 维护定 pm 不动(prompts/moderator.md 明写黑板不代劳,
+  §11.2 禁 moderator 产出实体工作)。
+- Q11 落地口径(Lead 裁量记录):steps 暴露=解析摘要(工具名+命令摘要截断+计数
+  +耗时),stdout 原文不经 HTTP 直出(§12 缺省 127.0.0.1 无鉴权+Q9 实证原文含
+  sessionId;用户若自行反代扩网面,风险自担并另议鉴权);acceptance/decision
+  气泡上的 steps 折叠组带「后端自述·非系统验证」标注、不与 meta.verify 徽章
+  争位——由评审"禁挂"建议放宽而来,依据 Q11 用户"细节全览"指示,verify 徽章
+  仍是唯一系统侧证据。
+- 工人事故簿:本轮三次进程中断收尸——T3回环(活已完,亲验代收);T4 首跑(API
+  流 600s 卡死,遗 975 行半成品);T4 续跑(SendMessage 复活后零进展再中断)。
+  T4 交收尾工人接手(重派 2/2,现场断点:styles.css 仅 2 行+唯一红=位置断言
+  用 str.index 首次出现定位、疑把函数定义误当调用点)。app.js 4 个 NUL 字节:
+  用户已在独立会话跑 chip 排查,施工全程各卡自证字节计数守恒。
