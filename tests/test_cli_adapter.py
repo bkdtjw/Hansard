@@ -771,6 +771,218 @@ def test_cwd_placeholder_supports_equals_form(tmp_dir):
 
 
 # ——————————————————————————————————————————————————————————————
+# T-MODEL：start_cmd/resume_cmd 支持字面量 {model} 占位（spec §11.1 行547）
+#
+# 取值 = roles 层 `model` 键，缺省回落 adapters 层 `model` 键（合并语义与其余键
+# 一致：role 层覆盖 adapter 层，由 cli.main._build_adapters_from_config 的
+# `merged = {**ac, **rc}` 保证——适配层只读 self.config["model"]，不自己合并）。
+#
+# 与 T-CWD 同一套硬约束（逐条钉死）：
+#   1) 先 .split() 再逐 token replace —— 含空格模型名仍是**单个** argv 元素；
+#   2) 无占位时逐字节回归原状（含"配了 model 键但命令里没占位"这种组合）；
+#   3) 作用域仅限 start_cmd 分词产物：不碰 tools_args，更不碰 view['text']。
+# 另加 fail-closed：两层皆无 model 而命令含占位 → 装载期报错（见
+# test_m5_availability.py 段 C 的 T-MODEL 组），invoke 期兜底抛错，
+# **禁止**空串替换或猜缺省。
+# ——————————————————————————————————————————————————————————————
+
+def test_model_placeholder_replaced_with_adapter_layer_value(tmp_dir):
+    """{model} 被替换为 config 里的 model 值（argv 不得残留字面占位）。"""
+    wt = tmp_dir / "wt-model"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(
+            start_cmd="oc run -m {model} --format json",
+            model="opencode/big-pickle"),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert argv is not None
+    assert not any("{model}" in a for a in argv), f"argv 残留未替换占位: {argv}"
+    assert argv[argv.index("-m") + 1] == "opencode/big-pickle"
+
+
+def test_model_placeholder_role_layer_overrides_adapter_layer(tmp_dir, monkeypatch):
+    """端到端合并语义：roles 层 model 覆盖 adapters 层（每角色选模型的整条链路）。"""
+    from orch.cli.main import _build_adapters_from_config
+
+    thread_dir = tmp_dir / "t-model"
+    thread_dir.mkdir()
+    config = {
+        "adapters": {
+            "oc": {
+                "kind": "cli",
+                "start_cmd": "oc run -m {model} --format json",
+                "model": "opencode/big-pickle",     # adapter 层缺省
+            },
+        },
+        "roles": {
+            "backend": {"adapter": "oc",
+                        "model": "opencode/nemotron-3-ultra-free"},  # role 层覆盖
+            "tester": {"adapter": "oc"},                             # 回落 adapter 层
+        },
+    }
+    out = _build_adapters_from_config(["backend", "tester"], config, thread_dir)
+    assert out["backend"].config["model"] == "opencode/nemotron-3-ultra-free"
+    assert out["tester"].config["model"] == "opencode/big-pickle"
+
+    captured: dict[str, list[str]] = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured.setdefault("argvs", []).append(list(argv))
+
+        def communicate(self, timeout=None):
+            return ('```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```', "")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _FakeProc)
+    out["backend"].invoke(_view("backend"), None)
+    out["tester"].invoke(_view("tester"), None)
+    argv_backend, argv_tester = captured["argvs"]
+    assert argv_backend[argv_backend.index("-m") + 1] == "opencode/nemotron-3-ultra-free"
+    assert argv_tester[argv_tester.index("-m") + 1] == "opencode/big-pickle"
+
+
+def test_model_key_without_placeholder_argv_byte_identical_regression(tmp_dir):
+    """回归护栏：命令里没有 {model} 时，argv 逐元素逐字节不变（哪怕配了 model 键）。
+
+    组合 {cwd} 场景：新占位不得干扰既有占位，也不得凭 model 键就往 argv 里塞东西。
+    """
+    wt = tmp_dir / "wt-nomodel"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="backend",
+        config=_cfg_no_hardcoded_tools(
+            start_cmd="oc run --dir {cwd}",
+            model="opencode/big-pickle",   # 配了但命令里没占位 → 一个字都不许进 argv
+            tools=["Edit", "Write"]),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"question","body":"?"}\n```',
+    )
+    ad.invoke(_view(text="hello view"), None)
+    assert ad.last_argv == [
+        "oc", "run", "--dir", str(wt),
+        "--allowedTools", "Edit", "Write", "hello view",
+    ]
+
+
+def test_model_placeholder_missing_value_fails_closed_at_invoke(tmp_dir):
+    """fail-closed 兜底：含占位而两层皆无 model → 抛错，**禁止**空串替换。
+
+    装载期（validate_availability_config）是主闸；这条防的是绕过装载校验直接
+    构造实例的路径——把字面 "{model}" 或空串喂给真实 CLI 都是静默错。
+    """
+    wt = tmp_dir / "wt-fc"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(start_cmd="oc run -m {model}"),  # 无 model 键
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    with pytest.raises(ValueError) as ei:
+        ad.invoke(_view("tester"), None)
+    msg = str(ei.value)
+    assert "{model}" in msg and "model" in msg
+
+
+def test_fake_and_real_argv_twins_share_one_start_cmd_argv_impl(tmp_dir, monkeypatch):
+    """孪生防漂移：两处 argv 组装必须调**同一个** _start_cmd_argv，且实参逐字相同。
+
+    做法：把模块级函数换成探针，两处各 invoke 一次 → 探针必须被调用 2 次
+    （证明没人另写一份），且两次实参相等（证明 model/cwd 取法没分叉）。
+    """
+    wt = tmp_dir / "wt-twin-model"
+    wt.mkdir()
+    cfg = _cfg_no_hardcoded_tools(
+        start_cmd="oc run --dir {cwd} -m {model}",
+        model="opencode/big-pickle", tools=["Edit"])
+    view = _view("tester", text="twin view")
+    reply = '```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```'
+
+    real_impl = orch.adapters._start_cmd_argv
+    calls: list[tuple] = []
+
+    def _spy(*args, **kw):
+        calls.append((args, kw))
+        return real_impl(*args, **kw)
+
+    monkeypatch.setattr("orch.adapters._start_cmd_argv", _spy)
+
+    fake = orch.adapters.FakeCliAdapter(
+        role="tester", config=cfg, worktree=wt, scripted_output=reply)
+    fake.invoke(view, None)
+
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = list(argv)
+
+        def communicate(self, timeout=None):
+            return (reply, "")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("orch.adapters.subprocess.Popen", _FakeProc)
+    orch.adapters.CliAdapter(
+        role="tester", config=cfg, worktree=wt).invoke(view, None)
+
+    assert len(calls) == 2, f"两处未共用 _start_cmd_argv（被调 {len(calls)} 次）"
+    assert calls[0] == calls[1], f"两处实参分叉: {calls}"
+    assert fake.last_argv == captured.get("argv")
+    assert not any("{model}" in a for a in fake.last_argv)
+
+
+def test_model_placeholder_not_applied_to_view_text_or_tools_args(tmp_dir):
+    """作用域最小化：正文与自动注入的工具参数里的 {model} 原样保留。
+
+    正文参与替换 = 给 agent 开模板注入面；tools_args 是 flag 与工具名，无模型语义。
+    """
+    wt = tmp_dir / "wt-noinject-model"
+    wt.mkdir()
+    text = "请解释配置里 {model} 这个占位的含义"
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(
+            start_cmd="oc run -m {model}",
+            model="opencode/big-pickle",
+            tools=["Edit", "Bash({model}:*)"]),   # 工具名里的占位同样不许被动
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"chat","body":"hi"}\n```',
+    )
+    ad.invoke(_view("tester", text=text), None)
+    argv = ad.last_argv
+    assert argv[-1] == text
+    assert "{model}" in argv[-1]
+    assert "Bash({model}:*)" in argv
+
+
+def test_model_placeholder_with_spaces_stays_single_argv_element(tmp_dir):
+    """含空格模型名替换后仍是**单个** argv 元素（同 {cwd} 的防裂判据）。"""
+    wt = tmp_dir / "wt-model-space"
+    wt.mkdir()
+    ad = orch.adapters.FakeCliAdapter(
+        role="tester",
+        config=_cfg_no_hardcoded_tools(
+            start_cmd="oc run -m {model}", model="vendor/model x1"),
+        worktree=wt,
+        scripted_output='```json\n{"to":["pm"],"type":"report","body":"ok"}\n```',
+    )
+    ad.invoke(_view("tester"), None)
+    argv = ad.last_argv
+    assert len(argv) == 5, f"含空格模型名被拆裂: {argv}"
+    assert argv[argv.index("-m") + 1] == "vendor/model x1"
+
+
+# ——————————————————————————————————————————————————————————————
 # T-CWD 附带缺口：§8.3 verify 钩子的 cwd 占位渲染（{worktree:role} / {target_repo}）
 #
 # 本组测的是 orch.scheduler.core，本应另起测试文件；受本卡可写路径白名单

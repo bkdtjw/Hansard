@@ -725,26 +725,64 @@ def _build_allowed_tools_args(config: dict, tools: list[str]) -> list[str]:
     return [flag, *[str(t) for t in tools]]
 
 
-def _start_cmd_argv(start_cmd, worktree) -> list[str]:
-    """把 start_cmd 分词为 argv 前缀，并把字面量 ``{cwd}`` 替换为本次调用的 worktree。
+_MODEL_PLACEHOLDER = "{model}"
 
-    背景：opencode 无视进程 cwd、自寻项目根（陪跑实测 2026-07-25），必须靠
+
+def _effective_model(config: dict | None) -> str:
+    """本 adapter 实例生效的模型名（§11.1 行547）；未配置回空串，由调用方 fail-closed。
+
+    只读一个键：**合并已由装配层做完**（``cli.main._build_adapters_from_config`` 的
+    ``merged = {**ac, **rc}``，role 层覆盖 adapter 层）。适配层若自己再合并一次，
+    就有两份合并语义可分叉——真实装配走 merged、测试直接构造走另一套，正是本文件
+    反复吃过的孪生漂移。
+    """
+    raw = (config or {}).get("model")
+    return "" if raw is None else str(raw)
+
+
+def _start_cmd_argv(start_cmd, worktree, config) -> list[str]:
+    """把 start_cmd 分词为 argv 前缀，并把字面量 ``{cwd}`` / ``{model}`` 逐 token 替换。
+
+    背景（{cwd}）：opencode 无视进程 cwd、自寻项目根（陪跑实测 2026-07-25），必须靠
     ``--dir <worktree>`` 显式压制；而 worktree 路径只有运行期才知道，配置里写不出来。
+    背景（{model}）：四家 CLI 都靠 flag 选模型（grok/kimi/opencode 是 ``-m``、claude 是
+    ``--model``），而"每角色一个模型"要求同一 adapter 段在不同角色下取不同值，故值来自
+    该角色生效配置的 ``model`` 键（§11.1 行547），命令里只写占位。
 
     三条约束（改动前先读，别照搬"整串 replace 再 split"）：
       1) **先 split 再逐 token replace**。整串替换后再 ``.split()`` 会把含空格的
          Windows 路径裂成多个 argv 元素，且无法靠引号补救（``str.split`` 不解析引号）。
          在单个 token 内部做子串替换，产物天然仍是一个 argv 元素，零转义逻辑。
       2) 无占位时逐字节回归：``str.replace`` 未命中返回等值原串，故整条 argv 与
-         改造前完全一致（既有 config / 测试零影响）。
-      3) 作用域只到 start_cmd 的分词产物——不含 tools_args（flag 与工具名，无 cwd
+         改造前完全一致（既有 config / 测试零影响）。配了 ``model`` 键但命令里没占位
+         同样一个字都不动——本函数不追加任何 flag，注入什么全由配置的命令行说话。
+      3) 作用域只到 start_cmd 的分词产物——不含 tools_args（flag 与工具名，无 cwd/模型
          语义），更不含 ``view['text']``（正文是 agent 可写的，若参与替换等于开一条
          模板注入面）。分离式 ``--dir {cwd}`` 与等号式 ``--dir={cwd}`` 天然都支持。
+
+    {model} 的两处顺序细节（看代码看不出意图，别顺手调）：
+      · **占位判定在模板 token 上做**，不在 {cwd} 替换后的产物上做。否则一个恰好含
+        ``{model}`` 字样的 worktree 路径能给"命令里根本没写占位"的配置凭空造出模型
+        要求，直接违反约束 2；
+      · 无值即抛错，**禁止**空串替换或猜缺省（§11.1 fail-closed）。主闸在装载期
+        （``state.validate_availability_config``）；这里是绕过装载校验直接构造实例时
+        的兜底——把字面 ``{model}`` 或空串喂给真实 CLI 都是静默错，响亮失败更便宜。
 
     CliAdapter 与 FakeCliAdapter 两处 argv 组装**必须**共用本函数：孪生单边漂移会让
     基于 last_argv 的断言给出假绿。
     """
-    return [tok.replace("{cwd}", str(worktree)) for tok in str(start_cmd).split()]
+    tokens = str(start_cmd).split()
+    argv = [tok.replace("{cwd}", str(worktree)) for tok in tokens]
+    if not any(_MODEL_PLACEHOLDER in tok for tok in tokens):
+        return argv
+    model = _effective_model(config)
+    if not model.strip():
+        raise ValueError(
+            f"start_cmd/resume_cmd 含 {_MODEL_PLACEHOLDER} 占位，但 roles / adapters"
+            " 两层都没配非空 model 值（§11.1 fail-closed：禁止空串替换或猜测缺省）："
+            f"{str(start_cmd)!r}"
+        )
+    return [tok.replace(_MODEL_PLACEHOLDER, model) for tok in argv]
 
 
 class CliAdapter:
@@ -805,8 +843,13 @@ class CliAdapter:
         tools_args = _build_allowed_tools_args(
             self.config, list(self.caps.get("tools", []) or [])
         )
-        # start_cmd 里的字面量 {cwd} → 本次调用的 worktree（token 级替换，见 _start_cmd_argv）。
-        cmd = _start_cmd_argv(start_cmd, self.worktree) + tools_args + [str(view["text"])]
+        # start_cmd 里的字面量 {cwd} / {model} → 本次调用的 worktree / 本角色生效模型名
+        # （token 级替换，见 _start_cmd_argv；config 整份传进去，模型名只在那一处取）。
+        cmd = (
+            _start_cmd_argv(start_cmd, self.worktree, self.config)
+            + tools_args
+            + [str(view["text"])]
+        )
         timeout_s = int(self.config.get("timeout_s", self.caps.get("timeout_s", 0)) or 0)
         self.last_raw_output = ""     # 本次调用起首归零（见 __init__ 注释）
         proc = subprocess.Popen(  # noqa: S603 — 冷启动子进程是 §7.2 明列职责
@@ -1028,7 +1071,7 @@ class FakeCliAdapter:
             self.config, list(self.caps.get("tools", []) or [])
         )
         self.last_argv = (
-            _start_cmd_argv(start_cmd, self.worktree)
+            _start_cmd_argv(start_cmd, self.worktree, self.config)
             + tools_args
             + [str(view.get("text", ""))]
         )

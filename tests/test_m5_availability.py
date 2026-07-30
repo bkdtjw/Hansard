@@ -519,6 +519,114 @@ def test_validate_rejects_api_primary_for_role_with_tools():
     assert any("cheap_api" in str(e) for e in errors), errors
 
 
+# ----------------------------------------------------------------------
+# C · T-MODEL：{model} 占位的装载期 fail-closed 校验（spec §11.1 行547）
+#
+# 规则：对每个角色，主绑定与全部 fallback 各自的 adapter —— 该 adapter 的
+# start_cmd 或 resume_cmd 含字面 "{model}" ⇒ 该 (role, adapter) 合并配置
+# （{**adapter层, **role层}）必须有非空 model 值；否则装载期报错。
+# 刻意**不查**模型名有效性（引擎不可知，见实现 docstring）。
+# ----------------------------------------------------------------------
+
+def _model_cfg(**over) -> dict:
+    """带 {model} 占位的最小 config：pm 主绑定 oc_cli，备胎 kimi_cli（无占位）。"""
+    cfg = {
+        "adapters": {
+            "oc_cli": {"kind": "cli", "start_cmd": "oc run -m {model} --format json"},
+            "kimi_cli": {"kind": "cli", "start_cmd": "kimi -p"},
+        },
+        "roles": {
+            "pm": {"adapter": "oc_cli", "fallback": ["kimi_cli"],
+                   "write_scope": [], "tools": []},
+        },
+    }
+    cfg.update(over)
+    return cfg
+
+
+def test_validate_requires_model_when_start_cmd_has_placeholder():
+    """两层皆无 model 而 start_cmd 含 {model} → 报错，且人话点名角色 + adapter。"""
+    m = _state_mod()
+    errors = m.validate_availability_config(_model_cfg())
+    assert errors, "含 {model} 占位却无 model 值必须装载期报错（fail-closed）"
+    hit = [e for e in errors if "{model}" in str(e)]
+    assert hit, errors
+    assert any("pm" in str(e) and "oc_cli" in str(e) for e in hit), hit
+
+
+def test_validate_accepts_model_from_adapter_layer():
+    """adapters 层 model 即可满足（roles 层不写 → 回落）。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["adapters"]["oc_cli"]["model"] = "opencode/big-pickle"
+    assert m.validate_availability_config(cfg) == []
+
+
+def test_validate_accepts_model_from_role_layer_only():
+    """roles 层单独给 model 亦可（adapter 层缺省不存在时）。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["roles"]["pm"]["model"] = "opencode/nemotron-3-ultra-free"
+    assert m.validate_availability_config(cfg) == []
+
+
+def test_validate_rejects_empty_model_value():
+    """空串 / 纯空白不算「有值」（禁止空串替换的同一条 fail-closed）。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["adapters"]["oc_cli"]["model"] = "   "
+    errors = m.validate_availability_config(cfg)
+    assert errors, "空白 model 值必须与「未配置」同等对待"
+    assert any("oc_cli" in str(e) for e in errors), errors
+
+
+def test_validate_role_layer_empty_model_overrides_adapter_layer():
+    """合并语义一致：role 层显式空值覆盖 adapter 层 → 仍报错（不偷偷回落）。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["adapters"]["oc_cli"]["model"] = "opencode/big-pickle"
+    cfg["roles"]["pm"]["model"] = ""
+    errors = m.validate_availability_config(cfg)
+    assert errors, "role 层空 model 覆盖 adapter 层后应视为无值"
+    assert any("pm" in str(e) for e in errors), errors
+
+
+def test_validate_requires_model_for_fallback_adapter_too():
+    """备胎侧同查：主绑定无占位、fallback 的 adapter 含占位而无 model → 报错点名备胎。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["roles"]["pm"] = {"adapter": "kimi_cli", "fallback": ["oc_cli"],
+                          "write_scope": [], "tools": []}
+    errors = m.validate_availability_config(cfg)
+    assert errors, "fallback 项的 {model} 占位同样要在装载期查"
+    assert any("oc_cli" in str(e) and "pm" in str(e) for e in errors), errors
+
+
+def test_validate_resume_cmd_placeholder_also_requires_model():
+    """resume_cmd 含占位同样触发（§11.1 原句是 start_cmd/resume_cmd 并列）。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["adapters"]["oc_cli"]["start_cmd"] = "oc run --format json"     # 无占位
+    cfg["adapters"]["oc_cli"]["resume_cmd"] = "oc run -m {model} --session {sid}"
+    errors = m.validate_availability_config(cfg)
+    assert errors, "resume_cmd 的 {model} 占位也要查"
+    assert any("oc_cli" in str(e) for e in errors), errors
+
+
+def test_validate_does_not_judge_model_name_validity():
+    """只查存在性，不查有效性：引擎不可知，任何非空字符串都放行。"""
+    m = _state_mod()
+    cfg = _model_cfg()
+    cfg["adapters"]["oc_cli"]["model"] = "definitely-not-a-real-model-xyz"
+    assert m.validate_availability_config(cfg) == []
+
+
+def test_validate_no_placeholder_ignores_missing_model():
+    """无占位的 adapter 不因缺 model 报错（回归：既有配置零影响）。"""
+    m = _state_mod()
+    assert m.validate_availability_config(_valid_cfg()) == []
+
+
 # ======================================================================
 # D. 调度接线（core.run_thread 同步环 + async_core 冒烟）—— 契约 §3/§4/§5
 # ======================================================================

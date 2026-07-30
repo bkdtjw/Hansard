@@ -286,17 +286,39 @@ def resolve_effective_adapter(
     return None
 
 
+_MODEL_PLACEHOLDER = "{model}"
+
+
+def _cmd_needs_model(adapter_conf: dict) -> bool:
+    """该 adapter 的 start_cmd / resume_cmd 是否含字面 ``{model}``（§11.1 行547 并列两键）。"""
+    for key in ("start_cmd", "resume_cmd"):
+        val = adapter_conf.get(key)
+        if isinstance(val, str) and _MODEL_PLACEHOLDER in val:
+            return True
+    return False
+
+
 def validate_availability_config(cfg: dict) -> list[str]:
     """§11.1 装载期校验，返回错误清单（空 = 合法；调用方据此启动报错）。
 
-    两条规则（§11.1 "可用性与降级字段"段）：
+    三条规则（§11.1 "可用性与降级字段"段 + 行547 ``{model}`` 段）：
       1. fallback 项必须是**已声明**的 adapter；
       2. tools 或 write_scope 非空的角色，其**主绑定与全部 fallback 项**必须是
-         cli 型——API 型不带工具循环（§7.3）。
+         cli 型——API 型不带工具循环（§7.3）；
+      3. 绑定链（主绑定 + 全部 fallback）上任一 adapter 的 start_cmd/resume_cmd 含
+         字面 ``{model}`` ⇒ 该 **(role, adapter) 合并配置**（role 层覆盖 adapter 层）
+         必须有非空 model 值。fail-closed：报错而不是空串替换或猜缺省。
+
+    规则 3 只查**存在性，不查模型名有效性**——本层引擎不可知（模型清单在各家 CLI 手里，
+    联网才知道；把清单写进代码等于每次供应商改名就撒谎）。相应地：role 层写的 model 名
+    可能不被异构 fallback 的那家 CLI 认识（grok 的模型名喂给 opencode 必然失败），这属
+    **配置者责任**，校验刻意不拦——拦它就得内建各家模型清单。UI 层按 CLI 家族给候选值
+    可缓解（控制台的角色编辑面板），但那是呈现层的事，不是本函数的判据。
 
     边界（本函数刻意不管的）：主绑定是否已声明。§11.1 只要求 fallback 项已声明，
     且主绑定缺省用角色名兜底（见 ``resolve_effective_adapter``）；kind 无从判定时
-    跳过规则 2，避免把"未声明"误报成"型别不符"。
+    跳过规则 2，避免把"未声明"误报成"型别不符"。规则 3 同理只作用于**已声明**的
+    adapter（未声明就没有命令行可查）。
     """
     errors: list[str] = []
     raw_adapters = cfg.get("adapters") if isinstance(cfg, dict) else None
@@ -309,6 +331,26 @@ def validate_availability_config(cfg: dict) -> list[str]:
         if not isinstance(conf, dict) or not conf.get("kind"):
             return None
         return str(conf["kind"])
+
+    def _model_error(role: str, name: str, role_conf: dict) -> str | None:
+        """规则 3：(role, adapter) 这一对缺 model 时给一句点名人话，否则 None。"""
+        adapter_conf = adapters.get(name)
+        if not isinstance(adapter_conf, dict) or not _cmd_needs_model(adapter_conf):
+            return None
+        # 合并语义与装配层同源（cli.main._build_adapters_from_config 的 {**ac, **rc}）：
+        # role 层存在该键就赢——**含显式空值**。写 model:"" 是"我不要模型名"的表态，
+        # 偷偷回落 adapter 层缺省等于替配置者猜，正是 fail-closed 要禁的。
+        merged_model = (
+            role_conf.get("model") if "model" in role_conf
+            else adapter_conf.get("model")
+        )
+        if merged_model is not None and str(merged_model).strip():
+            return None
+        return (
+            f"角色 {role}：绑定的 adapter {name!r} 命令行含 {_MODEL_PLACEHOLDER} 占位，"
+            f"但 roles.{role}.model 与 adapters.{name}.model 都没有非空值——"
+            f"请给其中一处配模型名（§11.1 行547 fail-closed：禁止空串替换或猜测缺省）"
+        )
 
     for role, conf in roles.items():
         if not isinstance(conf, dict):
@@ -323,6 +365,9 @@ def validate_availability_config(cfg: dict) -> list[str]:
                 f"角色 {role}：tools/write_scope 非空，主绑定 {primary!r} 是"
                 f" {primary_kind} 型，必须为 cli 型（§11.1/§7.3）"
             )
+        model_err = _model_error(role, primary, conf)
+        if model_err:
+            errors.append(model_err)
 
         fallback = conf.get("fallback") or []
         if not isinstance(fallback, (list, tuple)):
@@ -344,4 +389,9 @@ def validate_availability_config(cfg: dict) -> list[str]:
                     f"角色 {role}：tools/write_scope 非空，fallback 项 {name!r} 是"
                     f" {kind} 型，必须为 cli 型（§11.1/§7.3）"
                 )
+            # 备胎也要查：降级那一刻才发现备胎的 {model} 没值，等于把启动期错误
+            # 推迟到主绑定跳闸的最坏时刻（§5.6.2 生效绑定含 fallback）。
+            model_err = _model_error(role, name, conf)
+            if model_err:
+                errors.append(model_err)
     return errors
