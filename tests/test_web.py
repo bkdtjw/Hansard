@@ -776,8 +776,9 @@ def test_events_response_adds_round_stats_without_touching_event_shape(tmp_dir):
 def test_task_declaration_order_differs_from_lexicographic(tmp_dir):
     """乱序声明两个 key（后声明者字典序更小）→ 两种排序结果必须相反。
 
-    渲染序本身在 app.js（全仓无 JS 运行时），这里打**服务端真值**：/events 按 id
-    升序直出 bb_ops，前端据"首次声明事件号"排序；同 key 后写只改 status 不改位次。
+    这里打的是 /events 的**服务端真值**：按 id 升序直出 bb_ops，"首次声明事件号"
+    可从中复原。声明序的**计算**在 R3 后已从前端移到 /board 端点（前端不再据
+    bb_ops 自投影，见 w-14），本用例继续守住它的原料：事件序与 bb_ops 原文。
     """
     with _Serving(tmp_dir) as base:
         store = orch.store.Store(tmp_dir / "t-order")
@@ -819,10 +820,10 @@ def test_app_js_task_checklist_order_and_status_glyphs(tmp_dir):
     with _Serving(tmp_dir) as base:
         code, js = _req(base, "/app.js")
         assert code == 200, code
-        # ① 排序改首次声明序：字典序那行必须消失，比较器按 firstSeen。
+        # ① 次序取端点给的声明序；字典序那行必须不在，前端也不得自造第二套判据。
         assert "Object.keys(tasks).sort()" not in js, "字典序排序必须被替换"
-        assert "firstSeen" in js
-        assert "tasks[a].firstSeen - tasks[b].firstSeen" in js
+        assert "bd.task_order" in js, "待办次序须取权威端点的 task_order"
+        assert "firstSeen" not in js, "前端不得再自算首次声明序（判据只留服务端一处）"
         # ② 展示层归一化三档（只映射字形，不写回落盘、不改 protocol/schema.py）。
         assert "function taskGlyph(status)" in js
         assert "TASK_DONE_WORDS" in js and "TASK_DOING_WORDS" in js
@@ -842,4 +843,206 @@ def test_app_js_task_checklist_order_and_status_glyphs(tmp_dir):
         assert "自最后一条人类消息起" in js
         assert "工具数" in js, "缺栏理由须留注释（盘上无工具调用痕迹）"
         # ⑤ 属性位一律 escapeHtmlAttr。
-        assert 'data-goto="${escapeHtmlAttr(String(t.evt))}"' in js
+        assert 'data-goto="${escapeHtmlAttr(s)}"' in js
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-14) 黑板三节 = **权威**黑板（GET /api/threads/{id}/board）
+#
+# 落库 ≠ 生效：被 §3.3 门槛拒绝的 bb_ops 照样进库（store.reply_and_done 无条件写
+# bb_ops_json），调度层 _apply_bb_if_eligible（scheduler/core.py:666-688）只是不
+# 应用 + 追加 system 审计事件。若展示层据事件重投影，被拒绝的 agent 自述就会被
+# 勾选与「第 N/M 步」算进完成度 —— §16 第 5 条"采信 agent 自述"的展示层形态。
+#
+# 下面用例的盘上事实**全部由真调度器产生**（FakeApiAdapter 脚本化回复 +
+# orch.scheduler.run_thread）：应用/拒绝的判定出自 _apply_bb_if_eligible，
+# 测试不复刻门槛逻辑，只断言 HTTP 真值。
+# ——————————————————————————————————————————————————————————————
+
+def _run_bb_chain(ws: Path, tid: str):
+    """真跑一条链，产出「两条权威待办 + 一条被拒绝的自述」的盘上事实。
+
+    E1(human→pm)
+      → pm#1  decision   to=[backend]   set_task zzz.first=doing     （can_decide=true → 应用）
+      → backend#1 acceptance to=[pm]    set_task backend.selfclaim=done
+                                        set_decision 自封的决策       （can_decide=false → 整批拒绝）
+      → pm#2  decision   to=[moderator] set_task aaa.second=todo
+                                        set_task zzz.first=done
+                                        freeze_contract like-api v1
+                                        set_decision 真决策           （应用）
+      → moderator#1 terminate
+
+    三处设计要点：
+      · backend **不配 verify** → §8.3 不会把 acceptance 降级成 report
+        （scheduler/core.py:589 明文"未配 verify 的角色 acceptance 原样放行"），
+        于是命中的正是 §3.3 门槛里 can_decide 那一半 —— 也只有 acceptance 能走到
+        这里：decision/gate_decision 早被 §3.2 发送者约束拦下降级为 report。
+      · 两条权威待办的声明序与字典序**相反**（zzz 先、aaa 后），排序判据有区分力。
+      · 拒绝产生的 system 审计事件 to=[moderator]，与 pm#2 的回复同轮分组，组间按
+        最小 event_id 升序（core.py:242-254）→ pm 组先跑，链路结果确定。
+    """
+    import orch.adapters
+    import orch.scheduler
+
+    store = orch.store.Store(ws / tid)
+    store.set_meta("status", "running")
+    store.set_meta("roles", json.dumps(["pm", "backend", "moderator"], ensure_ascii=False))
+    store.append_event(sender="human", type="assign", body="点赞功能", to=["pm"])
+
+    config = {
+        "thread_defaults": {"max_rounds": 100, "loop_limit": 3, "chat_ttl": 10},
+        "roles": {
+            "pm": {"can_decide": True, "write_scope": [], "tools": []},
+            "backend": {"can_decide": False, "write_scope": [], "tools": []},
+            "moderator": {"can_decide": True, "write_scope": [], "tools": []},
+        },
+    }
+    adapters = {
+        "pm": orch.adapters.FakeApiAdapter(
+            role="pm", config={"kind": "api"},
+            scripted_replies={
+                1: {"type": "decision", "to": ["backend"], "body": "先立 zzz",
+                    "blackboard_ops": [
+                        {"op": "set_task", "key": "zzz.first", "status": "doing"},
+                    ]},
+                2: {"type": "decision", "to": ["moderator"], "body": "补 aaa 并收 zzz",
+                    "blackboard_ops": [
+                        {"op": "set_task", "key": "aaa.second", "status": "todo"},
+                        {"op": "set_task", "key": "zzz.first", "status": "done"},
+                        {"op": "freeze_contract", "name": "like-api",
+                         "version": 1, "path": "docs/like-api.md"},
+                        {"op": "set_decision", "text": "真决策：先做 aaa"},
+                    ]},
+            }),
+        "backend": orch.adapters.FakeApiAdapter(
+            role="backend", config={"kind": "api"},
+            scripted_reply={
+                "type": "acceptance", "to": ["pm"], "body": "我自己说我做完了",
+                "blackboard_ops": [
+                    {"op": "set_task", "key": "backend.selfclaim", "status": "done"},
+                    {"op": "set_decision", "text": "自封的决策"},
+                ]}),
+        "moderator": orch.adapters.FakeApiAdapter(
+            role="moderator", config={"kind": "api"},
+            scripted_reply={"type": "terminate", "to": [], "body": "收工"}),
+    }
+    orch.scheduler.run_thread(store, config, adapters)
+    return store
+
+
+def _board_of(base: str, tid: str) -> dict:
+    code, body = _req(base, f"/api/threads/{tid}/board")
+    assert code == 200, (code, body)
+    return body
+
+
+def test_board_excludes_rejected_self_claim_while_chat_keeps_the_event(tmp_dir):
+    """①被拒绝的自述：黑板不呈现，聊天流照旧看得见（如实展示消息 ≠ 采信自述）。"""
+    with _Serving(tmp_dir) as base:
+        store = _run_bb_chain(tmp_dir, "t-bb")
+        board = _board_of(base, "t-bb")
+
+        # 任务节 / 声明序 / 溯源 三处都不给它位置。
+        assert "backend.selfclaim" not in board["tasks"], board["tasks"]
+        assert "backend.selfclaim" not in board["task_order"], board["task_order"]
+        assert "backend.selfclaim" not in board["task_evt"], board["task_evt"]
+        # 同一条 acceptance 里的 set_decision 一并被拒 → 决策节也没有它。
+        texts = [d.get("text") for d in board["decisions"]]
+        assert "自封的决策" not in texts, texts
+        # 权威侧亲自复核：state.json 里本来就没有（端点没有"过滤掉"什么，是没有）。
+        assert "backend.selfclaim" not in orch.store.board_state(store)["tasks"]
+
+        # 聊天流：这条 acceptance 与它的自述 ops 一字不少（bb_ops 是消息内容）。
+        code, ev_body = _req(base, "/api/threads/t-bb/events")
+        assert code == 200, (code, ev_body)
+        claims = [e for e in ev_body["events"]
+                  if e["sender"] == "backend" and e["type"] == "acceptance"]
+        assert len(claims) == 1, [(e["sender"], e["type"]) for e in ev_body["events"]]
+        assert [op.get("key") for op in claims[0]["bb_ops"]] == [
+            "backend.selfclaim", None], claims[0]["bb_ops"]
+        # 调度器确实走了"拒绝"分支：审计事件在盘上（不是"什么都没发生"）。
+        audits = [e for e in ev_body["events"]
+                  if e["sender"] == "system" and "blackboard_ops" in e["body"]]
+        assert len(audits) == 1, [e["body"] for e in ev_body["events"]
+                                  if e["sender"] == "system"]
+        assert "backend" in audits[0]["body"] and "acceptance" in audits[0]["body"]
+
+
+def test_board_shows_authoritative_ops_in_declaration_order(tmp_dir):
+    """②can_decide 角色的合法 ops：三节如实呈现，待办按声明序（非字典序）。"""
+    with _Serving(tmp_dir) as base:
+        _run_bb_chain(tmp_dir, "t-bb2")
+        board = _board_of(base, "t-bb2")
+        code, ev_body = _req(base, "/api/threads/t-bb2/events")
+        assert code == 200, (code, ev_body)
+        pm_evts = [e["id"] for e in ev_body["events"]
+                   if e["sender"] == "pm" and e["type"] == "decision"]
+        assert len(pm_evts) == 2, pm_evts
+        pm1, pm2 = pm_evts
+
+        # 任务节：只有两条权威待办，status 为落盘原文（zzz 已被二次声明改成 done）。
+        assert board["tasks"] == {"zzz.first": "done", "aaa.second": "todo"}, board["tasks"]
+        # 声明序：zzz 先声明（pm#1）→ 排在字典序更小的 aaa 前面。
+        assert board["task_order"] == ["zzz.first", "aaa.second"], board["task_order"]
+        assert board["task_order"] != sorted(board["tasks"]), "fixture 无区分力"
+        # 溯源 #evt = 最近一次声明该 key 的事件号。
+        assert board["task_evt"]["zzz.first"] == pm2, (board["task_evt"], pm1, pm2)
+        assert board["task_evt"]["aaa.second"] == pm2, board["task_evt"]
+        # 契约节：frozen_at 由权威 state.json 直出（前端 #evt 取它）。
+        assert board["contracts"]["like-api"]["version"] == 1, board["contracts"]
+        assert board["contracts"]["like-api"]["path"] == "docs/like-api.md"
+        assert board["contracts"]["like-api"]["frozen_at"] == pm2, board["contracts"]
+        # 决策节：只剩合法那条，带事件号。
+        assert [d["text"] for d in board["decisions"]] == ["真决策：先做 aaa"], board["decisions"]
+        assert board["decisions"][0]["evt"] == pm2, board["decisions"]
+
+
+def test_board_progress_denominator_counts_only_authoritative_tasks(tmp_dir):
+    """③「第 N/M 步」的分子分母只数权威任务：M=2 而非把自述算进去的 3。"""
+    with _Serving(tmp_dir) as base:
+        _run_bb_chain(tmp_dir, "t-bb3")
+        board = _board_of(base, "t-bb3")
+        keys = board["task_order"]
+        assert len(keys) == 2, keys                      # M：分母
+        done = [k for k in keys if board["tasks"][k] == "done"]
+        assert done == ["zzz.first"], board["tasks"]     # N：分子（自述那条不在其中）
+        # 前端拿的正是这份 tasks —— 进度头用同一批 key 算，不另开数据源。
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "taskKeys.filter((k) => taskGlyph(tasks[k]).cls === \"done\")" in js
+        assert "只数权威黑板里的任务" in js
+
+
+def test_board_endpoint_shape_and_empty_thread(tmp_dir):
+    """端点键名冻结 + 空线程给真空（不是报错，也不是编造）+ 方法/线程存在性。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base)
+        board = _board_of(base, tid)
+        assert set(board) == {
+            "contracts", "decisions", "tasks", "task_order", "task_evt",
+        }, sorted(board)
+        assert board == {"contracts": {}, "decisions": [], "tasks": {},
+                         "task_order": [], "task_evt": {}}, board
+        code, body = _req(base, f"/api/threads/{tid}/board", "POST", {})
+        assert code == 405, (code, body)
+        code, body = _req(base, "/api/threads/no-such-thread/board")
+        assert code == 404, (code, body)
+
+
+def test_app_js_board_reads_endpoint_and_shows_read_failure(tmp_dir):
+    """前端判据：黑板只吃 /board 端点，前端自投影退役，读不到时显式失败态。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        # ① 数据源 = 只读端点；前端 bb_ops 自投影函数整体退役。
+        assert "/api/threads/${tid}/board" in js
+        assert "projectBoard" not in js, "前端 bb_ops 自投影必须退役，不留兜底"
+        assert "lastBoard" in js
+        # ② 三节字段改吃 state.json 口径（契约 frozen_at / 待办 task_evt）。
+        assert "c.frozen_at" in js
+        assert "bd.task_evt" in js
+        # ③ 读不到 = 失败态，不得渲染成"暂无"。
+        assert "黑板读取失败" in js and "bd-fail" in js
+        code, css = _req(base, "/styles.css")
+        assert code == 200, code
+        assert ".bd-fail" in css

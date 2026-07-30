@@ -129,6 +129,9 @@ def rebuild_blackboard(store: Store) -> None:
 
 def board_state(store: Store) -> dict:   # 读 state.json 供断言
     ...
+# （M5 后追加，签名不变）board_state 亦是**展示层**读权威黑板的唯一入口：控制台
+# GET /api/threads/{id}/board 经它投影三节，只读、不写盘；展示层禁止据事件的
+# bb_ops 自行重投影（落库 ≠ 生效，被 §3.3 门槛拒绝的 ops 照样在事件里）。
 ```
 
 > board.md 的具体**渲染格式**属 spec §17 开放决策点，由 T3 自定并记 NOTES（不影响本契约）。

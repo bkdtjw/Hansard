@@ -718,6 +718,10 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
   padding: 5px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.06); font-size: 12.5px;
 }
 .bd-empty { color: var(--txt-dim); font-style: italic; border-bottom: none !important; }
+/* 黑板端点读不到 = 失败态，不是空态：与"暂无"用不同颜色区分，免得读成"还没有". */
+.bd-fail { color: var(--danger-solid); font-style: normal; }
+/* 权威条目查不到事件号时的占位（不编号、不省列）。 */
+.bd-noevt { margin-left: auto; color: var(--txt-dim); font-family: var(--font-mono); cursor: help; }
 .bd-name { font-weight: 600; color: var(--txt); }
 .bd-ver {
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;

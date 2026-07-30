@@ -19,8 +19,18 @@ let selectedThread = null;
 const filterState = { roles: null, types: null, aOnly: false };
 // D18/D19：最近一次 status 明细缓存，供派发表展开与门禁 corr 提取。
 let lastStatus = null;
-// 当前线程事件缓存（供过滤重渲染 / 跳转 / 黑板投影，均为库的只读投影）。
+// 当前线程事件缓存（供过滤重渲染 / 跳转，均为库的只读投影）。
 let currentEvents = [];
+// 黑板三节的**唯一**数据源 = GET /api/threads/{id}/board 的权威投影（服务端读
+// blackboard/state.json）。前端**不再**据事件的 bb_ops 自行投影：落库 ≠ 生效，
+// 被 §3.3 门槛拒绝的 ops 照样在事件里，据它投影会把被拒绝的自述算进完成度。
+// null = 尚未取到 / 取失败 → 渲染成**显式失败态**，绝不退回前端投影兜底
+// （错的黑板比"读不到"更坏：它长得跟真的一样）。
+let lastBoard = null;
+let lastBoardError = "";
+// 载荷指纹：事件没变但黑板变了（如崩溃恢复后 rebuild）也要重绘。变化检测用，
+// 不是缓存 —— 每次轮询都真取一次端点，只是内容一样时省掉一次 innerHTML 重排。
+let lastBoardSig = "";
 // 「本轮」统计：/events 响应的同级键 round_stats 原样存放（服务端每请求现算）。
 // 前端**不重算**任何一项——它只随事件变化，故随 renderBoard 一起重绘即可。
 let lastRoundStats = null;
@@ -171,6 +181,9 @@ function switchWorkspace(name) {
   selectedThread = null;
   currentEvents = [];
   lastRoundStats = null;   // 跨工作区不沿用上一条线程的统计窗口
+  lastBoard = null;        // 黑板同理：工作区换了，上一条线程的三节必须清掉
+  lastBoardError = "";
+  lastBoardSig = "";
   lastStatus = null;
   lastRoles = [];
   lastConfigError = "";   // 工作区换了，上一个工作区的 config 报错不该跟着走
@@ -678,6 +691,9 @@ async function createThread() {
 async function selectThread(tid) {
   selectedThread = tid;
   lastBoardACount = -1;   // 跨线程不比较 A 类计数（防误闪烁）
+  lastBoard = null;       // 黑板是线程内事实：切线程即作废，绝不让上一条的三节留屏
+  lastBoardError = "";
+  lastBoardSig = "";
   lastRoundStats = null;  // 统计窗口是线程内概念，切线程即作废（loadEvents 立刻重填）
   lastRoles = [];         // 跨线程不沿用上一条线程的角色投影
   lastConfigError = "";   // 同理：config 报错是工作区级事实，下一拍 status 会重填
@@ -1047,6 +1063,7 @@ function isAtBottom(stream) {
 
 // R5 D6：事件摄取——变化检测（长度 + 末事件号），无变化不重渲染（性能红线）；
 // 有变化时按锚定规则滚动：贴底自动跟入；上翻则冻结位置并累计"↓ n 条新消息"。
+// 返回本次是否真的重渲染了（黑板另一条线据此决定要不要补一次 renderBoard）。
 function ingestEvents(evs, force = false) {
   const stream = $("#chat-stream");
   const prevLen = currentEvents.length;
@@ -1055,7 +1072,7 @@ function ingestEvents(evs, force = false) {
     || (evs.length > 0 && prevLen > 0
         && evs[evs.length - 1].id !== currentEvents[prevLen - 1].id);
   currentEvents = evs;
-  if (!changed) return;
+  if (!changed) return false;
   const stick = force || isAtBottom(stream);
   updateThreadTitle();
   populateSendType(evs.length > 0);
@@ -1065,6 +1082,26 @@ function ingestEvents(evs, force = false) {
   if (!stick) unseenCount += Math.max(0, evs.length - prevLen);
   else unseenCount = 0;
   updateNewMsgsFloat();
+  return true;
+}
+
+// 黑板取数：失败**不**连坐事件流（两个端点各读各的），但失败必须显式落到面板上。
+async function fetchBoard(tid) {
+  try {
+    return { data: await api(`/api/threads/${tid}/board`), err: "" };
+  } catch (e) {
+    return { data: null, err: e.message || "读取失败" };
+  }
+}
+
+// 应用一次 board 载荷（loadEvents 与 pollLoop 两条取数线共用），返回是否有变化。
+function applyBoardPayload(res) {
+  const sig = res.err ? "ERR:" + res.err : JSON.stringify(res.data);
+  const changed = sig !== lastBoardSig;
+  lastBoardSig = sig;
+  lastBoard = res.err ? null : (res.data || null);
+  lastBoardError = res.err;
+  return changed;
 }
 
 async function loadEvents(force = true) {
@@ -1072,10 +1109,15 @@ async function loadEvents(force = true) {
   const tid = selectedThread;
   const stream = $("#chat-stream");
   try {
-    const data = await api(`/api/threads/${tid}/events`);
+    const [data, bd] = await Promise.all([
+      api(`/api/threads/${tid}/events`),
+      fetchBoard(tid),
+    ]);
     if (tid !== selectedThread) return;   // 线程已切换：丢弃过期响应
     lastRoundStats = data.round_stats || null;   // 供 renderBoard 的统计卡取用
-    ingestEvents(data.events || [], force);
+    const boardChanged = applyBoardPayload(bd);
+    // 事件没变但黑板变了（如恢复期 rebuild）：ingestEvents 会跳过重渲染，这里补一次。
+    if (!ingestEvents(data.events || [], force) && boardChanged) renderBoard(currentEvents);
   } catch (e) {
     stream.innerHTML = `<div class="chat-empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
@@ -1179,39 +1221,24 @@ function gotoEvent(eid) {
 }
 
 // ————————————————————————————————————————————————
-// D17 黑板栏：据 A 类事件 + bb_ops 投影三节（契约/决策/任务状态）。
-// 数据源=前端投影（不加只读端点）：events 端点已返回 A 类事件与其 bb_ops
-// （store 键名 blackboard_ops → 端点 bb_ops），三种 op 与黑板三节一一对应：
-//   freeze_contract → 契约（name·vX·path，同名后写覆盖）
-//   set_decision    → 决策（逐条 append，带 #evt 链接）
-//   set_task        → 任务状态（key→status，同 key 后写覆盖）
-// 投影顺序=事件 id 升序（与 store.rebuild_blackboard / _apply_ops_into 一致，§4.6）。
+// D17 黑板栏：三节（契约/决策/任务状态）一律**只**渲染权威黑板，
+// 数据源 = GET /api/threads/{id}/board（服务端读 blackboard/state.json，§4.6）。
+//
+// 旧实现（前端据 A 类事件的 bb_ops 自投影）已**退役**，无兜底：它按 5 型 A 类放行
+// 且完全不判 can_decide，而 §3.3 的门槛是「type ∈ {decision, acceptance,
+// gate_decision} 且发件角色 can_decide」（protocol/rules.py:64-70）。可达反例：
+// can_decide=false 的角色发 acceptance + set_task status=done —— 调度器
+// (scheduler/core.py:678-688) 拒绝应用并追加 system 审计事件，但 ops 照样落库
+// (store/__init__.py:319/345)，前端照投，✓ 与「第 N/M 步」于是把**被拒绝的自述**
+// 算进完成度 —— §16 第 5 条"采信 agent 自述"的展示层形态。
+// 端点读不到时渲染显式失败态：错的黑板比"读不到"更坏（它长得跟真的一样）。
+//
+// 三节与 state.json 字段的对应：
+//   contracts {name:{version,path,frozen_at}} → 契约（#evt 取 frozen_at）
+//   decisions [{evt,text}]                    → 决策（应用序，端点原样直出）
+//   tasks     {key:status}                    → 任务状态；次序取端点 task_order
+//                                               （声明序），#evt 取 task_evt
 // ————————————————————————————————————————————————
-function projectBoard(evs) {
-  const contracts = {};     // name -> {version, path, evt}
-  const decisions = [];     // {evt, text}
-  const tasks = {};         // key -> {status, evt}
-  for (const ev of evs) {   // evs 已按 id 升序（端点 ORDER BY id ASC）
-    if (!A_CLASS_TYPES.has(ev.type)) continue;
-    for (const op of (ev.bb_ops || [])) {
-      if (op.op === "freeze_contract") {
-        contracts[op.name] = { version: op.version, path: op.path, evt: ev.id };
-      } else if (op.op === "set_decision") {
-        decisions.push({ evt: ev.id, text: op.text });
-      } else if (op.op === "set_task") {
-        // firstSeen = 该 key **首次**被 set_task 声明时的事件号（evs 已按 id 升序，
-        // 故首次命中即最小者）。待办按它排序 = 声明序；同 key 后续更新只改
-        // status/evt，位次不动（字典序会让"后声明但名字靠前"的任务插队）。
-        const prev = tasks[op.key];
-        tasks[op.key] = {
-          status: op.status, evt: ev.id,
-          firstSeen: prev ? prev.firstSeen : ev.id,
-        };
-      }
-    }
-  }
-  return { contracts, decisions, tasks };
-}
 
 // 待办状态的**展示层**归一化：spec §3.3 里 set_task 的 status 是自由字符串
 // （protocol/schema.py 无枚举），这里只把常见写法映射到三档字形，**不写回**、
@@ -1227,6 +1254,17 @@ function taskGlyph(status) {
   if (TASK_DOING_WORDS.has(key)) return { glyph: "◐", cls: "doing", text: "进行中", raw };
   // 其余（含未知）归"未开始"：空值显示分类名，非空则原文照排。
   return { glyph: "○", cls: "todo", text: raw || "未开始", raw, unknown: Boolean(raw) };
+}
+
+// 黑板行的 #evt 跳转 chip。事件号缺失时如实出"—"并把原因写进 title：
+// 权威 state.json 的 tasks 不带事件号（见端点注释），溯源查不到就是查不到，
+// 不编一个号出来，也不静默省掉这一列。
+function bdGotoChip(evt, missingTip = "权威状态里没有留下该条目的事件号") {
+  if (evt === undefined || evt === null || evt === "") {
+    return `<span class="bd-noevt" title="${escapeHtmlAttr(missingTip)}">—</span>`;
+  }
+  const s = String(evt);
+  return `<button class="ln-chip bd-goto" data-goto="${escapeHtmlAttr(s)}">#${escapeHtml(s)}</button>`;
 }
 
 // 「本轮」统计卡：mm:ss（超一小时 h:mm:ss）。
@@ -1274,34 +1312,42 @@ function buildRoundStatsSection() {
 function renderBoard(evs) {
   const el = $("#board-content");
   if (!el) return;
-  const { contracts, decisions, tasks } = projectBoard(evs);
+  const bd = lastBoard;                       // null = 端点没读到（失败态，非空态）
+  const contracts = (bd && bd.contracts) || {};
+  const decisions = (bd && bd.decisions) || [];
+  const tasks = (bd && bd.tasks) || {};       // {key: status}，status 是落盘原文
+  const taskEvt = (bd && bd.task_evt) || {};
   const names = Object.keys(contracts).sort();
-  // 待办排序 = 首次声明的事件号升序（不是字典序）；同一条事件声明多个 key 时
-  // 按 key 名兜底，保证同一份数据每次渲染次序稳定。
-  const taskKeys = Object.keys(tasks).sort((a, b) =>
-    (tasks[a].firstSeen - tasks[b].firstSeen) || (a < b ? -1 : (a > b ? 1 : 0)));
+  // 待办次序 = 端点给的声明序（服务端据事件首次声明号算，见端点注释）；端点没给
+  // 该键时退回权威 tasks 的键序，**不**在前端另造一套排序判据。
+  const taskKeys = ((bd && bd.task_order) || Object.keys(tasks))
+    .filter((k) => Object.prototype.hasOwnProperty.call(tasks, k));
+
+  // 读不到黑板：三节都如实说读不到（绝不显示成"暂无"——那是在替 store 编空态）。
+  const failMsg = `黑板读取失败：${escapeHtml(lastBoardError || "未知原因")}`;
+  const failLi = `<li class="bd-empty bd-fail">${failMsg}</li>`;
+  const failTr = `<tr><td colspan="3" class="bd-empty bd-fail">${failMsg}</td></tr>`;
 
   const contractRows = names.length
     ? names.map((n) => {
-        const c = contracts[n];
+        const c = contracts[n] || {};
         return `<li><span class="bd-name">${escapeHtml(n)}</span>` +
           `<span class="bd-ver">v${escapeHtml(String(c.version))}</span>` +
           `<span class="bd-path mono">${escapeHtml(String(c.path || ""))}</span>` +
-          `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(c.evt))}">#${escapeHtml(String(c.evt))}</button></li>`;
+          bdGotoChip(c.frozen_at) + `</li>`;
       }).join("")
-    : '<li class="bd-empty">决策冻结后会出现在这里</li>';
+    : (bd ? '<li class="bd-empty">决策冻结后会出现在这里</li>' : failLi);
 
   const decisionRows = decisions.length
     ? decisions.map((d) =>
         `<li><span class="bd-text">${escapeHtml(String(d.text == null ? "" : d.text))}</span>` +
-        `<button class="ln-chip bd-goto" data-goto="${escapeHtml(String(d.evt))}">#${escapeHtml(String(d.evt))}</button></li>`
+        bdGotoChip(d.evt) + `</li>`
       ).join("")
-    : '<li class="bd-empty">decision 类事件自动沉淀到这里</li>';
+    : (bd ? '<li class="bd-empty">decision 类事件自动沉淀到这里</li>' : failLi);
 
   const taskRows = taskKeys.length
     ? taskKeys.map((k) => {
-        const t = tasks[k];
-        const g = taskGlyph(t.status);
+        const g = taskGlyph(tasks[k]);
         const stTip = g.unknown
           ? `未识别状态「${g.raw}」：原文照排，归为未开始`
           : `落盘 status=${g.raw || "（空）"}`;
@@ -1309,15 +1355,15 @@ function renderBoard(evs) {
           `<td class="bd-task-key"><span class="task-glyph">${g.glyph}</span>` +
           `<span class="mono">${escapeHtml(k)}</span></td>` +
           `<td><span class="task-status ts-${escapeHtmlAttr(g.cls)}" title="${escapeHtmlAttr(stTip)}">${escapeHtml(g.text)}</span></td>` +
-          `<td><button class="ln-chip bd-goto" data-goto="${escapeHtmlAttr(String(t.evt))}">#${escapeHtml(String(t.evt))}</button></td></tr>`;
+          `<td>${bdGotoChip(taskEvt[k], "权威状态里有这一项，但事件里找不到声明它的 A 类事件")}</td></tr>`;
       }).join("")
-    : '<tr><td colspan="3" class="bd-empty">PM 建立任务后显示状态</td></tr>';
+    : (bd ? '<tr><td colspan="3" class="bd-empty">PM 建立任务后显示状态</td></tr>' : failTr);
 
-  // 进度头「第 N/M 步」：M=任务总数、N=已完成数（按上面同一套展示映射）。
-  // M=0 时不出进度头，保留现有空态文案。
-  const doneCount = taskKeys.filter((k) => taskGlyph(tasks[k].status).cls === "done").length;
+  // 进度头「第 N/M 步」：M/N 只数**权威**任务（被拒绝的自述连 tasks 都进不来，
+  // 自然不进分母），完成判定用下面同一套展示映射。M=0 时不出进度头。
+  const doneCount = taskKeys.filter((k) => taskGlyph(tasks[k]).cls === "done").length;
   const progress = taskKeys.length
-    ? `<span class="bd-progress" title="${escapeHtmlAttr(`已完成 ${doneCount} / 共 ${taskKeys.length} 项`)}">` +
+    ? `<span class="bd-progress" title="${escapeHtmlAttr(`已完成 ${doneCount} / 共 ${taskKeys.length} 项（只数权威黑板里的任务）`)}">` +
       `第 ${escapeHtml(String(doneCount))}/${escapeHtml(String(taskKeys.length))} 步</span>`
     : "";
 
@@ -1703,13 +1749,15 @@ async function pollLoop() {
   try {
     // N4：/api/adapters **不**在这条线拉——适配器是线程之外的全局事实，单一数据源
     // 是可用性心跳（availabilityHeartbeat）；这里只管本线程的事件与状态。
-    const [evData, s] = await Promise.all([
+    const [evData, s, bd] = await Promise.all([
       api(`/api/threads/${tid}/events`),
       api(`/api/threads/${tid}/status`),
+      fetchBoard(tid),
     ]);
     if (tid !== selectedThread) { pollInFlight = false; return; }  // 已切线程：丢弃
     lastRoundStats = evData.round_stats || null;
-    ingestEvents(evData.events || [], false);
+    const boardChanged = applyBoardPayload(bd);
+    if (!ingestEvents(evData.events || [], false) && boardChanged) renderBoard(currentEvents);
     applyStatusPayload(s);
   } catch (e) {
     ok = false;

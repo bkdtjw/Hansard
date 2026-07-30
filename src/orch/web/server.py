@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 import orch.store
 import orch.scheduler
 import orch.render
+import orch.protocol
 
 # 复用 CLI 层既有 helper（同包私有名允许直接 import；不拷业务逻辑）。
 import orch.cli.main as clim
@@ -161,10 +162,11 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
             "meta": ev.get("meta") or {},      # {tokens_in/out, duration_s, verify…}（R3 用）
             # D14 artifacts chips：库内 artifacts_json 已由 store.events() 解析为数组直出。
             "artifacts": ev.get("artifacts") or [],
-            # D17 黑板投影数据源：A 类事件的 bb_ops（store 键名 blackboard_ops，
-            # 已解析为数组或 None）。前端据 A 类事件 + 这些 ops 还原黑板三节
-            # （契约 freeze_contract / 决策 set_decision / 任务 set_task），
-            # 无需新增只读端点——投影足以从已投影事件重建（spec §4.6 增量=重放一致）。
+            # 该事件**自述**携带的 bb_ops（store 键名 blackboard_ops，已解析为数组
+            # 或 None）。注意：落库 ≠ 生效——被 §3.3 门槛拒绝的 ops 照样在这里出现
+            # （store.reply_and_done:319/345 无条件写 bb_ops_json）。故黑板三节的
+            # 数据源**不是**它，而是 GET /api/threads/{id}/board 的权威投影；本键只
+            # 供聊天流呈现"这条消息声明了什么"（自述 = 消息内容，如实展示不算采信）。
             "bb_ops": ev.get("blackboard_ops") or [],
             # 第三人称渲染走 orch.render（viewer_role 对单行不改格式，§6.2）。
             # 仅供 replay/审计口径参考；前端阅读列一律渲染 body 原文，绝不渲染此行（§16.7）。
@@ -172,6 +174,71 @@ def _ep_thread_events(ws: Path, tid: str) -> tuple[int, dict]:
         })
     # round_stats 是 events 的**同级键**（events 数组的元素结构是冻结面，一个键不动）。
     return 200, {"events": out, "round_stats": _round_stats(out)}
+
+
+def _ep_thread_board(ws: Path, tid: str) -> tuple[int, dict]:
+    """§4.6 **权威**黑板的只读投影（控制台右栏三节的唯一数据源）。
+
+    权威 = blackboard/state.json 这份材料化状态，用既有公开只读函数
+    ``orch.store.board_state`` 读出（docs/m0-contract.md §2 已冻结的对外符号）；
+    本端点不新增 store 方法、不写盘、不改配置。
+
+    **为什么不据事件的 bb_ops 重投影**：落库 ≠ 生效。被 §3.3 门槛拒绝的 ops 照样
+    进库（store.reply_and_done:319/345 无条件写 bb_ops_json），调度层
+    ``_apply_bb_if_eligible``（scheduler/core.py:678-688）只是"不应用 + 追加一条
+    system 审计事件"。据事件重投影 = 把**被拒绝的 agent 自述**当成既成事实展示，
+    勾选与「第 N/M 步」会把它算进完成度 —— 这正是 §16 第 5 条"采信 agent 自述"
+    在展示层的形态。权威状态里没有的，页面上就不该有。
+
+    tasks 的**声明序**与 #evt 跳转在 state.json 里查不到，只能另扫事件补：
+      · tasks 结构是 {key: status}，不带事件号；
+      · Store._write_state 用 ``json.dumps(..., sort_keys=True)`` 落盘
+        （store/__init__.py:643-647），插入序在盘上即被字典序抹平 —— 读回来的
+        dict 顺序是**字典序**，不是首次声明序。
+    故补两个**溯源**键，且只对权威已存在的 key 生效：
+      task_order —— 首次声明序（事件 id 升序；同一事件内多 key 按 key 名兜底）
+      task_evt   —— 最近一次声明该 key 的事件号（#evt 跳转用；查不到则缺键）
+    权威 tasks 里没有的 key 不可能出现在这两个键里 —— 被拒绝的自述既不进列表，
+    也不进「第 N/M 步」的分母。
+
+    键名冻结：contracts / decisions / tasks（state.json 逐字段原样）+
+    task_order / task_evt（溯源）。每请求现查盘、零缓存、无模块级状态（§16.9）。
+    """
+    store = _require_thread(ws, tid)
+    state = orch.store.board_state(store)
+    tasks = dict(state.get("tasks") or {})
+
+    first_evt: dict[str, int] = {}
+    last_evt: dict[str, int] = {}
+    for ev in store.events():
+        # 只认 §3.3 的 A 类三型：复用协议层同一谓词，把 can_decide 那一半置真、
+        # 单判 type 那一半（can_decide 的判定结果已经体现在权威 state 里，此处
+        # 不重判、不读 config —— 判据只留调度层一处，展示层不做第二套）。
+        if not orch.protocol.can_apply_blackboard_ops(
+            ev.get("type"), sender_can_decide=True
+        ):
+            continue
+        for op in (ev.get("blackboard_ops") or []):
+            if op.get("op") != "set_task":
+                continue
+            key = op.get("key")
+            if key not in tasks:
+                continue           # 权威里没有 = 没被应用，不给它任何露面机会
+            first_evt.setdefault(key, ev["id"])
+            last_evt[key] = ev["id"]
+
+    def _order_key(k: str):
+        # 有溯源 → 按首次声明事件号；查不到溯源的（理论上只有人工改盘才会出现）
+        # 排在最后并按 key 名定序：不编造事件号，也不让它插队。
+        return (0, first_evt[k], k) if k in first_evt else (1, 0, k)
+
+    return 200, {
+        "contracts": dict(state.get("contracts") or {}),
+        "decisions": list(state.get("decisions") or []),
+        "tasks": tasks,
+        "task_order": sorted(tasks, key=_order_key),
+        "task_evt": last_evt,
+    }
 
 
 def _role_binding_projection(
@@ -709,6 +776,10 @@ def _make_handler(ws_map: dict, default_name: str):
                     if method != "GET":
                         raise _ApiError(405, "events 仅支持 GET")
                     return _ep_thread_events(ws, tid)
+                if sub == "board":
+                    if method != "GET":
+                        raise _ApiError(405, "board 仅支持 GET")
+                    return _ep_thread_board(ws, tid)
                 if sub == "status":
                     if method != "GET":
                         raise _ApiError(405, "status 仅支持 GET")
