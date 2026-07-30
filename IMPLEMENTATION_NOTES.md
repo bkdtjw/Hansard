@@ -687,3 +687,53 @@ acceptance 也过不了钩子——两层故障叠着。
   T4 交收尾工人接手(重派 2/2,现场断点:styles.css 仅 2 行+唯一红=位置断言
   用 str.index 首次出现定位、疑把函数定义误当调用点)。app.js 4 个 NUL 字节:
   用户已在独立会话跑 chip 排查,施工全程各卡自证字节计数守恒。
+
+### 控制台对齐 AionUi:T4+二轮评审+A/B 回环收官(2026-07-30,Lead 施工台账)
+
+- Q11 裁决(用户 07-30"每条记录要看到具体细节"→放行)后 T4 落地(a8ca668,收尾
+  工人接力,重派 2/2 内完成):①write_invoke_log 落 stdout 真原文,还 §14 行603
+  债(_invoke_output_text 单实现,async import 同对象,测试 `is` 断言防漂移;
+  拿不到原文退信封 repr 并显式注明,不假装);②parse_invoke_steps 纯函数(仅
+  两种流式产步骤,json/text 诚实空);③GET /steps 只读端点(解析摘要,原文不
+  经 HTTP,7 条 HTTP 用例含敏感串不外泄断言);④前端 View Steps 折叠组(lazy
+  fetch 实测 1 击=1 请求/轮询 0 放大)+「后端自述·非系统验证」标注(A 类气泡
+  强制,CSS 刻意弱于 verify 徽章,折叠组固定气泡最末不争位)+「正在处理中
+  mm:ss」走字(started_ts=deadline_ts−_timeout_for 同源逆算,§16.2 合规)。
+  唯一红裁定=测试断言用 str.index 误命中函数定义,接线本就正确(徽章 1178<
+  折叠组 1186,Lead 亲读确认)。收卡:120 绿+全量 489。
+- 二轮独立评审(4bd04df..a8ca668):**阻断 0/应修 2/建议 10**;§16 十三条复核
+  全过,冻结面零触碰(store 未进 diff、/events 元素仍 12 键、write_invoke_log
+  签名调用位不变),Q11 暴露红线逐行确认(raw_output 只进解析器)。
+- A 回环(d56c9a0,T4 owner 修):应修2 /steps 改**内容嗅探**定格式——删
+  _role_wire_format(用当前绑定推历史日志,换绑后解析出假步骤),嗅探规则:
+  先排作者信封行(三键齐;不排则散文被判流式)→opencode 结构特征(part 对象/
+  sessionID 驼峰)→stream-json 弱特征居后→平票/无票不猜(None→诚实空态);
+  sniff 签名仅 raw_text,inspect.signature 用例钉死"构造上不可能读绑定"。
+  +建议6项:name 80 截断/日志尾 4MB+500 步上限(truncated 标志)/失败路径
+  (跳闸/超时/无 json 块)也落审计日志(纯追加 helper 只吞 OSError,控制流
+  逐字不变,_BrokenStore/_WeirdStore 双用例钉死)/fixture 溯源注释改口/前端
+  kind 白名单/走字定时器 clearInterval 收口。收卡:137 绿+全量 506。
+- B 回环(01782a1,原 owner 进程亡佚,接替工人完成,Lead 亲验代收):应修1
+  黑板损坏不再装空——store 旁加 board_state_checked(§9.1 调度/恢复的宽松
+  语义**故意不动**,两套语义分工写进 docstring;错误人话只带 line/column 与
+  §9.1 自救提示,不回抄黑板内容),/board 损坏时 200+board_error,前端走
+  bd-fail 显式失败态,健康路径逐字同旧;+建议2项:yaml 报错改 _yaml_error_brief
+  (只取 problem/context+行列,Mark 源码片段不进消息,连 pyyaml 诊断词嵌的
+  anchor/alias/tag 记名都按 _QUOTED_RUN_RE 抹除)/tid 白名单 ^t-[A-Za-z0-9-]+$
+  双挂(路由入口+_require_thread,404 在碰文件系统之前,堵 .. 穿透+Store
+  自动建库面)。收卡:190 绿+全量 523。
+- 二轮评审建议处置台账(10 条全数裁决):采纳 8(建议3/4/6/7/8/10/11/12,见
+  A/B 两回环 commit);记录不改 2——①建议5 steps 的 text/thinking 摘要属
+  Q11 列举口径之外:Lead 裁量保留(用户指示细节全览;单条 120 截断+500 步
+  上限,聚合外泄量有界;原文仍不经 HTTP),此为 Q11 口径的补充解释;②建议9
+  last_raw_output 实例属性在"共享 adapter 实例跨线程并发"下会串号:仓内全部
+  调用方(_build_adapters_from_config 每线程新建+adapter_instance 复合键)
+  均不共享,属潜在面不改;若未来引入共享实例须改返回值承载,与 core.py
+  _invoke_output_text docstring 双记。评审附带指出 config 绝对路径入 config_error
+  文案:/api/workspaces 早已直出 ws 绝对路径,非新增暴露面,不处置。
+- 收官门(HEAD=01782a1):全量 `pytest -q` **523 passed, 5 skipped** + 混沌门
+  `--chaos-m5` **527 passed, 1 skipped**,均 exit 0(A 卡失败路径落盘经故障
+  注入复验)。四特性(状态泡/单聊/待办统计/View Steps)全部落地且两轮独立
+  评审应修清零;遗留待人裁仅 Q12(恢复重放不判 can_decide,root 在 store/
+  scheduler,不属控制台面)。本轮事故簿追加:B 卡工人亦进程亡佚(今晚第 4 起),
+  活已完,Lead 亲验代收——与 T3 回环同款处置。
