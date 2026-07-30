@@ -465,7 +465,7 @@ def test_thread_status_with_valid_config_yaml_unchanged(tmp_dir):
         for row in by_role.values():
             # 键名冻结面的**本意**是堵臆造键侵入行结构，不是冻结未来的呈现键：四个
             # 语义键必须齐（少一个就是回退），另允许 Lead 批准的**纯呈现**键并存
-            # ——目前只有 display_name（C1，同 started_ts 加键先例）。
+            # ——目前是 display_name（C1）与 model（C3），同 started_ts 加键先例。
             for key in ("role", "primary", "effective", "blocked"):
                 assert key in row, row
             assert row["primary"] == "claude"
@@ -475,6 +475,10 @@ def test_thread_status_with_valid_config_yaml_unchanged(tmp_dir):
             # （不臆造别名；配了才换成中文名，见 tests/test_web.py 的两条 display_name 用例）。
             assert "display_name" in row, row
             assert row["display_name"] == row["role"], row
+            # model 同理：VALID_YAML 的 roles 与 adapters 两层都没写 model → 必须是
+            # None，不许拿 adapter 名 / 角色名之类的东西凑一个"看起来像模型名"的值。
+            assert "model" in row, row
+            assert row["model"] is None, row
 
 
 # ——————————————————————————————————————————————————————————————

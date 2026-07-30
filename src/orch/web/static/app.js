@@ -199,6 +199,8 @@ function switchWorkspace(name) {
   stepsCache.clear();      // 步骤摘要按事件号存：跨工作区/线程会撞车，必须清
   stepsOpen.clear();
   clearTypingClock();      // 走字定时器也要停（建议12：否则切完还每秒空转一次）
+  memberEditRole = null;   // 改绑面板是"某工作区某角色"的上下文，跨区必须关掉（否则冻结重绘）
+  memberEditErr = "";
   renderMemberRoster();
   unseenCount = 0;
   clearTimeout(pollTimer);
@@ -548,9 +550,150 @@ function memberBindLine(row) {
   return sub("", effective);
 }
 
+// 生效模型小字（/status 投影的 model 键：role 层优先，缺省回落**主绑定** adapter 层，
+// 两处都没有 → null）。有值才出——恒态空位是噪音；值不改写也不截断（截断交给 CSS 省略号，
+// 全名进 title），把 opencode/big-pickle 砍成 big-pickle 这种"美化"会让人照抄不出能用的值。
+function memberModelLine(row) {
+  const m = (row && row.model) ? String(row.model) : "";
+  if (!m || lastConfigError) return "";
+  return `<span class="mr-model" title="${escapeHtmlAttr("生效模型：" + m)}">· ${escapeHtml(m)}</span>`;
+}
+
+// ————————————————————————————————————————————————
+// C3 名册内就地改绑（⚙）：选 CLI + 填模型 → POST /api/config/role-binding。
+// 后端做的是 config.yaml 的**行级替换**（只动那一个值 token），前端这边只负责收集
+// 两个值与显示后端的人话，绝不在前端拼 YAML。
+// ————————————————————————————————————————————————
+// 模型候选（2026-07-30 本机实测清单，纯前端常量）：按 **adapter 名的子串**猜家族。
+// 子串猜测**只影响候选提示，不影响可填值**——输入框是自由文本，datalist 只是补全；
+// 名字里恰好含 "oc" 的自定义 adapter 会被归到 opencode 档，那也只是候选列错，不拦输入。
+// 模型名的有效性引擎不可知（清单在各家 CLI 手里、联网才知道），故后端只校验"非空
+// 字符串或 null"，这里也不做任何白名单拦截。
+const MODEL_CANDIDATES = {
+  grok: ["grok-4.5", "grok-4.5-latest", "grok-latest", "grok-build-latest"],
+  kimi: ["kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed",
+         "kimi-code/k3", "kimi-code/k3-256k"],
+  opencode: ["opencode/big-pickle", "opencode/deepseek-v4-flash-free",
+             "opencode/laguna-s-2.1-free", "opencode/ling-3.0-flash-free",
+             "opencode/mimo-v2.5-free", "opencode/nemotron-3-ultra-free",
+             "opencode/north-mini-code-free", "qwen/glm-5.2", "qwen/qwen3.8-max-preview"],
+  claude: ["fable", "opus", "sonnet", "haiku"],
+};
+
+function modelCandidates(adapterName) {
+  const n = String(adapterName || "").toLowerCase();
+  if (n.includes("grok")) return MODEL_CANDIDATES.grok;
+  if (n.includes("kimi")) return MODEL_CANDIDATES.kimi;
+  if (n.includes("opencode") || n.includes("oc")) return MODEL_CANDIDATES.opencode;
+  if (n.includes("claude")) return MODEL_CANDIDATES.claude;
+  // 猜不出（自定义命名）→ 全量并集：宁可多列几行让人挑，也不给一个空下拉。
+  const all = [];
+  for (const k of Object.keys(MODEL_CANDIDATES)) {
+    for (const v of MODEL_CANDIDATES[k]) if (!all.includes(v)) all.push(v);
+  }
+  return all;
+}
+
+// 当前展开编辑区的 role id（null = 全关）；错误人话与它同生命周期。
+let memberEditRole = null;
+let memberEditErr = "";
+
+function datalistOptions(names) {
+  return names.map((n) => `<option value="${escapeHtmlAttr(n)}"></option>`).join("");
+}
+
+function memberEditPanel(row) {
+  const role = String(row.role);
+  if (memberEditRole !== role) return "";
+  // 当前主绑定要**如实**在下拉里出现，哪怕它没在 adapters 段声明（config 缺省用角色名
+  // 兜底就是这种情形）；否则下拉会显示成别的 adapter，看着像"已经改过了"。
+  const cur = row.primary ? String(row.primary) : "";
+  const names = adapterRows.map((a) => String(a.name));
+  if (cur && !names.includes(cur)) names.unshift(cur);
+  const opts = names.map((n) =>
+    `<option value="${escapeHtmlAttr(n)}"${n === cur ? " selected" : ""}>${escapeHtml(n)}</option>`
+  ).join("");
+  const dl = "mre-dl-" + role;
+  const model = row.model ? String(row.model) : "";
+  return (
+    `<div class="mr-edit-pop glass-pop" data-edit-role="${escapeHtmlAttr(role)}">` +
+      `<div class="mre-title">改 ${escapeHtml(displayOf(role))} 的绑定</div>` +
+      `<label class="mre-row"><span class="mre-lab">CLI</span>` +
+        `<select class="inp mre-adapter">${opts}</select></label>` +
+      `<label class="mre-row"><span class="mre-lab">模型</span>` +
+        `<input class="inp mre-model" list="${escapeHtmlAttr(dl)}"` +
+        ` value="${escapeHtmlAttr(model)}" placeholder="留空 = 用 adapter 段的缺省" /></label>` +
+      `<datalist id="${escapeHtmlAttr(dl)}">${datalistOptions(modelCandidates(cur))}</datalist>` +
+      `<div class="mre-hint">候选仅供参考，可手输任意值</div>` +
+      `<div class="mre-err${memberEditErr ? "" : " hidden"}">${escapeHtml(memberEditErr)}</div>` +
+      `<div class="mre-btns">` +
+        `<button class="btn-primary mr-save" data-edit-role="${escapeHtmlAttr(role)}">保存</button>` +
+        `<button class="btn-ghost mr-cancel">取消</button>` +
+      `</div>` +
+    `</div>`
+  );
+}
+
+async function toggleMemberEdit(role) {
+  const opening = memberEditRole !== String(role);
+  memberEditErr = "";
+  if (opening && !adapterRows.length) {
+    // 冷启动头一拍（可用性心跳还没回来）就点开 ⚙ 时，下拉里只会剩当前那一个 adapter。
+    // **先补齐再展开**：展开后整栏重绘被冻住（见 renderMemberRoster），晚到的
+    // adapterRows 不会自己补进来，用户会看见一个只有一项、看着像"没有别的可选"的下拉。
+    await loadAdapters(true);
+  }
+  memberEditRole = opening ? String(role) : null;
+  renderMemberRoster();
+}
+
+function closeMemberEdit() {
+  memberEditRole = null;
+  memberEditErr = "";
+  renderMemberRoster();
+}
+
+async function saveMemberBinding(role) {
+  const pop = document.querySelector(`.mr-edit-pop[data-edit-role="${CSS.escape(String(role))}"]`);
+  if (!pop) return;
+  const row = lastRoles.find((r) => String(r.role) === String(role)) || {};
+  const adapter = String(pop.querySelector(".mre-adapter").value || "").trim();
+  const model = String(pop.querySelector(".mre-model").value || "").trim();
+  const body = { role: String(role) };
+  // 只把**改动过**的字段发上去。未动的模型输入框里可能是 adapter 段的缺省值（投影是
+  // 合并后的生效值），原样回传会在 role 层凭空钉死一份多余的 model 键——语义等价，
+  // 但从此这个角色不再跟随 adapter 段缺省走，属于用户没要求的副作用。
+  if (adapter && adapter !== String(row.primary || "")) body.adapter = adapter;
+  if (model !== String(row.model || "")) body.model = model || null;
+  if (!("adapter" in body) && !("model" in body)) { closeMemberEdit(); return; }
+  try {
+    await api("/api/config/role-binding", { method: "POST", body });
+  } catch (e) {
+    // 失败留在名片内红字（后端人话原样），面板不关——用户改一改还能接着存。
+    memberEditErr = e.message;
+    const err = pop.querySelector(".mre-err");
+    if (err) { err.textContent = e.message; err.classList.remove("hidden"); }
+    return;
+  }
+  memberEditRole = null;
+  memberEditErr = "";
+  toast("已写回 config.yaml");
+  // 立刻重拉 /status：生效绑定与模型副标题即时更新，不等下一拍轮询（1.5s 的空窗
+  // 会让人以为没保存上）。applyStatusPayload 里已带名册与绑定行的重绘。
+  await loadStatus();
+  renderMemberRoster();
+}
+
 function renderMemberRoster() {
   const box = $("#member-roster");
   if (!box) return;
+  // 编辑区展开期间**暂停整栏重绘**：名册每 1.5s 一拍，重绘会清掉用户正在填的模型名
+  // 与光标（renderAdapters 那种"存了再还"救不回焦点）。代价是这几秒状态点不刷新——
+  // 保存/取消后立刻重绘补上，比"一个模型名打不完"划算得多。
+  if (memberEditRole
+      && box.querySelector(`.mr-edit-pop[data-edit-role="${CSS.escape(memberEditRole)}"]`)) {
+    return;
+  }
   if (!selectedThread) { box.className = "member-roster"; box.innerHTML = ""; return; }
   const rows = (lastRoles && lastRoles.length)
     ? lastRoles
@@ -586,7 +729,10 @@ function renderMemberRoster() {
     // 时才出一枚（降级/阻塞），一切正常时零渲染——于是"谁在给这个角色干活"平时根本
     // 看不见。名册侧常显补上这一格：降级中显式写出 primary→effective 的走向，
     // 读不出来就写"绑定未知"，绝不拿 role id 当 adapter 名充数。
+    // ⚙ 与编辑面板是 chip 的**兄弟**而非子节点：chip 是 <button>，嵌按钮/表单控件既
+    // 非法又会让点击冒泡到单聊委托上（点下拉框顺手把消息流过滤了）。
     return (
+      `<div class="mr-item">` +
       `<button class="mr-chip${active === role ? " active" : ""}"` +
       ` data-member="${escapeHtmlAttr(role)}" title="${escapeHtmlAttr(tip)}">` +
         `<span class="mr-dot d-${escapeHtmlAttr(dotCls)}"></span>` +
@@ -595,9 +741,13 @@ function renderMemberRoster() {
             `<span class="mr-name" style="color:${col}">${escapeHtml(displayOf(role))}</span>` +
             badge +
           `</span>` +
-          memberBindLine(r) +
+          `<span class="mr-subrow">` + memberBindLine(r) + memberModelLine(r) + `</span>` +
         `</span>` +
-      `</button>`
+      `</button>` +
+      `<button class="mr-edit" data-edit-role="${escapeHtmlAttr(role)}"` +
+      ` title="${escapeHtmlAttr("改这个角色的 CLI 与模型（写回 config.yaml 的对应行）")}">⚙</button>` +
+      memberEditPanel(r) +
+      `</div>`
     );
   }).join("");
   const note = terminal
@@ -761,6 +911,8 @@ async function selectThread(tid) {
   // #send-to 由 populateSendTo 重建 options（value 自然回到兜底首项），故此处只清标记。
   filterState.roles = null;
   lastActiveMember = null;
+  memberEditRole = null;  // 改绑面板属上一条线程的上下文，切线程即关（否则名册重绘被冻住）
+  memberEditErr = "";
   $$("#filter-roles input:checked").forEach((c) => { c.checked = false; });
   updateFilterUI();
   renderMemberRoster();
@@ -1822,7 +1974,9 @@ function renderTypingPill() {
   if (!bar) return;
   if (!typingRows.length) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
   const parts = typingRows.map((r) => {
-    const name = escapeHtml(r.role);
+    // 纯文本位 → 走显示名（C1 铁律：typingRows 里存的仍是 role id，分组/去重的机器
+    // 判据一个字不动，只有这里印出来给人看的名字换成中文名）。
+    const name = escapeHtml(displayOf(r.role));
     if (r.started_ts === null) return `${name} 正在响应`;
     // fmtDuration 已是 mm:ss（超一小时 h:mm:ss），与统计卡同一格式，不另造一套。
     const el = escapeHtml(fmtDuration(Date.now() / 1000 - r.started_ts));
@@ -2445,10 +2599,25 @@ function bind() {
   $("#btn-stop").addEventListener("click", () => { $("#more-menu").classList.add("hidden"); stopWorkspace(); });
 
   // 成员名册：点击某成员 = 专人单聊（过滤消息流 + 锁定 #send-to）；再点取消。
+  // C3：⚙/保存/取消三枚在 chip 之外，先判它们再落到单聊分支。
   const roster = $("#member-roster");
   if (roster) roster.addEventListener("click", (e) => {
+    const gear = e.target.closest(".mr-edit");
+    if (gear) { toggleMemberEdit(gear.dataset.editRole); return; }
+    const save = e.target.closest(".mr-save");
+    if (save) { saveMemberBinding(save.dataset.editRole); return; }
+    if (e.target.closest(".mr-cancel")) { closeMemberEdit(); return; }
+    if (e.target.closest(".mr-edit-pop")) return;   // 面板内的点击不触发单聊
     const chip = e.target.closest(".mr-chip");
     if (chip) toggleMemberChat(chip.dataset.member);
+  });
+  // 换 CLI → 候选清单跟着换家族（只重画 datalist，不重建面板：重建会清掉已填的值）。
+  if (roster) roster.addEventListener("change", (e) => {
+    const sel = e.target.closest(".mre-adapter");
+    if (!sel) return;
+    const pop = sel.closest(".mr-edit-pop");
+    const dl = pop && pop.querySelector("datalist");
+    if (dl) dl.innerHTML = datalistOptions(modelCandidates(sel.value));
   });
 
   $("#btn-send").addEventListener("click", sendMessage);

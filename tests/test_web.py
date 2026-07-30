@@ -1884,13 +1884,18 @@ def test_config_put_writes_atomically_via_os_replace(tmp_dir):
     """
     import inspect
 
-    from orch.web.server import _ep_config_put
+    from orch.web.server import _atomic_write_bytes, _ep_config_put
 
-    src = inspect.getsource(_ep_config_put)
+    # C3 起原子写收口成**唯一**一个 helper（行级手术端点复用同一份，不拷第二套写盘）。
+    # 三条机制断言随之落到 helper 上；再加一条"端点必须委托给它"，堵住"另开一条写路"。
+    src = inspect.getsource(_atomic_write_bytes)
     assert "os.replace(tmp, target)" in src, src
     assert "os.fsync(fh.fileno())" in src, src
     assert "fh.flush()" in src, src
-    assert ".write_text(" not in src, "写盘不得走非原子的 write_text"
+    put_src = inspect.getsource(_ep_config_put)
+    assert "_atomic_write_bytes(" in put_src, put_src
+    for s in (src, put_src):
+        assert ".write_text(" not in s, "写盘不得走非原子的 write_text"
 
     good = (
         "adapters:\n"
@@ -1907,14 +1912,397 @@ def test_config_put_writes_atomically_via_os_replace(tmp_dir):
         code, body = _req(base, "/api/config", "PUT", {"yaml": good})
         assert code == 200, (code, body)
         assert body.get("ok") is True, body
-        # 内容与请求正文逐字符相同（不加 BOM、不改内容）。**刻意**用 read_text 比：
-        # 换行口径与改造前的 write_text / state.py::_flush 完全一致（都是文本模式，
-        # Windows 上 \n → \r\n），本卡只换写法不换换行语义。
+        # 内容与请求正文**逐字节**相同（不加 BOM、不改内容、不改换行）。C3 起写盘走
+        # bytes：文本模式在 Windows 上会把 \n 悄悄转成 \r\n，而行级手术端点必须逐字节
+        # 保真——同一份文件上两条写路各持一套换行策略，会让"改一行"与"整存一次"互相
+        # 把对方的换行全文重写。故这里从 read_text 收紧成 read_bytes。
         raw_bytes = (tmp_dir / "config.yaml").read_bytes()
         assert not raw_bytes.startswith(b"\xef\xbb\xbf"), "不得写 BOM"
-        assert (tmp_dir / "config.yaml").read_text(encoding="utf-8") == good
+        assert raw_bytes == good.encode("utf-8"), raw_bytes
         assert not list(tmp_dir.glob(".config.yaml.*.tmp")), list(tmp_dir.glob(".config.yaml.*"))
         # 读回一致（display_name 是纯呈现键，PUT 不因它报错）。
         code, body = _req(base, "/api/config")
         assert code == 200, (code, body)
         assert body["yaml"] == good, body
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-14) C3 每角色选 CLI / 选模型：/status 投影加 model + POST /api/config/role-binding
+#        （config.yaml 的**行级外科手术**：只改目标行的值，其余逐字节不动）
+# ——————————————————————————————————————————————————————————————
+
+# 块式样本：adapter 行与 model 行各带一句行内注释（注释保全是本卡硬指标）。
+_BLOCK_CFG = (
+    "# 顶部说明：这一行必须原样活着\n"
+    "adapters:\n"
+    "  cli_a:\n"
+    "    kind: cli\n"
+    "    start_cmd: fake-a -p\n"
+    "  cli_b:\n"
+    "    kind: cli\n"
+    "    start_cmd: fake-b -p\n"
+    "    model: b-default\n"
+    "roles:\n"
+    "  pm:\n"
+    "    adapter: cli_a      # 主绑定：这句注释必须活着\n"
+    "    display_name: 产品经理\n"
+    "    can_decide: true\n"
+    "  moderator:\n"
+    "    adapter: cli_b\n"
+    "    model: old-model    # 模型行的注释\n"
+    "    can_decide: true\n"
+    "thread_defaults:\n"
+    "  max_rounds: 16\n"
+)
+
+# 内联式样本（演示床 hetero-ws 的真实写法：角色整条挤在一对花括号里 + 行尾注释）。
+_INLINE_CFG = (
+    "adapters:\n"
+    "  cli_a: {kind: cli, start_cmd: fake-a -p}\n"
+    "  cli_b: {kind: cli, start_cmd: fake-b -p}\n"
+    "roles:\n"
+    "  pm:        {adapter: cli_a, display_name: 产品经理, fallback: [cli_b],"
+    " can_decide: true}   # 这条行尾注释必须活着\n"
+    "  moderator: {adapter: cli_b, model: old-model, can_decide: true}\n"
+)
+
+# 命令行含 {model} 占位的 adapter：换绑到它而两层都没模型值 → §11.1 fail-closed。
+_PLACEHOLDER_CFG = (
+    "adapters:\n"
+    "  cli_a:\n"
+    "    kind: cli\n"
+    "    start_cmd: fake-a -p\n"
+    "  cli_m:\n"
+    "    kind: cli\n"
+    "    start_cmd: fake-m -m {model} -p\n"
+    "roles:\n"
+    "  pm:\n"
+    "    adapter: cli_a\n"
+)
+
+
+def _write_cfg(ws: Path, text: str) -> bytes:
+    (ws / "config.yaml").write_bytes(text.encode("utf-8"))
+    return (ws / "config.yaml").read_bytes()
+
+
+def _bind(base: str, **body):
+    return _req(base, "/api/config/role-binding", "POST", body)
+
+
+def _cfg_text(ws: Path) -> str:
+    return (ws / "config.yaml").read_bytes().decode("utf-8")
+
+
+def test_role_binding_block_replaces_adapter_value_and_keeps_comment(tmp_dir):
+    """块式：只有 adapter 那一行的**值**变了；行内注释与其余全文逐字节不动。"""
+    before = _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", adapter="cli_b")
+        assert code == 200, (code, body)
+        assert body.get("ok") is True, body
+
+    after = _cfg_text(tmp_dir)
+    assert after == _BLOCK_CFG.replace(
+        "    adapter: cli_a      # 主绑定：这句注释必须活着\n",
+        "    adapter: cli_b      # 主绑定：这句注释必须活着\n",
+    ), after
+    # 反面钉死：注释没被吞、别的角色没被波及、顶部说明还在。
+    assert "# 主绑定：这句注释必须活着" in after
+    assert "# 顶部说明：这一行必须原样活着" in after
+    assert "    model: old-model    # 模型行的注释\n" in after
+    # 差异只有一行（证明不是"重排全文恰好等价"）。
+    diff = [(a, b) for a, b in zip(before.decode("utf-8").splitlines(),
+                                   after.splitlines()) if a != b]
+    assert len(diff) == 1, diff
+    assert not list(tmp_dir.glob(".config.yaml.*.tmp"))
+
+
+def test_role_binding_block_inserts_model_line_after_adapter(tmp_dir):
+    """块式：角色原本没有 model 键 → 紧跟 adapter 行之后、同缩进插入一行。"""
+    _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", model="opencode/big-pickle")
+        assert code == 200, (code, body)
+
+    after = _cfg_text(tmp_dir)
+    assert after == _BLOCK_CFG.replace(
+        "    adapter: cli_a      # 主绑定：这句注释必须活着\n",
+        "    adapter: cli_a      # 主绑定：这句注释必须活着\n"
+        "    model: opencode/big-pickle\n",
+    ), after
+    # 插入位置与缩进都钉死（不是"随便找个地方塞进去"）。
+    lines = after.splitlines()
+    i = lines.index("    model: opencode/big-pickle")
+    assert lines[i - 1].startswith("    adapter: cli_a"), lines[i - 3:i + 2]
+
+
+def test_role_binding_block_model_null_deletes_the_key(tmp_dir):
+    """block 式 model=null → 整行删掉（回落 adapter 层缺省），其余逐字节不动。"""
+    _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="moderator", model=None)
+        assert code == 200, (code, body)
+
+    after = _cfg_text(tmp_dir)
+    assert after == _BLOCK_CFG.replace("    model: old-model    # 模型行的注释\n", ""), after
+    assert "old-model" not in after
+    # 删了 role 层的键，adapter 层的缺省还在（这正是"回落"的落点）。
+    assert "    model: b-default\n" in after
+
+
+def test_role_binding_inline_replaces_adapter_value_and_keeps_comment(tmp_dir):
+    """内联式（单行花括号）：只换花括号内 adapter 项的值；行尾注释与其余项原样。"""
+    _write_cfg(tmp_dir, _INLINE_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", adapter="cli_b")
+        assert code == 200, (code, body)
+
+    after = _cfg_text(tmp_dir)
+    assert after == _INLINE_CFG.replace("{adapter: cli_a,", "{adapter: cli_b,"), after
+    assert "# 这条行尾注释必须活着" in after
+    # 花括号内其余项（含那串对齐空格）一个字符都没动。
+    assert "display_name: 产品经理, fallback: [cli_b], can_decide: true}" in after
+
+
+def test_role_binding_inline_inserts_model_item_after_adapter(tmp_dir):
+    """内联式：没有 model 项 → 在花括号内 adapter 项之后插 `, model: <值>`。"""
+    _write_cfg(tmp_dir, _INLINE_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", adapter="cli_b", model="grok-4.5-latest")
+        assert code == 200, (code, body)
+
+    after = _cfg_text(tmp_dir)
+    assert after == _INLINE_CFG.replace(
+        "{adapter: cli_a,", "{adapter: cli_b, model: grok-4.5-latest,"), after
+    assert "# 这条行尾注释必须活着" in after
+    import yaml as _yaml
+    pm = _yaml.safe_load(after)["roles"]["pm"]
+    assert pm["adapter"] == "cli_b" and pm["model"] == "grok-4.5-latest", pm
+    assert pm["fallback"] == ["cli_b"] and pm["display_name"] == "产品经理", pm
+
+
+def test_role_binding_inline_model_null_removes_the_item(tmp_dir):
+    """内联式 model=null → 整项连同分隔逗号消失，其余项原样。"""
+    _write_cfg(tmp_dir, _INLINE_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="moderator", model=None)
+        assert code == 200, (code, body)
+
+    after = _cfg_text(tmp_dir)
+    assert after == _INLINE_CFG.replace(
+        "{adapter: cli_b, model: old-model, can_decide: true}",
+        "{adapter: cli_b, can_decide: true}"), after
+
+
+def test_role_binding_unknown_role_is_404(tmp_dir):
+    """role 不在该 config 的 roles 集合里 → 404 人话（不是 400：那是"没这个东西"）。"""
+    before = _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="nobody", adapter="cli_a")
+        assert code == 404, (code, body)
+        assert "nobody" in body["error"], body
+    assert (tmp_dir / "config.yaml").read_bytes() == before
+
+
+def test_role_binding_undeclared_adapter_is_400(tmp_dir):
+    """adapter 不在已声明集合里 → 400 人话，盘上一个字节不动（写进去也是启动即报错）。"""
+    before = _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", adapter="no_such_cli")
+        assert code == 400, (code, body)
+        assert "no_such_cli" in body["error"], body
+    assert (tmp_dir / "config.yaml").read_bytes() == before
+    assert not list(tmp_dir.glob(".config.yaml.*.tmp"))
+
+
+@pytest.mark.parametrize("cfg_text, role", [
+    # 角色的值是个裸标量（既非缩进块也非花括号）。
+    ("adapters:\n  cli_a: {kind: cli, start_cmd: fake-a -p}\n"
+     "  cli_b: {kind: cli, start_cmd: fake-b -p}\nroles:\n  pm: cli_a\n", "pm"),
+    # 当前值带引号：不是裸标量，token 边界不敢认。
+    ("adapters:\n  cli_a: {kind: cli, start_cmd: fake-a -p}\n"
+     "  cli_b: {kind: cli, start_cmd: fake-b -p}\n"
+     "roles:\n  pm:\n    adapter: 'cli_a'\n", "pm"),
+    # 流式列表跨行：块内出现不是 `键: 值` 的续行。
+    ("adapters:\n  cli_a: {kind: cli, start_cmd: fake-a -p}\n"
+     "  cli_b: {kind: cli, start_cmd: fake-b -p}\n"
+     "roles:\n  pm:\n    fallback: [\n      cli_b,\n    ]\n    adapter: cli_a\n", "pm"),
+    # 角色根本没有显式 adapter 行（主绑定按角色名兜底）：没有值可替，不猜着插。
+    ("adapters:\n  cli_b: {kind: cli, start_cmd: fake-b -p}\n"
+     "roles:\n  pm:\n    can_decide: true\n", "pm"),
+])
+def test_role_binding_unrecognized_shape_400_bytewise_unchanged(tmp_dir, cfg_text, role):
+    """认不出的写法一律 400 + 一句人话，且**盘上逐字节不变**——宁 400 不猜。"""
+    before = _write_cfg(tmp_dir, cfg_text)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role=role, adapter="cli_b")
+        assert code == 400, (code, body)
+        assert "无法安全自动修改" in body["error"], body
+        assert "手工编辑" in body["error"], body
+    assert (tmp_dir / "config.yaml").read_bytes() == before
+    assert not list(tmp_dir.glob(".config.yaml.*.tmp"))
+
+
+def test_role_binding_model_placeholder_without_value_400(tmp_dir):
+    """换到命令行含 {model} 占位的 adapter 而两层都没模型值 → §11.1 校验拦下，400 转人话。
+
+    这一条是 C2 的 fail-closed 在改绑路径上的闸门：坏配置绝不允许先落盘再报错——
+    常驻 `orch run` 每轮重读 config，落了盘它就持续拒绝启动。
+    """
+    before = _write_cfg(tmp_dir, _PLACEHOLDER_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", adapter="cli_m")
+        assert code == 400, (code, body)
+        assert "§11.1" in body["error"], body
+        assert "{model}" in body["error"], body
+        assert "cli_m" in body["error"], body
+        assert (tmp_dir / "config.yaml").read_bytes() == before, "校验不过必须一个字节不写"
+
+        # 同一次请求里连模型一起给 → 过闸并落盘（证明拦的是"缺值"不是"这个 adapter"）。
+        code, body = _bind(base, role="pm", adapter="cli_m", model="m-1")
+        assert code == 200, (code, body)
+    after = _cfg_text(tmp_dir)
+    assert "    adapter: cli_m\n    model: m-1\n" in after, after
+
+
+def test_role_binding_requires_at_least_one_field(tmp_dir):
+    """adapter 与 model 一个都不给 → 400（避免"什么都没说"的空写请求）。"""
+    before = _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm")
+        assert code == 400, (code, body)
+    assert (tmp_dir / "config.yaml").read_bytes() == before
+
+
+def test_role_binding_no_op_does_not_touch_disk(tmp_dir):
+    """删一个本就不存在的 model 键 = 无实质改动：200 + changed=false，且不写盘。"""
+    before = _write_cfg(tmp_dir, _BLOCK_CFG)
+    mtime = (tmp_dir / "config.yaml").stat().st_mtime_ns
+    with _Serving(tmp_dir) as base:
+        code, body = _bind(base, role="pm", model=None)
+        assert code == 200, (code, body)
+        assert body.get("changed") is False, body
+    assert (tmp_dir / "config.yaml").read_bytes() == before
+    assert (tmp_dir / "config.yaml").stat().st_mtime_ns == mtime
+
+
+def test_status_roles_projection_carries_effective_model(tmp_dir):
+    """/status 的 roles[] 带 model：role 层优先 → 主绑定 adapter 层缺省 → 都没有则 None。"""
+    (tmp_dir / "config.yaml").write_text(
+        "adapters:\n"
+        "  cli_a:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-a -p\n"
+        "  cli_b:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-b -p\n"
+        "    model: b-default\n"
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_b\n"
+        "    model: pm-pinned\n"
+        "  moderator:\n"
+        "    adapter: cli_b\n"
+        "  tester:\n"
+        "    adapter: cli_a\n",
+        encoding="utf-8",
+    )
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator", "tester"])
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert _roles_row(body, "pm")["model"] == "pm-pinned"        # role 层赢
+        assert _roles_row(body, "moderator")["model"] == "b-default"  # 回落 adapter 层
+        assert _roles_row(body, "tester")["model"] is None            # 两层都没有
+        # 语义键一个不动（加键不是改名）。
+        for role in ("pm", "moderator", "tester"):
+            row = _roles_row(body, role)
+            for key in ("role", "display_name", "primary", "effective", "blocked"):
+                assert key in row, row
+
+
+def test_role_binding_change_is_visible_in_status_immediately(tmp_dir):
+    """端到端：改绑后同一进程的 /status 立刻反映新 adapter 与新 model（零缓存，§16.9）。"""
+    _write_cfg(tmp_dir, _BLOCK_CFG)
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert _roles_row(body, "pm")["primary"] == "cli_a", body
+        assert _roles_row(body, "pm")["model"] is None, body
+
+        code, body = _bind(base, role="pm", adapter="cli_b", model="pinned-1")
+        assert code == 200, (code, body)
+
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        pm = _roles_row(body, "pm")
+        assert pm["primary"] == "cli_b", pm
+        assert pm["effective"] == "cli_b", pm
+        assert pm["model"] == "pinned-1", pm
+
+
+def test_app_js_member_binding_editor(tmp_dir):
+    """名册内就地改绑：⚙ + CLI 下拉 + 模型 datalist + 保存走真实 POST + 失败在名片内红字。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+
+        # ① ⚙ 与面板是 chip 的兄弟（chip 是 <button>，嵌控件会把点击冒泡成单聊）。
+        assert 'class="mr-edit" data-edit-role=' in js
+        assert "function memberEditPanel(row)" in js
+        # ② CLI 下拉的 options 来自 GET /api/adapters 的 name 列表，当前主绑定选中。
+        assert "adapterRows.map((a) => String(a.name))" in js
+        assert 'n === cur ? " selected" : ""' in js
+        # ③ 保存 = 真实 POST（不是假按钮）；成功后立刻重拉 /status 刷新副标题。
+        assert 'api("/api/config/role-binding", { method: "POST", body })' in js
+        assert "await loadStatus();" in js.split("async function saveMemberBinding", 1)[1]
+        # ④ 失败：后端人话原样进名片内红字，不 toast 走掉、面板不关。
+        save = js.split("async function saveMemberBinding", 1)[1].split("\n}\n", 1)[0]
+        assert "memberEditErr = e.message;" in save, save
+        assert 'pop.querySelector(".mre-err")' in save, save
+        # ⑤ 模型候选：四家族 + 猜不出给并集；注明只影响提示不影响可填值。
+        assert "function modelCandidates(adapterName)" in js
+        for probe in ("grok-4.5-latest", "kimi-code/k3-256k", "opencode/big-pickle",
+                      "qwen/qwen3.8-max-preview", "fable"):
+            assert probe in js, probe
+        assert "候选仅供参考，可手输任意值" in js
+        assert "不影响可填值" in js, "必须写明子串猜测只影响候选提示"
+        # ⑥ 副标题追加生效模型（有 model 才出）。
+        assert "function memberModelLine(row)" in js
+        mm = js.split("function memberModelLine(row)", 1)[1].split("\n}\n", 1)[0]
+        assert 'if (!m || lastConfigError) return "";' in mm, mm
+        assert "escapeHtml(m)" in mm and "escapeHtmlAttr(" in mm, mm
+        # ⑦ 转义口径：属性位 escapeHtmlAttr、文本位 escapeHtml（model 值来自 config，可控）。
+        panel = js.split("function memberEditPanel(row)", 1)[1].split("\n}\n", 1)[0]
+        assert 'value="${escapeHtmlAttr(model)}"' in panel, panel
+        assert 'data-edit-role="${escapeHtmlAttr(role)}"' in panel, panel
+        # ⑧ 名册每 1.5s 一拍：编辑区展开时暂停整栏重绘，否则模型名打不完。
+        roster = js.split("function renderMemberRoster()", 1)[1].split("\n}\n", 1)[0]
+        assert "memberEditRole" in roster, roster
+        # ⑨ 冷启动头一拍（心跳还没回来）就点 ⚙：**先补 adapterRows 再展开**——展开后
+        #    整栏冻结重绘，晚到的列表补不进来，下拉会只剩当前那一个，看着像"无处可选"。
+        tog = js.split("async function toggleMemberEdit(role)", 1)[1].split("\n}\n", 1)[0]
+        assert "await loadAdapters(true);" in tog, tog
+
+        code, css = _req(base, "/styles.css")
+        assert code == 200, code
+        for sel in (".mr-item", ".mr-edit-pop", ".mre-row", ".mre-err", ".mr-model"):
+            assert sel in css, sel
+        # glass 红线：新增浮层复用 .glass-pop，不得自己再引 backdrop-filter。
+        pop_css = css.split(".mr-edit-pop {", 1)[1].split("}", 1)[0]
+        assert "backdrop-filter" not in pop_css, pop_css
+
+
+def test_app_js_typing_pill_uses_display_name(tmp_dir):
+    """走字胶囊的角色名是纯文本位 → 过 displayOf；typingRows 里存的仍是 role id。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        pill = js.split("function renderTypingPill()", 1)[1].split("\n}\n", 1)[0]
+        assert "escapeHtml(displayOf(r.role))" in pill, pill
+        assert "escapeHtml(r.role)" not in pill, pill
+        # 机器判据不动：分组键仍是 String(d.target) 的 role id。
+        bar = js.split("function updateTypingBar(s)", 1)[1].split("\n}\n", 1)[0]
+        assert "const role = String(d.target);" in bar, bar
+        assert "displayOf" not in bar, bar

@@ -928,6 +928,39 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
 .mr-badge.fallback { color: #93c5fd; border-color: rgba(96, 165, 250, 0.4); }
 .mr-note { font-size: 11.5px; color: var(--txt-dim); margin-left: auto; }
 
+/* —— C3 每角色改 CLI/模型：⚙ + 就地编辑面板 ——
+   面板是 chip 的兄弟节点（chip 是 <button>，不能嵌下拉/输入框），故整块包一层
+   .mr-item 做定位锚。纯 rgba + border，**不新增 backdrop-filter**（性能红线）。 */
+.mr-item { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.mr-subrow { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+/* 生效模型小字：与绑定小字同行；过长交给省略号，全名在 title 里（不砍字符）。 */
+.mr-model {
+  font-size: 10.5px; line-height: 1.1; color: var(--txt-dim);
+  max-width: 12em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mr-edit {
+  font-family: inherit; font-size: 12px; line-height: 1; cursor: pointer;
+  padding: 4px 6px; border-radius: 999px;
+  color: var(--txt-meta); background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-brd);
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.mr-edit:hover { background: rgba(255, 255, 255, 0.12); color: var(--txt); }
+/* 底色/描边/投影一律复用 .glass-pop（与 ⋯ 菜单、筛选弹层同一档；无 blur）。 */
+.mr-edit-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+  display: flex; flex-direction: column; gap: 7px;
+  min-width: 268px; padding: 11px 12px;
+}
+.mre-title { font-size: 12px; color: var(--txt-meta); }
+.mre-row { display: flex; align-items: center; gap: 8px; }
+.mre-lab { font-size: 11.5px; color: var(--txt-dim); flex: 0 0 30px; }
+/* 覆盖 .inp 的 max-width:160px —— 面板里两个控件要撑满同一列，才对得齐。 */
+.mre-row .inp, .mre-row select.inp { flex: 1 1 auto; min-width: 0; max-width: none; }
+.mre-hint { font-size: 10.5px; color: var(--txt-dim); }
+.mre-err { font-size: 11.5px; color: var(--danger-solid); white-space: pre-wrap; }
+.mre-btns { display: flex; gap: 8px; justify-content: flex-end; }
+
 /* —— D19 门禁琥珀 banner —— */
 .gate-banner {
   flex: 0 0 auto;

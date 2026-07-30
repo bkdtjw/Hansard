@@ -290,9 +290,19 @@ def _role_binding_projection(
 ) -> list[dict]:
     """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
 
-    返回投影行，键名 {role, display_name, primary, effective, blocked}；effective=None ⇔
-    blocked=True（该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用
+    返回投影行，键名 {role, display_name, model, primary, effective, blocked}；
+    effective=None ⇔ blocked=True（该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用
     state.resolve_effective_adapter，与调度层同一判据；本函数**不写盘、不改配置**。
+
+    model（C3 追加的**纯呈现**键，同 display_name/started_ts 加键先例）= 该角色生效的
+    模型名，取值链 role 层 model → 主绑定 adapter 层 model → None。两处细节：
+      · 取值优先级与装配层的合并语义同源（`cli.main._build_adapters_from_config` 的
+        ``{**ac, **rc}``）：role 层**存在该键就赢，含显式空值**——写 ``model: ""`` 是
+        "我不要模型名"的表态，偷偷回落 adapter 层缺省等于替配置者猜（§11.1 fail-closed
+        正是要禁这个），故此处一律呈现成 None 而不是 adapter 层那个值；
+      · 回落只看**主绑定**那一段 adapter 的缺省，不看降级后的 effective：降级到异构备胎
+        时，备胎段的缺省模型名与本角色的配置无关（grok 的名字喂给 opencode 必然失败），
+        把它当"本角色的模型"展示是编造。降级中的真实走向由 effective 那一栏说。
 
     display_name（config roles 层可选键）是**纯呈现**键，与 wire_format 同类先例：
     引擎一侧无视它——模型视图只取 prompt/write_scope/tools（render/__init__.py::
@@ -318,6 +328,9 @@ def _role_binding_projection(
     if cfg_error:
         return []
     roles_cfg = cfg.get("roles") or {}
+    adapters_cfg = cfg.get("adapters")
+    if not isinstance(adapters_cfg, dict):
+        adapters_cfg = {}
     roles = clim._thread_roles(store) or [str(r) for r in roles_cfg]
     if not roles:
         return []
@@ -334,9 +347,17 @@ def _role_binding_projection(
         # 假值一律退回 role id，避免前端拿到空名字渲染出无名 chip。
         raw_name = rc.get("display_name")
         display = str(raw_name) if (raw_name and str(raw_name).strip()) else role
+        if "model" in rc:
+            raw_model = rc.get("model")
+        else:
+            ac = adapters_cfg.get(primary)
+            raw_model = ac.get("model") if isinstance(ac, dict) else None
+        model = (str(raw_model)
+                 if (raw_model is not None and str(raw_model).strip()) else None)
         out.append({
             "role": role,
             "display_name": display,
+            "model": model,
             "primary": primary,
             "effective": effective,
             "blocked": effective is None,
@@ -727,23 +748,518 @@ def _ep_config_put(ws: Path, body: dict) -> tuple[int, dict]:
         if errors:
             raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
     ws.mkdir(parents=True, exist_ok=True)
-    # 原子替换（临时文件 + flush + fsync + os.replace，照 adapters/state.py::_flush 的
-    # 既有模式）。**存在理由**：常驻 `orch run` 每轮重读 config.yaml——非原子写有一段
-    # 窗口让它读到半份文件，于是要么 adapters/roles 段读空、静默退回 Fake 后端（假绿），
-    # 要么 YAML 解析失败让整个进程报错退出。os.replace 保证盘上永远是完整的一份：
-    # 要么旧的、要么新的。临时文件与目标同目录（跨目录 rename 非原子），失败即删不留残迹。
-    target = ws / "config.yaml"
-    tmp = target.parent / f".config.yaml.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    # 写盘走**唯一**的原子写入口 _atomic_write_bytes（见那里的存在理由）。这里刻意
+    # 自己 encode 成 bytes 而不再用文本模式：文本模式在 Windows 上会把 \n 悄悄转成
+    # \r\n，而 C3 的行级手术端点必须逐字节保真——同一份 config.yaml 上两条写路各持
+    # 一套换行策略，会让"改一行"与"整存一次"互相把对方的换行全文重写，diff 全是噪音。
+    # 现在两条路一致：请求正文里是什么字节，盘上就是什么字节。
+    _atomic_write_bytes(ws / "config.yaml", raw.encode("utf-8"))
+    return 200, {"ok": True}
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """原子替换（临时文件 + flush + fsync + os.replace，照 adapters/state.py::_flush）。
+
+    **存在理由**：常驻 `orch run` 每轮重读 config.yaml——非原子写有一段窗口让它读到
+    半份文件，于是要么 adapters/roles 段读空、静默退回 Fake 后端（假绿），要么 YAML
+    解析失败让整个进程报错退出。os.replace 保证盘上永远是完整的一份：要么旧的、要么
+    新的。临时文件与目标同目录（跨目录 rename 非原子），失败即删不留残迹。
+
+    只收 bytes：调用方自己决定编码与换行，本函数一个字节都不改写。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(raw)
+        with tmp.open("wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    return 200, {"ok": True}
+
+
+# ——————————————————————————————————————————————————————————————
+# C3：POST /api/config/role-binding —— 每角色改 CLI / 改模型的**行级外科手术**。
+#
+# 改写口径（用户裁决，本文件唯一）：程序动 config.yaml 一律**只改目标行的那个值
+# token，其余逐字节不动**；认不出的写法一律 400 让人手工编辑，绝不猜。
+# 故这里刻意**不**走 safe_load → 改结构 → safe_dump 回写：那条路会把注释、缩进风格、
+# 单行花括号写法、键序、锚点全抹平，等于拿一份"语义等价但面目全非"的文件覆盖运维手写
+# 的配置（演示床的 config.yaml 里近半数行是注释与踩坑记录，抹了就没了）。
+#
+# 支持的两种现存形态（仓内演示床两份 config 各占一种，别再加第三种"顺手支持"）：
+#   块式    roles:\n  pm:\n    adapter: grok_cli\n    model: x
+#   内联式  roles:\n  pm: {adapter: grok_cli, display_name: 产品经理, …}
+# 每一步定位都要求**唯一命中**，任一步含糊即整体拒绝，盘上一个字节不动。
+# ——————————————————————————————————————————————————————————————
+
+# 允许写进 config 的裸标量字符集：不含空白/引号/井号/冒号/花括号方括号逗号。
+# 收得这么窄是刻意的——值不带引号直接落进 YAML，任何一个流式指示符都会改变语义；
+# 真实的 adapter 名与模型名（opencode/big-pickle、kimi-code/k3-256k、grok-4.5-latest…）
+# 全在这个集合内，落在集合外的名字宁可 400 让人手工加引号编辑。
+_YAML_BARE_VALUE_RE = re.compile(r"^[A-Za-z0-9_.+/@-]+$")
+
+# roles: 顶层行（冒号后除行内注释外不许有内容——`roles: {pm: …}` 这种整段内联不支持）。
+_ROLES_HEAD_RE = re.compile(r"^roles[ \t]*:[ \t]*(#.*)?$")
+
+# "键:"行/项的形状（键名限保守字符集；匹配不上即视为不认识的写法）。
+_MAP_KEY_RE = re.compile(r"^[ \t]*([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*:")
+
+
+def _hand_edit_error(reason: str) -> _ApiError:
+    """认不出的写法 → 统一一句人话（前端在名片内红字原样显示）。"""
+    return _ApiError(
+        400,
+        f"该角色的配置写法无法安全自动修改，请到配置页手工编辑（原因：{reason}；"
+        f"程序只做行级替换，认不出的写法一律不猜）",
+    )
+
+
+def _split_eol(line: str) -> tuple[str, str]:
+    """(正文, 行尾符)。行尾符原样保留，改写不许顺手统一换行。"""
+    for eol in ("\r\n", "\n", "\r"):
+        if line.endswith(eol):
+            return line[: -len(eol)], eol
+    return line, ""
+
+
+def _line_indent(line: str) -> int:
+    """行首空格数；用制表符缩进 → -1（YAML 明令禁止，也不猜等价宽度）。"""
+    n = 0
+    for ch in line:
+        if ch == " ":
+            n += 1
+        elif ch == "\t":
+            return -1
+        else:
+            break
+    return n
+
+
+def _is_skippable(line: str) -> bool:
+    """空行或整行注释：扫描时跳过——既不作块边界，也不参与缩进判定。"""
+    s = line.strip()
+    return (not s) or s.startswith("#")
+
+
+def _split_inline_comment(text: str) -> tuple[str, str]:
+    """把"值 + 可选行内注释"切成 (值区, 注释区)。
+
+    注释判据用 YAML 原规则：**前面是空白**的 ``#`` 才起注释（`a#b` 是值的一部分）。
+    这就是"注释保全"的实现点——值替换只动值区那一段，注释区原样接回去。
+    """
+    for i, ch in enumerate(text):
+        if ch == "#" and (i == 0 or text[i - 1] in " \t"):
+            return text[:i], text[i:]
+    return text, ""
+
+
+def _replace_bare_value(text: str, key: str, new_value: str) -> str:
+    """把 ``…key: <值>`` 里的**值 token** 换成 new_value；其余逐字保留。
+
+    "其余"= 缩进、键名、冒号前后空白、值后的补白、行内注释。**禁止**写成
+    ``re.sub(rf"{key}:.*$", …)`` 这类扫到行尾的贪婪式：那会把 ``# 注释`` 一起吞掉，
+    而注释保全是本卡的硬指标。
+    """
+    m = re.match(r"^([ \t]*" + re.escape(key) + r"[ \t]*:)([ \t]*)(.*)$", text)
+    if not m:
+        raise _hand_edit_error(f"{key} 那一行不是 `键: 值` 的形状")
+    head, gap, rest = m.group(1), m.group(2), m.group(3)
+    if not gap:
+        # `key:value` 在 YAML 里整体是一个标量而非映射项，改它等于改错东西。
+        raise _hand_edit_error(f"{key} 的冒号后缺空格，不构成映射项")
+    value_region, comment = _split_inline_comment(rest)
+    value = value_region.rstrip(" \t")
+    pad = value_region[len(value):]          # 值与注释之间的补白，原样留住
+    if not _YAML_BARE_VALUE_RE.match(value):
+        raise _hand_edit_error(f"{key} 的当前值 {value!r} 不是裸标量（引号/流式/空值不改）")
+    return head + gap + new_value + pad + comment
+
+
+def _flow_scan(text: str, start: int) -> int:
+    """从 text[start] 处的 ``{`` 出发找**同一行内**配对的 ``}``；找不到 → -1。
+
+    引号内的字符一律不计（含 ``{}``/``[]``/``,``）；遇到 YAML 流式里的注释起点
+    （前有空白的 ``#``）即放弃——那说明花括号跨了行，本卡只认单行内联式。
+    """
+    depth = 0
+    quote = ""
+    for i in range(start, len(text)):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+            continue
+        if ch == "#" and i > start and text[i - 1] in " \t":
+            return -1
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return i if ch == "}" else -1
+            if depth < 0:
+                return -1
+    return -1
+
+
+def _flow_split(inside: str) -> list[str]:
+    """按**顶层**逗号切分流式映射的内容，每段保留原文（含两侧空白）。
+
+    切的是逗号字符本身，故 ``",".join(段)`` 能逐字节还原 inside —— 未被改动的项
+    因此一个字符都不会漂移。引号与嵌套 ``{}``/``[]`` 内的逗号不切。
+    """
+    segs: list[str] = []
+    depth = 0
+    quote = ""
+    cur = []
+    for ch in inside:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+            cur.append(ch)
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            segs.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    segs.append("".join(cur))
+    if len(segs) == 1 and not segs[0].strip():
+        return []                     # `{}` 空映射
+    return segs
+
+
+def _seg_key(seg: str) -> str | None:
+    m = _MAP_KEY_RE.match(seg)
+    return m.group(1) if m else None
+
+
+def _locate_role_line(lines: list[str], role: str) -> tuple[int, int, int]:
+    """定位角色键行 → (行下标, roles 段结束下标, 角色键缩进)。
+
+    三次唯一性检查，任一步含糊即抛 400：顶层 roles: 行唯一；段内首个有效行确定角色键
+    缩进；该缩进上叫 role 的键唯一。
+    """
+    heads = [i for i, ln in enumerate(lines)
+             if _ROLES_HEAD_RE.match(_split_eol(ln)[0])]
+    if len(heads) != 1:
+        raise _hand_edit_error(
+            "找不到唯一的顶层 `roles:` 段" if not heads else "文件里有多个顶层 `roles:` 段")
+    start = heads[0] + 1
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if _is_skippable(lines[i]):
+            continue
+        if _line_indent(lines[i]) <= 0:
+            end = i
+            break
+    role_indent = None
+    for i in range(start, end):
+        if _is_skippable(lines[i]):
+            continue
+        role_indent = _line_indent(lines[i])
+        break
+    if role_indent is None or role_indent <= 0:
+        raise _hand_edit_error("roles 段下没有缩进的角色键")
+    key_re = re.compile(r"^[ \t]*" + re.escape(role) + r"[ \t]*:")
+    hits = [i for i in range(start, end)
+            if not _is_skippable(lines[i])
+            and _line_indent(lines[i]) == role_indent
+            and key_re.match(lines[i])]
+    if len(hits) != 1:
+        raise _hand_edit_error(
+            f"roles 段里 {role} 这一行定位不唯一（命中 {len(hits)} 处）")
+    return hits[0], end, role_indent
+
+
+def _edit_block_role(lines: list[str], ridx: int, end: int, role_indent: int,
+                     role: str, adapter: str | None, model: str | None,
+                     set_model: bool, dominant_eol: str) -> list[str]:
+    """块式（role 键下缩进若干 `键: 值` 行）的改写。"""
+    sub_start = ridx + 1
+    sub_end = end
+    for i in range(sub_start, end):
+        if _is_skippable(lines[i]):
+            continue
+        if _line_indent(lines[i]) <= role_indent:
+            sub_end = i
+            break
+    sub_indent = None
+    for i in range(sub_start, sub_end):
+        if _is_skippable(lines[i]):
+            continue
+        sub_indent = _line_indent(lines[i])
+        break
+    if sub_indent is None or sub_indent <= role_indent:
+        raise _hand_edit_error(f"角色 {role} 的缩进块是空的或缩进异常")
+
+    def _find(key: str) -> list[int]:
+        kre = re.compile(r"^[ \t]*" + re.escape(key) + r"[ \t]*:")
+        out = []
+        for i in range(sub_start, sub_end):
+            ln = lines[i]
+            if _is_skippable(ln):
+                continue
+            ind = _line_indent(ln)
+            if ind > sub_indent:
+                continue                    # 更深 = 嵌套内容（块标量/子映射），不是本角色的直接键
+            if ind < sub_indent:
+                raise _hand_edit_error(f"角色 {role} 块内缩进不齐（{ind} < {sub_indent}）")
+            if not _MAP_KEY_RE.match(ln):
+                # 列表项、流式续行、`]` 收尾行…… 都落这里：结构超出行级替换的把握范围。
+                raise _hand_edit_error(f"角色 {role} 块内出现非 `键: 值` 的行")
+            if kre.match(ln):
+                out.append(i)
+        return out
+
+    adapter_hits = _find("adapter")
+    out = list(lines)
+    if adapter is not None:
+        if len(adapter_hits) != 1:
+            raise _hand_edit_error(
+                f"角色 {role} 没有显式的 adapter 行（主绑定按角色名兜底）"
+                if not adapter_hits else f"角色 {role} 有多行 adapter")
+        body, eol = _split_eol(out[adapter_hits[0]])
+        out[adapter_hits[0]] = _replace_bare_value(body, "adapter", adapter) + eol
+    if not set_model:
+        return out
+    model_hits = _find("model")
+    if len(model_hits) > 1:
+        raise _hand_edit_error(f"角色 {role} 有多行 model")
+    if model is None:
+        if model_hits:
+            del out[model_hits[0]]          # 整行删（含其行内注释——那句注释是在说这个键）
+        return out
+    if model_hits:
+        body, eol = _split_eol(out[model_hits[0]])
+        out[model_hits[0]] = _replace_bare_value(body, "model", model) + eol
+        return out
+    # 插入：紧跟 adapter 行之后、同缩进新起一行；没有 adapter 行则放块首。
+    # （YAML 映射键无序，位置纯粹为了好读，不影响语义。）
+    anchor = adapter_hits[0] if adapter_hits else None
+    if anchor is None:
+        for i in range(sub_start, sub_end):
+            if not _is_skippable(out[i]):
+                anchor = i
+                break
+    if anchor is None:
+        raise _hand_edit_error(f"角色 {role} 块内找不到插入锚点")
+    _, anchor_eol = _split_eol(out[anchor])
+    new_line = " " * sub_indent + f"model: {model}"
+    if anchor_eol:
+        out.insert(anchor + 1, new_line + anchor_eol)
+    else:
+        # 锚点是没有末尾换行的文件末行：给它补上，新行自己不带（保持"原本没有末尾换行"）。
+        out[anchor] = out[anchor] + dominant_eol
+        out.insert(anchor + 1, new_line)
+    return out
+
+
+def _edit_inline_role(lines: list[str], ridx: int, role: str, head_end: int,
+                      adapter: str | None, model: str | None,
+                      set_model: bool) -> list[str]:
+    """内联式（`pm: {adapter: …, …}` 单行花括号）的改写。"""
+    body, eol = _split_eol(lines[ridx])
+    open_at = body.index("{", head_end)
+    close_at = _flow_scan(body, open_at)
+    if close_at < 0:
+        raise _hand_edit_error(f"角色 {role} 的花括号没有在同一行内闭合")
+    tail = body[close_at + 1:]
+    if tail.strip() and not tail.lstrip().startswith("#"):
+        raise _hand_edit_error(f"角色 {role} 的花括号之后还有内容")
+    segs = _flow_split(body[open_at + 1:close_at])
+    for seg in segs:
+        if _seg_key(seg) is None:
+            raise _hand_edit_error(f"角色 {role} 花括号内有不是 `键: 值` 的项")
+
+    def _idx(key: str) -> list[int]:
+        return [i for i, s in enumerate(segs) if _seg_key(s) == key]
+
+    adapter_idx = _idx("adapter")
+    if adapter is not None:
+        if len(adapter_idx) != 1:
+            raise _hand_edit_error(
+                f"角色 {role} 花括号内没有 adapter 项（主绑定按角色名兜底）"
+                if not adapter_idx else f"角色 {role} 花括号内有多个 adapter 项")
+        segs[adapter_idx[0]] = _replace_bare_value(segs[adapter_idx[0]], "adapter", adapter)
+    if set_model:
+        model_idx = _idx("model")
+        if len(model_idx) > 1:
+            raise _hand_edit_error(f"角色 {role} 花括号内有多个 model 项")
+        if model is None:
+            if model_idx:
+                segs.pop(model_idx[0])      # 整项删（连同它前面那个逗号，由 join 自然消掉）
+        elif model_idx:
+            segs[model_idx[0]] = _replace_bare_value(segs[model_idx[0]], "model", model)
+        else:
+            pos = (adapter_idx[0] + 1) if adapter_idx else len(segs)
+            segs.insert(pos, f" model: {model}")
+    out = list(lines)
+    out[ridx] = body[: open_at + 1] + ",".join(segs) + body[close_at:] + eol
+    return out
+
+
+def _edit_role_binding_text(raw: str, role: str, *, adapter: str | None,
+                            model: str | None, set_model: bool) -> str:
+    """在 config.yaml **原文**上做行级替换，返回新全文；认不出的写法抛 _ApiError(400)。
+
+    纯函数：不读盘、不写盘。调用方负责改写后的自证（可解析 + 目标键就是想要的值 +
+    其余解析产物完全相等 + §11.1 校验）与原子落盘。
+    """
+    lines = raw.splitlines(keepends=True)
+    ridx, end, role_indent = _locate_role_line(lines, role)
+    body, _eol = _split_eol(lines[ridx])
+    key_re = re.compile(r"^[ \t]*" + re.escape(role) + r"[ \t]*:")
+    head_end = key_re.match(body).end()
+    rest = body[head_end:]
+    dominant_eol = "\r\n" if "\r\n" in raw else "\n"
+    if rest.lstrip().startswith("{"):
+        out = _edit_inline_role(lines, ridx, role, head_end, adapter, model, set_model)
+    elif (not rest.strip()) or rest.lstrip().startswith("#"):
+        out = _edit_block_role(lines, ridx, end, role_indent, role,
+                               adapter, model, set_model, dominant_eol)
+    else:
+        raise _hand_edit_error(
+            f"角色 {role} 的值既不是缩进块也不是单行花括号（实得 {rest.strip()[:24]!r}）")
+    return "".join(out)
+
+
+def _ep_config_role_binding(ws: Path, body: dict) -> tuple[int, dict]:
+    """POST /api/config/role-binding —— 改某角色的主绑定 adapter 与/或模型名。
+
+    入参 {role, adapter?, model?}：adapter 与 model 至少给一项；``model: null`` 是
+    **显式删键**（回落 adapter 层缺省），与"不传 model"是两回事。fallback 不在本端点。
+
+    校验分工（各管各的，不互相兜底）：
+      · role   —— 必须在**该 config 的 roles 集合**内，不在 → 404（不是 400：那是"没有
+                  这个东西"，不是"参数写错了"）；
+      · adapter—— 必须在已声明的 adapters 集合内，不在 → 400（写进去也是启动即报错）；
+      · model  —— 只查"非空字符串或 null"。**不查名字有效性**：模型清单在各家 CLI 手里、
+                  联网才知道，把清单写进代码等于每次供应商改名就撒谎（与
+                  ``state.validate_availability_config`` 规则 3 的边界同源）。UI 侧的候选
+                  下拉是提示，不是判据。
+    """
+    import copy
+
+    import yaml  # pyyaml 已在依赖白名单
+
+    from orch.adapters.state import validate_availability_config
+
+    role = body.get("role")
+    if not role or not isinstance(role, str):
+        raise _ApiError(400, "role 必填（字符串）")
+    role = role.strip()
+    has_adapter, has_model = "adapter" in body, "model" in body
+    if not has_adapter and not has_model:
+        raise _ApiError(400, "adapter 与 model 至少给一项")
+    adapter = None
+    if has_adapter:
+        adapter = body.get("adapter")
+        if not isinstance(adapter, str) or not adapter.strip():
+            raise _ApiError(400, "adapter 必须是非空字符串")
+        adapter = adapter.strip()
+        if not _YAML_BARE_VALUE_RE.match(adapter):
+            raise _ApiError(400, f"adapter 名 {adapter!r} 含无法安全写入 YAML 的字符")
+    model = None
+    if has_model:
+        model = body.get("model")
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise _ApiError(
+                    400, "model 必须是非空字符串；要清除该角色的模型请传 null"
+                         "（回落到 adapter 段的缺省）")
+            model = model.strip()
+            if not _YAML_BARE_VALUE_RE.match(model):
+                raise _ApiError(
+                    400, f"模型名 {model!r} 含空白/引号等字符，无法安全写成裸标量，"
+                         f"请到配置页手工编辑")
+
+    target = clim._workspace_config_path(ws)
+    try:
+        raw_bytes = target.read_bytes()
+    except FileNotFoundError:
+        raise _ApiError(404, f"该工作区还没有 config.yaml，无从改角色 {role} 的绑定")
+    except OSError as exc:
+        raise _ApiError(500, f"config.yaml 读取失败：{clim._one_line(exc)}") from exc
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ApiError(400, "config.yaml 不是 UTF-8 编码，无法安全自动修改，请手工编辑") from exc
+    try:
+        before = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        # 先修语法再改绑：坏文件上做行级替换 = 在看不懂的东西上动刀。
+        raise _ApiError(
+            400, "config.yaml 当前无法解析（语法错），请先到配置页修好再改绑") from exc
+    if not isinstance(before, dict):
+        raise _ApiError(400, "config.yaml 顶层不是映射，无法改绑")
+    roles_cfg = before.get("roles")
+    if not isinstance(roles_cfg, dict) or role not in roles_cfg:
+        raise _ApiError(404, f"config.yaml 的 roles 段里没有角色 {role}")
+    adapters_cfg = before.get("adapters")
+    if not isinstance(adapters_cfg, dict):
+        adapters_cfg = {}
+    if adapter is not None and adapter not in adapters_cfg:
+        raise _ApiError(
+            400, f"adapters 段未声明 {adapter}：请先在配置页声明它，再来改绑")
+
+    new_raw = _edit_role_binding_text(
+        raw, role, adapter=adapter, model=model, set_model=has_model)
+    if new_raw == raw:
+        # 没有实质改动（如删一个本就不存在的 model 键）：不写盘，盘上一个字节不动。
+        return 200, {"ok": True, "changed": False, "role": role}
+
+    # —— 改写后的三重自证（全过才落盘；任一条不过 = 盘上一个字节不动）——
+    try:
+        after = yaml.safe_load(new_raw)
+    except yaml.YAMLError as exc:
+        raise _hand_edit_error("改写后的 config 反而解析不了") from exc
+    rc_after = after.get("roles", {}).get(role) if isinstance(after, dict) else None
+    if not isinstance(rc_after, dict):
+        raise _hand_edit_error("改写后角色段的形状变了")
+    # ① 目标键确实变成了想要的值（防止引号/转义把值写成别的东西）。
+    if adapter is not None and str(rc_after.get("adapter")) != adapter:
+        raise _hand_edit_error("改写后 adapter 的值与请求不符")
+    if has_model:
+        if model is None and "model" in rc_after:
+            raise _hand_edit_error("model 键没能删掉")
+        if model is not None and str(rc_after.get("model")) != model:
+            raise _hand_edit_error("改写后 model 的值与请求不符")
+    # ② 其余配置**一个键都没波及**：把本次刻意改的键抹平后两份解析产物必须完全相等。
+    #    字节层面由行级替换保证，这一条是语义层面的第二道闸（防定位错行改到别人头上）。
+    b2, a2 = copy.deepcopy(before), copy.deepcopy(after)
+    for doc in (b2, a2):
+        rc = doc.get("roles", {}).get(role)
+        if isinstance(rc, dict):
+            if adapter is not None:
+                rc.pop("adapter", None)
+            if has_model:
+                rc.pop("model", None)
+    if b2 != a2:
+        raise _hand_edit_error("改写波及了本次目标之外的配置")
+    # ③ §11.1 装载期校验前置到写盘之前（与 PUT /api/config 同一函数、同一口径）：
+    #    换到命令行含 {model} 占位的 adapter 而两层都没模型值，就在这里被拦下。
+    errors = validate_availability_config(after)
+    if errors:
+        raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
+
+    _atomic_write_bytes(target, new_raw.encode("utf-8"))
+    return 200, {"ok": True, "changed": True, "role": role,
+                 "adapter": rc_after.get("adapter"), "model": rc_after.get("model")}
 
 
 # ——————————————————————————————————————————————————————————————
@@ -1040,6 +1556,13 @@ def _make_handler(ws_map: dict, default_name: str):
                 if method == "PUT":
                     return _ep_config_put(ws, body)
                 raise _ApiError(405, "config 仅支持 GET/PUT")
+
+            # C3：结构化改绑（行级外科手术）。与 PUT /api/config 的"整份文本覆盖"
+            # 并存而不重叠：整存是运维在配置页手改全文，本端点是名册上点两下改一个值。
+            if parts == ["api", "config", "role-binding"]:
+                if method != "POST":
+                    raise _ApiError(405, "config/role-binding 仅支持 POST")
+                return _ep_config_role_binding(ws, body)
 
             if parts == ["api", "metrics"]:
                 if method != "GET":
