@@ -1689,3 +1689,232 @@ def test_app_js_typing_pill_counts_up_from_started_ts(tmp_dir):
         assert "正在响应" in js
         # 计时只是展示：不得参与任何调度判定（注释显式声明）。
         assert "不参与任何调度判定" in js
+
+
+# ——————————————————————————————————————————————————————————————
+# (w-13) C1 控制台人性化：display_name 纯呈现键 + PUT /api/config 写盘加固
+# ——————————————————————————————————————————————————————————————
+
+def _cfg_with_display_names(ws: Path, *, pm_name: str | None = "产品经理") -> None:
+    """workspace config：pm 配（或不配）display_name，moderator 一律不配。
+
+    两个 adapter 都是 cli 型且 fallback 已声明 → 过 §11.1 校验（本组用例关心的是
+    display_name 的投影，不是校验分支）。
+    """
+    pm_line = f"    display_name: {pm_name}\n" if pm_name is not None else ""
+    (ws / "config.yaml").write_text(
+        "adapters:\n"
+        "  cli_a:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-a -p\n"
+        "  cli_b:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-b -p\n"
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_a\n"
+        + pm_line +
+        "    fallback: [cli_b]\n"
+        "    can_decide: true\n"
+        "  moderator:\n"
+        "    adapter: cli_b\n"
+        "    can_decide: true\n",
+        encoding="utf-8",
+    )
+
+
+def _roles_row(body: dict, role: str) -> dict:
+    rows = body.get("roles") or []
+    return next(r for r in rows if r["role"] == role)
+
+
+def test_status_roles_projection_carries_display_name(tmp_dir):
+    """配了 display_name → 投影带出中文名；role/primary/effective/blocked 一个不动。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        _cfg_with_display_names(tmp_dir)
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        pm = _roles_row(body, "pm")
+        assert pm["display_name"] == "产品经理", pm
+        # role id 仍是权威键：显示名绝不顶替它（机器匹配全靠它）。
+        assert pm["role"] == "pm", pm
+        assert pm["primary"] == "cli_a", pm
+        assert pm["effective"] == "cli_a", pm
+        assert pm["blocked"] is False, pm
+
+
+def test_status_roles_display_name_defaults_to_role_id(tmp_dir):
+    """没配 display_name（以及 config 里写成空值）→ 等于 role id 本身，不臆造别名。"""
+    with _Serving(tmp_dir) as base:
+        tid = _new_thread(base, roles=["pm", "moderator"])
+        _cfg_with_display_names(tmp_dir, pm_name=None)
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        for role in ("pm", "moderator"):
+            row = _roles_row(body, role)
+            assert row["display_name"] == role, row
+
+        # 空串/null 也一律退回 role id（假值不得渲染成无名 chip）。
+        _cfg_with_display_names(tmp_dir, pm_name='""')
+        code, body = _req(base, f"/api/threads/{tid}/status")
+        assert code == 200, (code, body)
+        assert _roles_row(body, "pm")["display_name"] == "pm", body
+
+
+def test_app_js_display_name_only_in_human_readable_slots(tmp_dir):
+    """铁律断言：displayOf 只进文本位；一切机器匹配位仍是 role id。
+
+    错配比不显示更坏——单聊/筛选/路由靠 role id 比对，混进显示名会静默切断整条链。
+    故逐一钉住：option.value、筛选 checkbox 的 value、dataset.member、CSS 类 r-{role}、
+    isMemberRelated/activeMemberRole 的比较键。
+    """
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "function displayOf(role)" in js
+
+        # ① #send-to 的 option：value=role id，只有 textContent 换显示名。
+        assert "o.value = r; o.textContent = displayOf(r);" in js
+        assert "o.value = displayOf" not in js
+
+        # ② 筛选 chip：checkbox value 仍走 escapeHtmlAttr(r)（原文 id），标签才用显示名。
+        fn = js.split("function populateFilterRoles(roles)", 1)
+        assert len(fn) == 2, "populateFilterRoles 应存在"
+        body = fn[1].split("\n}\n", 1)[0]
+        assert 'value="${escapeHtmlAttr(r)}"' in body, body
+        assert "escapeHtml(displayOf(r))" in body, body
+        assert "value=\"${escapeHtmlAttr(displayOf" not in body, body
+
+        # ③ 名册 chip：dataset 与高亮比较键都是 role id，只有 .mr-name 用显示名。
+        fn = js.split("function renderMemberRoster()", 1)
+        assert len(fn) == 2, "renderMemberRoster 应存在"
+        body = fn[1].split("\n}\n", 1)[0]
+        assert 'data-member="${escapeHtmlAttr(role)}"' in body, body
+        assert 'active === role ? " active" : ""' in body, body
+        assert 'class="mr-name" style="color:${col}">${escapeHtml(displayOf(role))}' in body, body
+
+        # ④ 单聊比较键 / 焦点判据 / CSS 类：一处 displayOf 都不许出现。
+        for fn_name in ("function isMemberRelated(ev, role)",
+                        "function activeMemberRole()",
+                        "function toggleMemberChat(role)",
+                        "function readFilters()"):
+            assert fn_name in js, fn_name
+            body = js.split(fn_name, 1)[1].split("\n}\n", 1)[0]
+            assert "displayOf" not in body, (fn_name, body)
+        assert "div.className = `bubble r-${ev.sender" in js, "CSS 类必须仍用 role id"
+
+        # ⑤ display_name 是用户可控文本 → 每处用法必须过转义：要么 escapeHtml(displayOf(…))
+        # 进 innerHTML，要么赋给 textContent（DOM 自动转义）。裸 ${displayOf(…)} 拼进
+        # innerHTML 就是一个 XSS 缺口（config.yaml 可写 → 可控）。
+        allowed_prefixes = ("escapeHtml(", "textContent = ", "function ")
+        naked = []
+        idx = js.find("displayOf(")
+        while idx != -1:
+            head = js[:idx]
+            if not any(head.endswith(p) for p in allowed_prefixes):
+                naked.append(js[max(0, idx - 60):idx + 30])
+            idx = js.find("displayOf(", idx + 1)
+        assert not naked, f"displayOf 未过转义的用法：{naked}"
+        assert js.count("escapeHtml(displayOf(") >= 5, js.count("escapeHtml(displayOf(")
+
+
+def test_app_js_member_roster_always_shows_effective_binding(tmp_dir):
+    """名册常显生效 CLI 名：降级中标 primary→effective，blocked 沿用 ⛔，读不出来写"绑定未知"。"""
+    with _Serving(tmp_dir) as base:
+        code, js = _req(base, "/app.js")
+        assert code == 200, code
+        assert "function memberBindLine(row)" in js
+        body = js.split("function memberBindLine(row)", 1)[1].split("\n}\n", 1)[0]
+        assert "降级中" in body, body
+        assert "${primary}→${effective}" in body, body
+        assert "⛔ 无可用适配器" in body, body
+        assert "绑定未知" in body, body
+        # 常显（不是"有话要说才渲染"）：正常态也返回一枚带 effective 的小字。
+        assert "return sub(\"\", effective);" in body, body
+        # 名册侧新增，#role-bindings 的既有"无话不渲染"逻辑不动。
+        rb = js.split("function renderRoleBindings()", 1)[1].split("\n}\n", 1)[0]
+        assert 'if (!notable.length) { el.innerHTML = ""; return; }' in rb, rb
+        code, css = _req(base, "/styles.css")
+        assert code == 200, code
+        assert ".mr-sub" in css and ".mr-sub.degraded" in css and ".mr-sub.blocked" in css
+        # glass 风格红线：本次新增不得引入 backdrop-filter。
+        sub_css = css.split(".mr-sub {", 1)[1].split("}", 1)[0]
+        assert "backdrop-filter" not in sub_css, sub_css
+
+
+_BAD_FALLBACK_YAML = (
+    "adapters:\n"
+    "  cli_a:\n"
+    "    kind: cli\n"
+    "    start_cmd: fake-a -p\n"
+    "roles:\n"
+    "  pm:\n"
+    "    adapter: cli_a\n"
+    "    fallback: [no_such_adapter]\n"
+)
+
+
+def test_config_put_rejects_semantically_invalid_config_bytewise_unchanged(tmp_dir):
+    """能解析 ≠ 合法：fallback 指向未声明 adapter → 400 人话，盘上文件**逐字节**未变。
+
+    §11.1 校验前置到写盘之前的理由：常驻 orch run 每轮重读 config，坏配置一旦落盘就会
+    让它持续拒绝启动，而控制台此前会回 ok:true 让运维以为保存成功了。
+    """
+    good = "adapters: {}\nroles: {}\n"
+    (tmp_dir / "config.yaml").write_text(good, encoding="utf-8")
+    before = (tmp_dir / "config.yaml").read_bytes()
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, "/api/config", "PUT", {"yaml": _BAD_FALLBACK_YAML})
+        assert code == 400, (code, body)
+        assert "error" in body, body
+        assert "no_such_adapter" in body["error"], body
+        assert "§11.1" in body["error"], body
+    after = (tmp_dir / "config.yaml").read_bytes()
+    assert after == before, "校验不通过必须一个字节都不写"
+    # 临时文件不得残留（原子替换失败/未发生都不留残迹）。
+    assert not list(tmp_dir.glob(".config.yaml.*.tmp")), list(tmp_dir.glob(".config.yaml.*"))
+
+
+def test_config_put_writes_atomically_via_os_replace(tmp_dir):
+    """合法 → 写入且走原子替换（tmp + flush + fsync + os.replace），无 tmp 残留。
+
+    代码断言 os.replace：非原子写会让常驻 run 读到半份文件（静默降级 Fake 或进程退出），
+    这条判据只能在源码层钉住——HTTP 层看不出写法。
+    """
+    import inspect
+
+    from orch.web.server import _ep_config_put
+
+    src = inspect.getsource(_ep_config_put)
+    assert "os.replace(tmp, target)" in src, src
+    assert "os.fsync(fh.fileno())" in src, src
+    assert "fh.flush()" in src, src
+    assert ".write_text(" not in src, "写盘不得走非原子的 write_text"
+
+    good = (
+        "adapters:\n"
+        "  cli_a:\n"
+        "    kind: cli\n"
+        "    start_cmd: fake-a -p\n"
+        "roles:\n"
+        "  pm:\n"
+        "    adapter: cli_a\n"
+        "    display_name: 产品经理\n"
+        "    fallback: [cli_a]\n"
+    )
+    with _Serving(tmp_dir) as base:
+        code, body = _req(base, "/api/config", "PUT", {"yaml": good})
+        assert code == 200, (code, body)
+        assert body.get("ok") is True, body
+        # 内容与请求正文逐字符相同（不加 BOM、不改内容）。**刻意**用 read_text 比：
+        # 换行口径与改造前的 write_text / state.py::_flush 完全一致（都是文本模式，
+        # Windows 上 \n → \r\n），本卡只换写法不换换行语义。
+        raw_bytes = (tmp_dir / "config.yaml").read_bytes()
+        assert not raw_bytes.startswith(b"\xef\xbb\xbf"), "不得写 BOM"
+        assert (tmp_dir / "config.yaml").read_text(encoding="utf-8") == good
+        assert not list(tmp_dir.glob(".config.yaml.*.tmp")), list(tmp_dir.glob(".config.yaml.*"))
+        # 读回一致（display_name 是纯呈现键，PUT 不因它报错）。
+        code, body = _req(base, "/api/config")
+        assert code == 200, (code, body)
+        assert body["yaml"] == good, body

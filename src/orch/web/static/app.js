@@ -319,6 +319,19 @@ function blockedRolesOf() {
   return lastRoles.filter((r) => r.blocked).map((r) => String(r.role));
 }
 
+// 角色中文显示名（config roles 层可选键 display_name，由 /status 的 roles[] 投影带来）。
+// **铁律：本函数的返回值只许进人类可读文本位**——CSS 类 r-{role}、筛选 checkbox 的
+// value、#send-to 的 option.value、dataset.*、isMemberRelated/toggleMemberChat 的比较键
+// 一律仍用 role id。混进任何一处机器匹配位，单聊/筛选/路由会静默错配（错配比不显示更坏）。
+// 查不到投影（config 读不出来、/status 还没回来、human/system 这类非 config 角色）→
+// 原样返回 role id，不猜中文。
+function displayOf(role) {
+  const key = String(role == null ? "" : role);
+  const row = lastRoles.find((r) => String(r.role) === key);
+  const name = row && row.display_name;
+  return (name && String(name)) || key;
+}
+
 function renderRoleBindings() {
   const el = $("#role-bindings");
   if (!el) return;
@@ -332,7 +345,8 @@ function renderRoleBindings() {
   const notable = rows.filter((r) => r.blocked || r.effective !== r.primary);
   if (!notable.length) { el.innerHTML = ""; return; }
   el.innerHTML = notable.map((r) => {
-    const role = escapeHtml(String(r.role));
+    // chip 文案走显示名（人类可读位）；primary/effective 是 adapter 名，与显示名无关。
+    const role = escapeHtml(displayOf(r.role));
     const primary = escapeHtml(String(r.primary));
     if (r.blocked) {
       return `<span class="rb-chip blocked" title="主绑定 ${primary} 与全部备胎均已停用：` +
@@ -513,6 +527,27 @@ function toggleMemberChat(role) {
   readFilters();   // 重渲染事件流 + 筛选 chips + 名册高亮（readFilters 内已带上名册）
 }
 
+// 名册 chip 的常显副标题（生效绑定一行小字）。输入是 /status 的 roles[] 投影行，
+// 或 lastThreadRoles 兜底行（primary/effective 皆 null）。四种如实成文，互不冒充：
+//   · config 读不出来 → "绑定未知"（后端此时给空投影，兜底行的 blocked=false 是"不知道"）；
+//   · blocked → 沿用既有 ⛔ 语汇，与状态点/警示条同一符号；
+//   · effective ≠ primary → "降级中: primary→effective"（走向写全，只写 effective 会让
+//     人以为那就是配置里的主绑定）；
+//   · 正常 → 光秃秃的 effective（= 现在真正在跑的 CLI 名）。
+function memberBindLine(row) {
+  const sub = (cls, text) =>
+    `<span class="mr-sub${cls}">${escapeHtml(text)}</span>`;
+  if (lastConfigError) return sub(" unknown", "绑定未知");
+  const primary = row.primary ? String(row.primary) : "";
+  const effective = row.effective ? String(row.effective) : "";
+  if (row.blocked === true) return sub(" blocked", "⛔ 无可用适配器");
+  if (!effective) return sub(" unknown", "绑定未知");
+  if (primary && effective !== primary) {
+    return sub(" degraded", `降级中: ${primary}→${effective}`);
+  }
+  return sub("", effective);
+}
+
 function renderMemberRoster() {
   const box = $("#member-roster");
   if (!box) return;
@@ -547,12 +582,21 @@ function renderMemberRoster() {
           ? `；主绑定 ${r.primary} 已停用，本轮由 ${r.effective} 承接` : "");
     const tip = (MEMBER_DOT_TITLE[st] || "") + bindTip +
       "；点击 = 只看与该成员相关的消息并把发送目标锁到他（再点一次取消）";
+    // 常显副标题 = 该成员**当前生效的 CLI 名**。#role-bindings 那条只在"有话要说"
+    // 时才出一枚（降级/阻塞），一切正常时零渲染——于是"谁在给这个角色干活"平时根本
+    // 看不见。名册侧常显补上这一格：降级中显式写出 primary→effective 的走向，
+    // 读不出来就写"绑定未知"，绝不拿 role id 当 adapter 名充数。
     return (
       `<button class="mr-chip${active === role ? " active" : ""}"` +
       ` data-member="${escapeHtmlAttr(role)}" title="${escapeHtmlAttr(tip)}">` +
         `<span class="mr-dot d-${escapeHtmlAttr(dotCls)}"></span>` +
-        `<span class="mr-name" style="color:${col}">${escapeHtml(role)}</span>` +
-        badge +
+        `<span class="mr-body">` +
+          `<span class="mr-top">` +
+            `<span class="mr-name" style="color:${col}">${escapeHtml(displayOf(role))}</span>` +
+            badge +
+          `</span>` +
+          memberBindLine(r) +
+        `</span>` +
       `</button>`
     );
   }).join("");
@@ -560,7 +604,8 @@ function renderMemberRoster() {
     ? `<span class="mr-note">${escapeHtml(tstatus === "terminated"
         ? "线程已终止 · 名册为终态快照" : "线程挂起中 · 待门禁裁决")}</span>`
     : (active
-        ? `<span class="mr-note">单聊 ${escapeHtml(active)} · 再点该成员取消</span>` : "");
+        // 与 chip 名字同口径（纯文本位）；activeMemberRole() 本身仍是 role id。
+        ? `<span class="mr-note">单聊 ${escapeHtml(displayOf(active))} · 再点该成员取消</span>` : "");
   box.innerHTML = `<span class="mr-label">成员</span>` + chips + note;
 }
 
@@ -745,7 +790,10 @@ async function populateSendTo() {
     for (const r of roles) {
       if (r === "human") continue; // human 是自己，不作为发送目标项
       const o = document.createElement("option");
-      o.value = r; o.textContent = r;
+      // value **必须**是 role id：它就是 POST /api/threads/{tid}/send 的 to 字段，
+      // 也是 toggleMemberChat 单聊锁定时的比对键（与 populateFilterRoles 里那条
+      // "value 只能是 id" 同一约束）。只有 textContent 换显示名。
+      o.value = r; o.textContent = displayOf(r);
       sel.appendChild(o);
     }
     // D16：角色过滤下拉也随线程角色刷新。
@@ -1136,10 +1184,12 @@ async function loadSteps(eid) {
 function buildEventHead(ev) {
   const sender = ev.sender || "system";
   const col = roleColor(sender);
+  // 头像首字母仍取 sender（role id）首字符：中文名首字本身可用作头像，但换成显示名会
+  // 让同一角色在"投影已到/未到"两拍之间跳字（B / 后），故这里刻意不跟着换。
   const initial = escapeHtml((sender[0] || "?").toUpperCase());
   const chips = (ev.to || []).map((r) => {
-    const c = roleColor(r);
-    return `<span class="to-chip" style="color:${c};border-color:${c}66">@${escapeHtml(r)}</span>`;
+    const c = roleColor(r);   // 配色键仍是 role id
+    return `<span class="to-chip" style="color:${c};border-color:${c}66">@${escapeHtml(displayOf(r))}</span>`;
   }).join("");
   const arrow = (ev.to && ev.to.length) ? '<span class="head-arrow">→</span>' : "";
   const type = ev.type || "";
@@ -1156,7 +1206,7 @@ function buildEventHead(ev) {
   return (
     `<div class="b-head">` +
       `<span class="avatar" style="background:${col}1f;color:${col};border-color:${col}66">${initial}</span>` +
-      `<span class="speaker" style="color:${col}">${escapeHtml(sender)}</span>` +
+      `<span class="speaker" style="color:${col}">${escapeHtml(displayOf(sender))}</span>` +
       arrow +
       `<span class="to-chips">${chips}</span>` +
       typeBadge +
@@ -1577,8 +1627,30 @@ function populateFilterRoles(roles) {
     const c = roleColor(r);
     // value 走 escapeHtmlAttr（escapeHtml 不转引号）：该属性值已是名册单聊的匹配关键
     // 路径——toggleMemberChat 拿 c.value 与成员名比对，坏引号会静默切断整条单聊链。
-    return `<label class="f-chip"><input type="checkbox" value="${escapeHtmlAttr(r)}" data-fkind="role"><span style="color:${escapeHtmlAttr(c)}">${escapeHtml(r)}</span></label>`;
+    // 同理 value **只能**是 role id；显示名只进 <span> 标签文本（readFilters 收的是
+    // c.value，filterState.roles 因此恒为 id 集合，isMemberRelated 才比得上）。
+    return `<label class="f-chip"><input type="checkbox" value="${escapeHtmlAttr(r)}" data-fkind="role"><span style="color:${escapeHtmlAttr(c)}">${escapeHtml(displayOf(r))}</span></label>`;
   }).join("");
+}
+
+// 显示名补挂（不重建控件）：populateSendTo / populateFilterRoles 由 /api/threads 的
+// roles 触发，可能**先于** /status 的 roles[] 投影返回，那时 displayOf 只能拿到 role id。
+// 两个函数只改**文本**（option.textContent / f-chip 的 <span>），value 与 checked 态
+// 一律不碰——重建控件会清掉用户已勾的筛选、并把 #send-to 的单聊锁定冲掉。
+function refreshSendToLabels() {
+  const sel = $("#send-to");
+  if (!sel) return;
+  for (const o of Array.from(sel.options)) {
+    if (!o.value) continue;                       // 首项"由 moderator 路由"是固定文案
+    o.textContent = displayOf(o.value);
+  }
+}
+
+function refreshFilterRoleLabels() {
+  $$("#filter-roles input[data-fkind=\"role\"]").forEach((c) => {
+    const span = c.parentElement && c.parentElement.querySelector("span");
+    if (span) span.textContent = displayOf(c.value);
+  });
 }
 
 function populateFilterTypes() {
@@ -1678,6 +1750,8 @@ function applyStatusPayload(s) {
   lastConfigError = s.config_error || "";   // 坏 config 信号与投影同源同拍，不另起轮询
   renderRoleBindings();       // 角色行生效绑定
   renderMemberRoster();       // 常驻名册：角色投影 + 本次响应的全量派发行
+  refreshSendToLabels();      // 显示名随投影补上（populateSendTo 可能先于 status 返回）
+  refreshFilterRoleLabels();
   updateAdapterAlerts();      // 阻塞点名依赖角色投影，状态一变就重评警示档位
   updateTypingBar(s);
   // D19：以 status 端点权威状态重评门禁 banner。

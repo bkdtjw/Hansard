@@ -1,8 +1,9 @@
 """玻璃感 Web 控制台网关（spec 之外的补充工具）。
 
 设计铁律（本文件严格遵守）：
-  · 零新增依赖：仅标准库 http.server / socketserver / json / urllib / traceback
-    / pathlib，+ 已有 orch 包，+ 已装 pyyaml（仅 PUT /api/config 校验用，白名单内）。
+  · 零新增依赖：仅标准库 http.server / socketserver / json / os / uuid / urllib
+    / traceback / pathlib，+ 已有 orch 包，+ 已装 pyyaml（仅 PUT /api/config 校验用，
+    白名单内）。
   · 不重复实现业务逻辑：全部端点复用 src/orch/cli/main.py 已有的模块级 helper
     与 orch.store / orch.scheduler / orch.render，不拷第二份。
   · 进程内固定一个 workspace 根（make_server 参数决定）。
@@ -13,8 +14,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -287,9 +290,16 @@ def _role_binding_projection(
 ) -> list[dict]:
     """§12 可用性呈现的控制台数据源（评审 minor-2）：角色 → 生效绑定的只读投影。
 
-    返回投影行，键名冻结 {role, primary, effective, blocked}；effective=None ⇔
+    返回投影行，键名 {role, display_name, primary, effective, blocked}；effective=None ⇔
     blocked=True（该角色主绑定与全部备胎均已停用，§5.6.2）。解析复用
     state.resolve_effective_adapter，与调度层同一判据；本函数**不写盘、不改配置**。
+
+    display_name（config roles 层可选键）是**纯呈现**键，与 wire_format 同类先例：
+    引擎一侧无视它——模型视图只取 prompt/write_scope/tools（render/__init__.py::
+    _build_system / _read_prompt）与 adapter.context_window（同文件 _context_window），
+    别的 roles 键一个不读，故中文名不会漏进提示词（已跑 render_view 实测确认）；
+    机器匹配位（路由/筛选/CSS 类/单聊比较键）永远用 role id，本投影把两者并列给出，
+    前端才不必自己去猜哪个能当键用。缺配 → 等于 role id 本身（不臆造别名）。
 
     (cfg, cfg_error) 由调用方传入（`clim._read_config_file_checked` 的原样产物）：
     同一请求内 config 只读一次，角色投影与派发行的 started_ts 推算同源同拍——两处
@@ -320,8 +330,13 @@ def _role_binding_projection(
         rc = roles_cfg.get(role) or {}
         primary = str(rc.get("adapter") or role)
         effective = resolve_effective_adapter(role, roles_cfg, availability)
+        # display_name 只在**非空字符串**时生效：config 里写成 null / 空串 / 数字 0 等
+        # 假值一律退回 role id，避免前端拿到空名字渲染出无名 chip。
+        raw_name = rc.get("display_name")
+        display = str(raw_name) if (raw_name and str(raw_name).strip()) else role
         out.append({
             "role": role,
+            "display_name": display,
             "primary": primary,
             "effective": effective,
             "blocked": effective is None,
@@ -696,12 +711,38 @@ def _ep_config_put(ws: Path, body: dict) -> tuple[int, dict]:
         raise _ApiError(400, "yaml 必填（字符串）")
     import yaml  # pyyaml 已在依赖白名单
     try:
-        yaml.safe_load(raw)  # 仅校验可解析；不改结构
+        parsed = yaml.safe_load(raw)  # 仅校验可解析；不改结构
     except yaml.YAMLError as e:
         # 校验失败：不写盘，返回 error（HTTP 200 承载 {error} 便于前端统一处理）。
         return 200, {"error": f"YAML 解析失败: {e}"}
+    # §11.1 装载期校验**前置到写盘之前**：能解析 ≠ 合法。fallback 指向未声明的
+    # adapter、带工具角色绑 api 型，这些错只有 orch run 启动时才会炸——而那时坏配置
+    # 已经在盘上，常驻 run 每轮重读会持续拒绝启动。复用 state 里的同一个纯函数
+    # （不拷第二份判据，也不在此处收紧规则）。顶层非映射（列表/标量）跳过校验：
+    # 那种形状 validate_availability_config 本就只回空表，装载期由别处报错。
+    from orch.adapters.state import validate_availability_config
+
+    if isinstance(parsed, dict):
+        errors = validate_availability_config(parsed)
+        if errors:
+            raise _ApiError(400, "配置校验未通过（§11.1）：" + "；".join(errors))
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "config.yaml").write_text(raw, encoding="utf-8")
+    # 原子替换（临时文件 + flush + fsync + os.replace，照 adapters/state.py::_flush 的
+    # 既有模式）。**存在理由**：常驻 `orch run` 每轮重读 config.yaml——非原子写有一段
+    # 窗口让它读到半份文件，于是要么 adapters/roles 段读空、静默退回 Fake 后端（假绿），
+    # 要么 YAML 解析失败让整个进程报错退出。os.replace 保证盘上永远是完整的一份：
+    # 要么旧的、要么新的。临时文件与目标同目录（跨目录 rename 非原子），失败即删不留残迹。
+    target = ws / "config.yaml"
+    tmp = target.parent / f".config.yaml.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return 200, {"ok": True}
 
 

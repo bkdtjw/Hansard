@@ -203,6 +203,7 @@
           <dl>
             <dt>adapters</dt><dd>供应商适配器：<code>{名字: {kind: cli|api|mock, start_cmd, resume_cmd, timeout_s…}}</code>。同一角色可换 adapter 热替换供应商。</dd>
             <dt>roles</dt><dd>角色=配置：<code>{角色: {adapter, can_decide, write_scope:[], tools:[], prompt}}</code>。禁止把角色逻辑写死进代码。</dd>
+            <dt>display_name（可选）</dt><dd>角色的中文显示名，如 <code>backend: {adapter: …, display_name: 后端工程师}</code>。<b>纯呈现</b>：只改控制台上给人看的文字，不进模型提示词、不改路由；协议里的角色标识、@目标、单聊/筛选一律仍用角色 id。缺配时显示 id 本身。</dd>
             <dt>gate_ops</dt><dd>特权操作命令模板（系统执行器专用）：如 <code>merge_main</code> / <code>run_ci</code>。</dd>
             <dt>limits（thread_defaults）</dt><dd>线程默认：<code>max_rounds / loop_limit / chat_ttl</code>。</dd>
           </dl>

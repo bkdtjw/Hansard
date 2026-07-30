@@ -463,11 +463,18 @@ def test_thread_status_with_valid_config_yaml_unchanged(tmp_dir):
         by_role = {r["role"]: r for r in body["roles"]}
         assert sorted(by_role) == ["moderator", "pm"]
         for row in by_role.values():
-            # 投影行四键一个不动（键名冻结面，新增顶层键不得侵入行结构）。
-            assert sorted(row) == ["blocked", "effective", "primary", "role"]
+            # 键名冻结面的**本意**是堵臆造键侵入行结构，不是冻结未来的呈现键：四个
+            # 语义键必须齐（少一个就是回退），另允许 Lead 批准的**纯呈现**键并存
+            # ——目前只有 display_name（C1，同 started_ts 加键先例）。
+            for key in ("role", "primary", "effective", "blocked"):
+                assert key in row, row
             assert row["primary"] == "claude"
             assert row["effective"] == "claude"
             assert row["blocked"] is False
+            # 缺省语义钉死：VALID_YAML 合法且**未配** display_name → 等于 role id 本身
+            # （不臆造别名；配了才换成中文名，见 tests/test_web.py 的两条 display_name 用例）。
+            assert "display_name" in row, row
+            assert row["display_name"] == row["role"], row
 
 
 # ——————————————————————————————————————————————————————————————

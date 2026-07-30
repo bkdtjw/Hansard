@@ -898,6 +898,18 @@ button.ln-chip:hover { background: rgba(96, 165, 250, 0.22); border-color: var(-
 .mr-chip:hover { background: rgba(255, 255, 255, 0.1); transform: translateY(-1px); }
 .mr-chip.active { border-color: var(--blue-solid); background: rgba(96, 165, 250, 0.18); }
 .mr-name { font-weight: 600; }
+/* 生效绑定副标题：名字行 + 小字行两行式（dot 仍与整块垂直居中）。
+   纯 rgba + border，无 backdrop-filter 新增（性能红线）。 */
+.mr-body { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.mr-top { display: inline-flex; align-items: center; gap: 6px; }
+.mr-sub {
+  font-size: 10.5px; line-height: 1.1; letter-spacing: 0.02em;
+  color: var(--txt-meta); max-width: 15em; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.mr-sub.degraded { color: var(--gate); }        /* 与 d-queued 琥珀同源，不新增色 */
+.mr-sub.blocked { color: var(--danger-solid); }
+.mr-sub.unknown { color: var(--txt-dim); font-style: italic; }
 .mr-dot {
   width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
   background: var(--term); box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
