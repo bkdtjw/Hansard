@@ -667,7 +667,8 @@ function renderMarkdown(rawBody) {
   let text = escapedAll.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
     const idx = codeBlocks.length;
     codeBlocks.push(code.replace(/\n$/, ""));
-    return ` CB${idx} `;
+    // 占位符以 \u0000 定界：正常文本打不出 NUL，不会与消息正文碰撞；须写转义而非原始 NUL 字节，否则 rg 会把整个文件判为二进制。
+    return `\u0000CB${idx}\u0000`;
   });
 
   // ③ 按行处理块级结构：无序/有序列表 + 段落，行内再走 renderInlineMd。
@@ -678,7 +679,7 @@ function renderMarkdown(rawBody) {
 
   for (const line of lines) {
     // 代码块占位行：整行就是占位符 → 直接吐 <pre><code>。
-    const cbMatch = /^ CB(\d+) $/.exec(line.trim());
+    const cbMatch = /^\u0000CB(\d+)\u0000$/.exec(line.trim());
     if (cbMatch) {
       closeList();
       out.push(`<pre class="md-pre"><code>${codeBlocks[Number(cbMatch[1])]}</code></pre>`);
